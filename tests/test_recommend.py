@@ -127,10 +127,15 @@ class AppStateRecommendTest(unittest.TestCase):
                              transport=FakeTransport(market)))
         return state
 
-    def test_without_claude_key_returns_plain_listing(self):
+    def test_without_backend_returns_plain_listing(self):
         state = self._state(with_claude_key=False)
+
+        def no_cli():
+            raise RuntimeError("Claude Code가 설치되어 있지 않다")
+
+        state.cli_analyst_factory = no_cli
         out = state.recommend("kr")
-        self.assertIn("목록만 표시", out["text"])
+        self.assertIn("AI 분석 불가", out["text"])
         self.assertIn("005930", out["text"])
 
     def test_with_claude_key_returns_ai_text(self):

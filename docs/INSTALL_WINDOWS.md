@@ -31,6 +31,18 @@ PyQt5, 키움 모듈 설치가 전혀 필요 없고 파이썬 표준 라이브�
 `mode = real`(실전, api.kiwoom.com)은 실행 시 `--allow-real` 플래그까지
 명시해야 동작한다 — 이중 안전장치다.
 
+## AI 분석: 구독 로그인 (API 과금 없음)
+
+Claude API 키 대신 claude.ai **Pro/Max 구독**으로 분석을 돌릴 수 있다.
+건당 과금 없이 구독 사용 한도 안에서 동작한다.
+
+1. PowerShell에서 Claude Code 설치: `irm https://claude.ai/install.ps1 | iex`
+2. `claude`를 한 번 실행해 claude.ai 계정으로 로그인 (브라우저 인증)
+3. `config.ini`의 `[claude] api_key`는 비워 둔다 — 키가 없으면 프로그램이
+   자동으로 Claude Code 로그인을 사용한다 (`backend = auto`)
+
+`backend = api`(항상 API 키), `backend = cli`(항상 구독 로그인)로 강제할 수도 있다.
+
 ## 실행
 
 - **백테스트**: 바탕화면 "AutoTrader 백테스트" 더블클릭. 장이 닫혀 있어도 된다.
