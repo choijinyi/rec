@@ -50,6 +50,34 @@ class TopVolumeTest(unittest.TestCase):
         self.assertIn("/api/us/rkinfo", url)
         self.assertEqual(headers["api-id"], "usa20530")
 
+    def test_change_criteria_api_ids(self):
+        t = FakeTransport()
+        KiwoomRestClient("A", "S", transport=t, market="kr").top_stocks("change")
+        self.assertEqual(t.calls[-1][1]["api-id"], "ka10027")
+        t2 = FakeTransport("us")
+        KiwoomRestClient("A", "S", transport=t2, market="us").top_stocks("change")
+        self.assertEqual(t2.calls[-1][1]["api-id"], "usa20910")
+
+    def test_unknown_criteria_rejected(self):
+        from autotrader.kiwoom_rest import KiwoomRestError
+        client = KiwoomRestClient("A", "S", transport=FakeTransport())
+        with self.assertRaises(KiwoomRestError):
+            client.top_stocks("moon_phase")
+
+    def test_token_mismatch_hint(self):
+        from autotrader.kiwoom_rest import KiwoomRestError
+
+        def mismatch(url, headers, body):
+            return {"return_msg": "입력 값 오류입니다[8030:투자구분(실전/모의)이 "
+                                  "달라서 Appkey를 사용할수가 없습니다]",
+                    "return_code": 2}
+
+        client = KiwoomRestClient("A", "S", transport=mismatch)
+        with self.assertRaises(KiwoomRestError) as ctx:
+            client.current_price("005930")
+        self.assertIn("mode", str(ctx.exception))
+        self.assertIn("어긋났다", str(ctx.exception))
+
 
 class FakeClaudeClient:
     def __init__(self):

@@ -183,13 +183,16 @@ class AppState:
         analyst = self.analyst_factory(api_key)
         return {"text": analyst.analyze(snapshot)}
 
-    def recommend(self, market: str) -> dict:
-        """당일 거래량 상위를 키움에서 받아 Claude가 관심 후보를 고른다."""
+    def recommend(self, market: str, criteria: str = "volume") -> dict:
+        """순위 상위를 키움에서 받아 Claude가 관심 후보를 고른다."""
+        from .kiwoom_rest import RANK_CRITERIA_LABELS
+
+        label = RANK_CRITERIA_LABELS.get(criteria, criteria)
         cfg = load_config(self.config_path)
         mock = cfg["mode"] != "real"
         client = self.client_factory(cfg["appkey"], cfg["secretkey"], mock=mock,
                                      market=market)
-        rows = client.top_volume_stocks(limit=10)
+        rows = client.top_stocks(criteria, limit=10)
         if not rows:
             return {"error": "순위 데이터가 비어 있다. 장 시간과 API 키를 확인해 달라."}
         listing = "\n".join(
@@ -202,11 +205,11 @@ class AppState:
         if parser.has_section("claude"):
             api_key = parser["claude"].get("api_key", "").strip()
         if not api_key:
-            return {"text": "[당일 거래량 상위 - Claude 키가 없어 목록만 표시]\n"
-                            + listing}
+            return {"text": f"[{label} - Claude 키가 없어 목록만 표시]\n" + listing}
         analyst = self.analyst_factory(api_key)
-        text = analyst.recommend(market, "mock" if mock else "real", rows)
-        return {"text": f"[당일 거래량 상위 기반 관심 후보]\n{text}\n\n"
+        text = analyst.recommend(market, "mock" if mock else "real", rows,
+                                 criteria_label=label)
+        return {"text": f"[{label} 기반 관심 후보]\n{text}\n\n"
                         f"--- 원본 데이터 ---\n{listing}"}
 
 
@@ -255,6 +258,8 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
   <button class="danger" onclick="stopT()">중지</button>
   <button onclick="backtest()">백테스트</button>
   <button onclick="analyze()" id="btnAI">AI 분석 (Fable)</button>
+  <select id="recBasis"><option value="volume">거래량 상위</option>
+  <option value="change">등락률 상위</option></select>
   <button onclick="recommend()" id="btnRec">오늘의 추천</button>
 </div>
 <div class="warn" id="msg"></div>
@@ -302,8 +307,9 @@ async function analyze(){
 }
 async function recommend(){
   $("btnRec").disabled=true;
-  $("analysis").textContent="당일 거래량 상위를 조회하고 Claude Fable이 후보를 고르는 중...";
-  try{const r=await api("/api/recommend",{market:$("market").value});
+  $("analysis").textContent="순위 데이터를 조회하고 Claude Fable이 후보를 고르는 중...";
+  try{const r=await api("/api/recommend",{market:$("market").value,
+    criteria:$("recBasis").value});
     $("analysis").textContent=(r.error||r.text)+
       "\\n\\n※ 추천은 참고 자료이며 투자 자문이 아닙니다.";}
   finally{$("btnRec").disabled=false;}
@@ -391,7 +397,8 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/analyze":
                 self._send(self.state.analyze())
             elif self.path == "/api/recommend":
-                self._send(self.state.recommend(body.get("market", "kr")))
+                self._send(self.state.recommend(
+                    body.get("market", "kr"), body.get("criteria", "volume")))
             else:
                 self._send({"error": "not found"}, 404)
         except (KiwoomRestError, PermissionError, RuntimeError, KeyError) as e:
