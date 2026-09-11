@@ -75,8 +75,20 @@ class AppState:
         self.analyst_factory = ClaudeAnalyst
 
     # ── 실행 제어 ──────────────────────────────────────────
+    @staticmethod
+    def resolve_cash(market: str, cash) -> float:
+        """기준 자본 입력값을 해석한다. 비었거나 잘못되면 시장별 기본값."""
+        try:
+            value = float(str(cash).replace(",", "").strip())
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+        return 1_000.0 if market == "us" else 1_000_000.0
+
     def start(self, market: str, code: str, strategy: str, confirm: str,
-              auto: bool = False, criteria: str = "volume") -> dict:
+              auto: bool = False, criteria: str = "volume",
+              cash=None) -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -86,7 +98,7 @@ class AppState:
                 return {"need_confirm": True,
                         "error": "실전투자 모드다. 확인란에 YES를 입력해야 시작된다."}
             risk_cfg = load_risk_config(self.config_path) or RiskConfig()
-            cash = 10_000 if market == "us" else 10_000_000
+            cash = self.resolve_cash(market, cash)
             client = self.client_factory(cfg["appkey"], cfg["secretkey"], mock=mock,
                                          market=market)
             api = RecordingAPI(client)
@@ -309,6 +321,7 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
   <input id="code" value="AAPL" size="8" style="display:none">
   <select id="strategy"><option value="sma_crossover">이동평균 교차</option>
   <option value="rsi_reversion">RSI 평균회귀</option></select>
+  <span>기준 자본: <input id="cash" value="1000" size="8" title="주문 크기 계산의 기준 금액 (미국: 달러, 국내: 원)"></span>
   <span id="realConfirm">실전 확인: <input id="confirm" placeholder="YES 입력" size="6"></span>
   <button class="primary" id="btnStart" onclick="start()">시작</button>
   <button class="danger" onclick="stopT()">중지</button>
@@ -341,7 +354,9 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
 <script>
 const $=id=>document.getElementById(id);
 let lastStatus=null;
-$("market").onchange=()=>{ $("code").value = $("market").value==="us" ? "AAPL" : "005930"; };
+$("market").onchange=()=>{ const us=$("market").value==="us";
+  $("code").value = us ? "AAPL" : "005930";
+  $("cash").value = us ? "1000" : "1000000"; };
 $("selMode").onchange=()=>{ $("code").style.display = $("selMode").value==="manual" ? "inline-block" : "none"; };
 async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",
 headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
@@ -350,7 +365,7 @@ async function start(){
   const auto=$("selMode").value==="auto";
   const r=await api("/api/start",{market:$("market").value,code:$("code").value.trim(),
     strategy:$("strategy").value,confirm:$("confirm").value.trim(),
-    auto:auto,criteria:$("recBasis").value});
+    auto:auto,criteria:$("recBasis").value,cash:$("cash").value.trim()});
   $("msg").textContent=r.error||(auto?"자동 선정 모드로 시작 - 장이 열리면 상위 종목을 선정합니다":"");
 }
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
@@ -453,6 +468,7 @@ class Handler(BaseHTTPRequestHandler):
                     confirm=body.get("confirm", ""),
                     auto=bool(body.get("auto")),
                     criteria=body.get("criteria", "volume"),
+                    cash=body.get("cash"),
                 ))
             elif self.path == "/api/stop":
                 self._send(self.state.stop())

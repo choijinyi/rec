@@ -134,3 +134,17 @@ class WebUiHttpTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveCashTest(unittest.TestCase):
+    def test_valid_values(self):
+        self.assertEqual(AppState.resolve_cash("us", "1000"), 1000.0)
+        self.assertEqual(AppState.resolve_cash("us", "2,500"), 2500.0)
+        self.assertEqual(AppState.resolve_cash("kr", 500000), 500000.0)
+
+    def test_invalid_falls_back_to_market_default(self):
+        self.assertEqual(AppState.resolve_cash("us", ""), 1000.0)
+        self.assertEqual(AppState.resolve_cash("us", None), 1000.0)
+        self.assertEqual(AppState.resolve_cash("us", "abc"), 1000.0)
+        self.assertEqual(AppState.resolve_cash("us", "-50"), 1000.0)
+        self.assertEqual(AppState.resolve_cash("kr", ""), 1000000.0)
