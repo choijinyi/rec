@@ -244,7 +244,10 @@ def _read_parser(path: str | Path) -> configparser.ConfigParser:
             f"설정 파일이 없다: {path}\n"
             "config.ini를 만들고 [kiwoom] 섹션에 appkey/secretkey를 입력해야 한다."
         )
-    parser = configparser.ConfigParser()
+    # interpolation=None: 값/주석에 %가 있어도 오류 없이 그대로 읽는다.
+    # inline_comment_prefixes: "값 ; 설명" 형태의 줄 끝 주석을 허용한다.
+    parser = configparser.ConfigParser(
+        interpolation=None, inline_comment_prefixes=(";", "#"))
     for enc in ("utf-8-sig", "cp949"):
         try:
             parser.read(path, encoding=enc)

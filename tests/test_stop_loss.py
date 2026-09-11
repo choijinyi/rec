@@ -97,6 +97,28 @@ class StopLossTest(unittest.TestCase):
                          "[risk]\nstop_loss_pct = 0\n", encoding="utf-8")
             self.assertAlmostEqual(load_risk_config(p).stop_loss_pct, 0.0)
 
+    def test_config_tolerates_percent_and_inline_comments(self):
+        """% 문자와 줄 끝 주석이 있어도 파싱된다 (실사용 오류 재현)."""
+        import tempfile
+        from pathlib import Path
+
+        content = (
+            "[kiwoom]\nappkey=A\nsecretkey=B\nmode = real\n"
+            "[risk]\n"
+            "max_position_pct = 20   ; 종목당 최대 투자 비중\n"
+            "order_cash_pct = 10     ; 1회 매수에 쓰는 자본 비중\n"
+            "max_drawdown_pct = 15   ; 자본이 이만큼 줄면 신규 매수 중단\n"
+            "stop_loss_pct = 3       ; 평균단가 대비 -3%에서 전량 손절, 0이면 끔\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.ini"
+            p.write_text(content, encoding="utf-8")
+            rc = load_risk_config(p)
+            self.assertAlmostEqual(rc.stop_loss_pct, 0.03)
+            self.assertAlmostEqual(rc.max_position_pct, 0.20)
+            from autotrader.kiwoom_rest import load_config
+            self.assertEqual(load_config(p)["mode"], "real")
+
 
 if __name__ == "__main__":
     unittest.main()
