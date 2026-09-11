@@ -109,7 +109,13 @@ class AppState:
                     risk=RiskManager(risk_cfg, initial_equity=cash),
                     is_simulation=mock,
                 )
-            thread = threading.Thread(target=trader.run, daemon=True)
+            def run_guarded():
+                try:
+                    trader.run()
+                except Exception as e:  # 스레드가 죽어도 UI에 이유를 남긴다
+                    self.last_error = f"매매 스레드 종료: {e}"
+
+            thread = threading.Thread(target=run_guarded, daemon=True)
             self.trader, self.api, self.thread = trader, api, thread
             self.params = {"market": market,
                            "code": "자동선정" if auto else code,
@@ -139,7 +145,8 @@ class AppState:
             "running": running,
             "config_mode": mode,
             "params": self.params,
-            "last_error": self.last_error,
+            "last_error": self.last_error
+                          or getattr(self.trader, "last_error", ""),
             "prices": [], "events": [], "fills": [], "symbols": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "position_qty": 0, "orders_today": 0, "bars_seen": 0,

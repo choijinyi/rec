@@ -16,6 +16,9 @@ class FakeTransport:
         self.calls.append((url, headers, body))
         if url.endswith("/oauth2/token"):
             return {"token": "T", "expires_dt": ""}
+        if "/api/us/stkinfo" in url:  # usa10098 거래소구분 조회
+            return {"return_code": 0,
+                    "list": [{"stex_tp": "ND", "stk_cd": body.get("stk_cd", "")}]}
         if "/api/us/mrkcond" in url:
             return self.price_payload
         if "/api/us/ordr" in url:
