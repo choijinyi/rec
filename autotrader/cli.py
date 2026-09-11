@@ -42,11 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     rest = sub.add_parser("live-rest", help="키움 REST API 실시간 자동매매 (권장, OS 무관)")
     rest.add_argument("--strategy", choices=sorted(STRATEGIES), default="sma_crossover")
-    rest.add_argument("--code", default="005930", help="종목코드 (기본: 005930 삼성전자)")
+    rest.add_argument("--market", choices=["kr", "us"], default="kr",
+                      help="kr=국내주식(기본), us=미국주식")
+    rest.add_argument("--code", default=None,
+                      help="종목코드 (국내 기본: 005930, 미국 기본: AAPL)")
+    rest.add_argument("--exchange", default="ND",
+                      help="미국주식 거래소 구분 (기본 ND=나스닥)")
     rest.add_argument("--config", default="config.ini", help="API 키 설정 파일 경로")
     rest.add_argument("--bar-interval", type=int, default=60, help="봉 주기(초)")
     rest.add_argument("--poll-interval", type=float, default=3.0, help="시세 폴링 주기(초)")
-    rest.add_argument("--cash", type=float, default=10_000_000, help="운용 기준 자본")
+    rest.add_argument("--cash", type=float, default=None,
+                      help="운용 기준 자본 (국내 기본 1,000만 원, 미국 기본 1만 달러)")
     rest.add_argument("--max-orders", type=int, default=20, help="일일 최대 주문 횟수")
     rest.add_argument(
         "--allow-real", action="store_true",
@@ -106,31 +112,60 @@ def main(argv: list[str] | None = None) -> int:
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
         from .kiwoom.live import LiveConfig, LiveTrader
-        from .kiwoom_rest import KiwoomRestClient, KiwoomRestError, load_config
+        from .kiwoom_rest import (
+            KiwoomRestClient, KiwoomRestError, load_config, load_risk_config,
+        )
+        from .risk import RiskManager
+
+        code = args.code or ("AAPL" if args.market == "us" else "005930")
+        cash = args.cash or (10_000 if args.market == "us" else 10_000_000)
+        currency = "달러" if args.market == "us" else "원"
 
         try:
             cfg = load_config(args.config)
             mock = cfg["mode"] != "real"
-            client = KiwoomRestClient(cfg["appkey"], cfg["secretkey"], mock=mock)
+            risk_cfg = load_risk_config(args.config)
+            client = KiwoomRestClient(cfg["appkey"], cfg["secretkey"], mock=mock,
+                                      market=args.market, exchange=args.exchange)
             config = LiveConfig(
                 account_no="",  # REST API는 키에 계좌가 연결되어 있다
-                code=args.code,
+                code=code,
                 bar_interval=args.bar_interval,
                 poll_interval=args.poll_interval,
-                initial_cash=args.cash,
+                initial_cash=cash,
                 max_orders_per_day=args.max_orders,
                 allow_real=args.allow_real,
+                market=args.market,
             )
+            if not mock:
+                if not args.allow_real:
+                    raise PermissionError(
+                        "config.ini가 실전투자(mode=real)인데 --allow-real이 없다. "
+                        "모의투자로 돌리려면 mode=mock으로 바꾸면 된다."
+                    )
+                print("\n" + "=" * 55)
+                print("  [실전투자 확인] 지금부터 실제 계좌에 주문이 나간다.")
+                print(f"  - 시장/종목 : {'미국' if args.market == 'us' else '국내'} {code}")
+                print(f"  - 전략      : {args.strategy}")
+                print(f"  - 기준 자본 : {cash:,.0f}{currency}")
+                print(f"  - 일일 한도 : 주문 {args.max_orders}회")
+                print("  - 손실 위험 : 원금 손실이 실제로 발생할 수 있다")
+                print("=" * 55)
+                answer = input("계속하려면 YES를 입력하세요: ").strip()
+                if answer != "YES":
+                    print("실전투자를 취소했다.")
+                    return 0
             trader = LiveTrader(
                 api=client,
                 strategy=STRATEGIES[args.strategy](),
                 config=config,
+                risk=RiskManager(risk_cfg, initial_equity=cash) if risk_cfg else None,
                 is_simulation=mock,
             )
         except (KiwoomRestError, PermissionError) as e:
             print(f"\n[중단] {e}")
             return 1
-        print(f"[{args.code}] 전략 {args.strategy}, "
+        print(f"[{'미국' if args.market == 'us' else '국내'} {code}] 전략 {args.strategy}, "
               f"{'모의투자(mockapi)' if mock else '실전투자(api)'} 서버")
         trader.run()
     return 0

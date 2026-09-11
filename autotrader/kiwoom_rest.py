@@ -25,9 +25,16 @@ logger = logging.getLogger(__name__)
 MOCK_HOST = "https://mockapi.kiwoom.com"
 REAL_HOST = "https://api.kiwoom.com"
 
-_API_PRICE = ("/api/dostk/stkinfo", "ka10001")
-_API_ORDER = {"buy": ("/api/dostk/ordr", "kt10000"),
-              "sell": ("/api/dostk/ordr", "kt10001")}
+# 국내주식
+_API_PRICE_KR = ("/api/dostk/stkinfo", "ka10001")
+_API_ORDER_KR = {"buy": ("/api/dostk/ordr", "kt10000"),
+                 "sell": ("/api/dostk/ordr", "kt10001")}
+# 미국주식 (주문은 지정가 방식: ord_uv 필수)
+_API_PRICE_US = ("/api/us/mrkcond", "usa20100")
+_API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
+                 "sell": ("/api/us/ordr", "ust20001")}
+# 미국주식 현재가 응답에서 시도할 필드 후보
+_US_PRICE_KEYS = ("cur_prc", "last_pric", "cur_pric", "now_pric", "prpr")
 
 Transport = Callable[[str, dict, dict], dict]
 
@@ -49,19 +56,25 @@ class KiwoomRestClient:
     """MarketAPI 프로토콜 구현. transport 주입으로 테스트 가능."""
 
     def __init__(self, appkey: str, secretkey: str, mock: bool = True,
+                 market: str = "kr", exchange: str = "ND",
                  transport: Transport = _http_post):
         if not appkey or not secretkey:
             raise KiwoomRestError(
                 "API 키가 없다. openapi.kiwoom.com 에서 발급받은 appkey/secretkey를 "
                 "config.ini에 입력해야 한다."
             )
+        if market not in ("kr", "us"):
+            raise KiwoomRestError(f"market은 'kr' 또는 'us'여야 한다: {market}")
         self.appkey = appkey
         self.secretkey = secretkey
         self.mock = mock
+        self.market = market
+        self.exchange = exchange  # 미국주식 거래소 구분 (ND=나스닥 등)
         self.host = MOCK_HOST if mock else REAL_HOST
         self._transport = transport
         self._token: str | None = None
         self._token_expires_at = 0.0
+        self._last_price: float | None = None  # 미국주식 지정가 주문에 사용
 
     # ── 인증 ────────────────────────────────────────────────
     def _ensure_token(self) -> str:
@@ -102,36 +115,65 @@ class KiwoomRestClient:
         return res
 
     # ── MarketAPI 구현 ──────────────────────────────────────
-    def current_price(self, code: str) -> float:
-        res = self._call(_API_PRICE[0], _API_PRICE[1], {"stk_cd": code})
-        raw = res.get("cur_prc")
-        if raw in (None, ""):
-            raise KiwoomRestError(
-                f"현재가(cur_prc)를 찾지 못했다. 응답 키: {sorted(res.keys())}")
+    @staticmethod
+    def _parse_price(raw) -> float:
         return abs(float(str(raw).replace(",", "").replace("+", "")))
+
+    def current_price(self, code: str) -> float:
+        if self.market == "us":
+            res = self._call(_API_PRICE_US[0], _API_PRICE_US[1],
+                             {"stex_tp": self.exchange, "stk_cd": code})
+            for key in _US_PRICE_KEYS:
+                if res.get(key) not in (None, ""):
+                    price = self._parse_price(res[key])
+                    break
+            else:
+                raise KiwoomRestError(
+                    f"미국주식 현재가 필드를 찾지 못했다. 응답 키: {sorted(res.keys())}")
+        else:
+            res = self._call(_API_PRICE_KR[0], _API_PRICE_KR[1], {"stk_cd": code})
+            raw = res.get("cur_prc")
+            if raw in (None, ""):
+                raise KiwoomRestError(
+                    f"현재가(cur_prc)를 찾지 못했다. 응답 키: {sorted(res.keys())}")
+            price = self._parse_price(raw)
+        self._last_price = price
+        return price
 
     def send_market_order(self, account_no: str, code: str, side: str,
                           quantity: int) -> None:
-        path, api_id = _API_ORDER[side]
-        body = {
-            "dmst_stex_tp": "KRX",   # 국내거래소
-            "stk_cd": code,
-            "ord_qty": str(quantity),
-            "ord_uv": "",            # 시장가는 단가 없음
-            "trde_tp": "3",          # 3 = 시장가
-            "cond_uv": "",
-        }
+        if self.market == "us":
+            # 미국주식은 시장가 코드가 없어 현재가 지정가로 집행한다
+            if self._last_price is None:
+                raise KiwoomRestError("직전 시세가 없어 미국주식 주문 단가를 정할 수 없다")
+            path, api_id = _API_ORDER_US[side]
+            body = {
+                "stex_tp": self.exchange,
+                "stk_cd": code,
+                "ord_qty": str(quantity),
+                "ord_uv": f"{self._last_price:.2f}",
+                "trde_tp": "00",     # 00 = 지정가
+            }
+            if side == "sell":
+                body["stop_pric"] = ""
+        else:
+            path, api_id = _API_ORDER_KR[side]
+            body = {
+                "dmst_stex_tp": "KRX",   # 국내거래소
+                "stk_cd": code,
+                "ord_qty": str(quantity),
+                "ord_uv": "",            # 시장가는 단가 없음
+                "trde_tp": "3",          # 3 = 시장가
+                "cond_uv": "",
+            }
         res = self._call(path, api_id, body)
-        logger.info("주문 전송: %s %s %d주 (시장가, 주문번호=%s)",
-                    code, side, quantity, res.get("ord_no", "?"))
+        logger.info("주문 전송: [%s] %s %s %d주 (주문번호=%s)",
+                    self.market, code, side, quantity, res.get("ord_no", "?"))
 
 
 # ── 설정 파일 ───────────────────────────────────────────────
-def load_config(path: str | Path) -> dict:
-    """config.ini에서 [kiwoom] appkey/secretkey/mode를 읽는다.
-
-    인코딩은 UTF-8과 CP949(한글 Windows 메모장 기본) 모두 허용한다.
-    """
+def _read_parser(path: str | Path) -> configparser.ConfigParser:
+    """UTF-8과 CP949(한글 Windows 메모장 기본)를 모두 허용해 ini를 읽는다."""
     path = Path(path)
     if not path.exists():
         raise KiwoomRestError(
@@ -145,9 +187,40 @@ def load_config(path: str | Path) -> dict:
             break
         except UnicodeDecodeError:
             continue
+    return parser
+
+
+def load_config(path: str | Path) -> dict:
+    """config.ini에서 [kiwoom] appkey/secretkey/mode를 읽는다."""
+    parser = _read_parser(path)
     section = parser["kiwoom"] if parser.has_section("kiwoom") else {}
     return {
         "appkey": section.get("appkey", "").strip(),
         "secretkey": section.get("secretkey", "").strip(),
         "mode": section.get("mode", "mock").strip().lower(),
     }
+
+
+def load_risk_config(path: str | Path):
+    """config.ini의 [risk] 섹션을 RiskConfig로 읽는다. 값은 퍼센트 숫자.
+
+    섹션이 없으면 None을 반환한다(기본 리스크 설정 사용).
+    """
+    from .risk import RiskConfig
+
+    parser = _read_parser(path)
+    if not parser.has_section("risk"):
+        return None
+    section = parser["risk"]
+
+    def pct(key: str, default: float) -> float:
+        value = float(section.get(key, default))
+        if not 0 < value <= 100:
+            raise KiwoomRestError(f"[risk] {key}는 0보다 크고 100 이하여야 한다: {value}")
+        return value / 100.0
+
+    return RiskConfig(
+        max_position_pct=pct("max_position_pct", 20.0),
+        order_cash_pct=pct("order_cash_pct", 10.0),
+        max_drawdown_pct=pct("max_drawdown_pct", 15.0),
+    )
