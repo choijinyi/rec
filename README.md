@@ -1,5 +1,11 @@
 # autotrader — 주식 자동매매 프레임워크
 
+**대시보드 UI**: `python -m autotrader ui` 를 실행하면 브라우저에서
+시작/중지, 실시간 시세 차트, 손익 현황, 백테스트, Claude Fable AI 분석을
+한 화면에서 쓸 수 있다(로컬 127.0.0.1 전용). AI 분석은 `config.ini`의
+`[claude] api_key`(console.anthropic.com 발급)와 `pip install anthropic`이
+필요하며, 참고 자료일 뿐 투자 자문이 아니다.
+
 전략 신호 → 리스크 검증 → 주문 체결의 파이프라인으로 구성된 파이썬 자동매매
 프레임워크다. 기본 동작은 모의투자(페이퍼 트레이딩)와 백테스트이며, 외부
 패키지 없이 파이썬 표준 라이브러리만으로 실행된다.

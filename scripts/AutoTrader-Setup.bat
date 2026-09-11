@@ -3,11 +3,10 @@ setlocal
 title AutoTrader 설치 프로그램
 
 rem =====================================================
-rem  AutoTrader 원클릭 설치 프로그램 (키움 REST API 버전)
-rem  - Python 3.10+ 확인/자동 설치 (64비트 가능)
-rem  - 프로그램 다운로드 (github.com/choijinyi/rec)
+rem  AutoTrader 원클릭 설치 프로그램 (대시보드 UI 버전)
+rem  - Python 3.10+ 확인/자동 설치
+rem  - 프로그램 다운로드 + anthropic(Claude) 패키지 설치
 rem  - 자체 점검, config.ini 생성, 바탕화면 바로가기
-rem  - 미국주식/국내주식, 모의투자/실전투자 지원
 rem =====================================================
 
 set "INSTALL_DIR=%USERPROFILE%\autotrader"
@@ -19,12 +18,12 @@ set "SRC_DIR=%TEMP%\autotrader-src"
 
 echo.
 echo  =====================================================
-echo    AutoTrader 설치를 시작합니다 (키움 REST API 자동매매)
+echo    AutoTrader 설치를 시작합니다 (대시보드 UI + AI 분석)
 echo    설치 위치: %INSTALL_DIR%
 echo  =====================================================
 echo.
 
-echo [1/5] Python 확인 중...
+echo [1/6] Python 확인 중...
 set "PYCMD="
 py -3 -c "import sys; assert sys.version_info>=(3,10)" >nul 2>&1 && set "PYCMD=py -3"
 if not defined PYCMD (
@@ -44,14 +43,22 @@ if not defined PYCMD (
 )
 echo    확인 완료
 
-echo [2/5] 프로그램 내려받는 중...
+echo [2/6] 프로그램 내려받는 중...
 powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '%REPO_ZIP%' -OutFile '%ZIP_FILE%'; Expand-Archive -Force '%ZIP_FILE%' '%SRC_DIR%'"
 if errorlevel 1 goto :fail_net
 robocopy "%SRC_DIR%\rec-main" "%INSTALL_DIR%" /E /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 goto :fail
 echo    완료
 
-echo [3/5] 자체 점검 실행 중...
+echo [3/6] Claude 분석 패키지(anthropic) 설치 중...
+%PYCMD% -m pip install --quiet --upgrade anthropic
+if errorlevel 1 (
+    echo    ! anthropic 설치에 실패했습니다. AI 분석 기능만 제한되고 매매는 정상 동작합니다.
+) else (
+    echo    완료
+)
+
+echo [4/6] 자체 점검 실행 중...
 pushd "%INSTALL_DIR%"
 %PYCMD% -m unittest discover -s tests >nul 2>&1
 if errorlevel 1 (
@@ -62,7 +69,7 @@ if errorlevel 1 (
 popd
 echo    전체 테스트 통과
 
-echo [4/5] 설정 파일 준비 중...
+echo [5/6] 설정 파일 준비 중...
 if not exist "%INSTALL_DIR%\config.ini" (
     > "%INSTALL_DIR%\config.ini" (
         echo [kiwoom]
@@ -73,45 +80,30 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo ; mock = 모의투자, real = 실전투자
         echo mode = mock
         echo.
+        echo [claude]
+        echo ; AI 분석용 Claude API 키. console.anthropic.com 에서 발급합니다.
+        echo api_key =
+        echo.
         echo [risk]
         echo ; 숫자는 퍼센트 단위입니다.
-        echo ; 종목당 최대 투자 비중
         echo max_position_pct = 20
-        echo ; 한 번의 매수에 쓰는 자본 비중
         echo order_cash_pct = 10
-        echo ; 자본이 이만큼 줄면 신규 매수를 중단
         echo max_drawdown_pct = 15
     )
 )
 echo    완료
 
-echo [5/5] 바탕화면 바로가기 만드는 중...
+echo [6/6] 바탕화면 바로가기 만드는 중...
 set "DESKTOP="
 for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "DESKTOP=%%D"
 if not defined DESKTOP set "DESKTOP=%USERPROFILE%\Desktop"
 
-> "%DESKTOP%\AutoTrader 백테스트.bat" (
+> "%DESKTOP%\AutoTrader 실행.bat" (
     echo @echo off
-    echo title AutoTrader 백테스트
+    echo title AutoTrader
     echo cd /d "%INSTALL_DIR%"
-    echo %PYCMD% -m autotrader backtest --strategy sma_crossover --days 250
-    echo %PYCMD% -m autotrader backtest --strategy rsi_reversion --days 250
-    echo pause
-)
-> "%DESKTOP%\AutoTrader 미국주식 모의투자.bat" (
-    echo @echo off
-    echo title AutoTrader 미국주식 모의투자
-    echo cd /d "%INSTALL_DIR%"
-    echo echo 미국 정규장: 한국시간 밤 10시30분~새벽 5시 ^(겨울철 11시30분~6시^)
-    echo %PYCMD% -m autotrader live-rest --market us --code AAPL --strategy sma_crossover
-    echo pause
-)
-> "%DESKTOP%\AutoTrader 미국주식 실전투자.bat" (
-    echo @echo off
-    echo title AutoTrader 미국주식 실전투자
-    echo cd /d "%INSTALL_DIR%"
-    echo echo [주의] 실전투자는 config.ini의 mode=real 과 실전용 키가 필요합니다.
-    echo %PYCMD% -m autotrader live-rest --market us --code AAPL --strategy sma_crossover --allow-real
+    echo echo 브라우저에 대시보드가 열립니다. 이 창은 닫지 마세요.
+    echo %PYCMD% -m autotrader ui
     echo pause
 )
 echo    완료
@@ -120,21 +112,20 @@ echo.
 echo  =====================================================
 echo    설치가 끝났습니다!
 echo.
-echo    바탕화면 바로가기:
-echo      - "AutoTrader 백테스트"          : 지금 바로 실행 가능
-echo      - "AutoTrader 미국주식 모의투자" : 모의투자 키 입력 후
-echo      - "AutoTrader 미국주식 실전투자" : 실전용 키 + mode=real 필요
+echo    바탕화면의 "AutoTrader 실행"을 더블클릭하면 브라우저에
+echo    대시보드가 열립니다. 시작/중지, 시세 차트, 백테스트,
+echo    Claude Fable AI 분석을 모두 화면에서 사용합니다.
 echo.
-echo    [준비 - openapi.kiwoom.com 에서 최초 1회]
-echo      1. 키움 REST API 사용 신청
-echo      2. 모의투자용/실전용 appkey, secretkey 발급
-echo      3. 잠시 후 열리는 config.ini에 키를 붙여넣고 저장
+echo    [준비 - 최초 1회, 잠시 후 열리는 config.ini에 입력]
+echo      1. openapi.kiwoom.com : 키움 REST API 신청 후
+echo         appkey / secretkey 발급 (모의투자용)
+echo      2. console.anthropic.com : Claude API 키 발급 (AI 분석용)
 echo.
-echo    다른 종목으로 바꾸려면 바로가기 파일을 메모장으로 열어
-echo    --code AAPL 부분을 원하는 종목으로 수정하세요.
+echo    실전투자는 config.ini에서 mode=real + 실전용 키로 바꾼 뒤
+echo    대시보드 확인란에 YES를 입력해야만 시작됩니다.
 echo.
-echo    자동매매는 수익을 보장하지 않습니다. 실전투자 전에
-echo    모의투자로 충분히 검증하시길 권합니다.
+echo    자동매매는 수익을 보장하지 않습니다. 모의투자로 충분히
+echo    검증한 뒤에만 실전 전환을 검토하세요.
 echo  =====================================================
 echo.
 start "" notepad "%INSTALL_DIR%\config.ini"
