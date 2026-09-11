@@ -36,16 +36,29 @@ _API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
 # 미국주식 현재가 응답에서 시도할 필드 후보
 _US_PRICE_KEYS = ("cur_prc", "last_pric", "cur_pric", "now_pric", "prpr")
 
-# 당일 거래량 상위 (추천 후보 수집용)
-_API_RANK_KR = ("/api/dostk/rkinfo", "ka10030", {
-    "mrkt_tp": "000", "sort_tp": "1", "mang_stk_incls": "0", "crd_tp": "0",
-    "trde_qty_tp": "0", "pric_tp": "0", "trde_prica_tp": "0",
-    "mrkt_open_tp": "0", "stex_tp": "3",
-})
-_API_RANK_US = ("/api/us/rkinfo", "usa20530", {
-    "stex_tp": "0", "inds_cd": "", "stk_tp": "0", "trde_qty_tp": "0",
-    "qry_tp": "0", "stk_cnd": "0", "pric_cnd": "0", "trde_prica_cnd": "0",
-})
+# 순위 조회 (추천 후보 수집용): (market, criteria) → (경로, api-id, 본문)
+_API_RANK = {
+    ("kr", "volume"): ("/api/dostk/rkinfo", "ka10030", {   # 당일거래량상위
+        "mrkt_tp": "000", "sort_tp": "1", "mang_stk_incls": "0", "crd_tp": "0",
+        "trde_qty_tp": "0", "pric_tp": "0", "trde_prica_tp": "0",
+        "mrkt_open_tp": "0", "stex_tp": "3",
+    }),
+    ("kr", "change"): ("/api/dostk/rkinfo", "ka10027", {   # 전일대비등락률상위
+        "mrkt_tp": "000", "sort_tp": "1", "trde_qty_cnd": "0000",
+        "stk_cnd": "0", "crd_cnd": "0", "updown_incls": "1",
+        "pric_cnd": "0", "trde_prica_cnd": "0", "stex_tp": "3",
+    }),
+    ("us", "volume"): ("/api/us/rkinfo", "usa20530", {     # 당일 거래량 상위
+        "stex_tp": "0", "inds_cd": "", "stk_tp": "0", "trde_qty_tp": "0",
+        "qry_tp": "0", "stk_cnd": "0", "pric_cnd": "0", "trde_prica_cnd": "0",
+    }),
+    ("us", "change"): ("/api/us/rkinfo", "usa20910", {     # 전일대비 등락률상위
+        "stex_tp": "0", "inds_cd": "", "inds_cls_tp": "0", "sort_tp": "1",
+        "stk_tp": "0", "stk_cnd": "0", "pric_cnd": "0",
+        "trde_prica_cnd": "0", "trde_qty_tp": "",
+    }),
+}
+RANK_CRITERIA_LABELS = {"volume": "당일 거래량 상위", "change": "등락률 상위"}
 
 Transport = Callable[[str, dict, dict], dict]
 
@@ -99,7 +112,15 @@ class KiwoomRestClient:
         )
         token = res.get("token")
         if not token:
-            raise KiwoomRestError(f"토큰 발급 실패: {res}")
+            hint = ""
+            if "투자구분" in str(res):
+                hint = (
+                    "\n→ 키 종류와 접속 서버가 어긋났다. 모의투자(mode=mock)에는 "
+                    "openapi.kiwoom.com에서 발급한 '모의투자용' 키가, "
+                    "실전(mode=real)에는 '실전용' 키가 필요하다. "
+                    "config.ini의 mode와 키를 같은 종류로 맞춰야 한다."
+                )
+            raise KiwoomRestError(f"토큰 발급 실패: {res}{hint}")
         self._token = token
         # expires_dt(yyyyMMddHHmmss)가 있으면 사용, 없으면 23시간으로 가정
         expires_dt = str(res.get("expires_dt", ""))
@@ -181,9 +202,12 @@ class KiwoomRestClient:
         logger.info("주문 전송: [%s] %s %s %d주 (주문번호=%s)",
                     self.market, code, side, quantity, res.get("ord_no", "?"))
 
-    def top_volume_stocks(self, limit: int = 10) -> list[dict]:
-        """당일 거래량 상위 종목 목록(추천 후보). 필드는 방어적으로 파싱한다."""
-        path, api_id, body = _API_RANK_US if self.market == "us" else _API_RANK_KR
+    def top_stocks(self, criteria: str = "volume", limit: int = 10) -> list[dict]:
+        """순위 상위 종목 목록(추천 후보). criteria: volume(거래량) | change(등락률)."""
+        try:
+            path, api_id, body = _API_RANK[(self.market, criteria)]
+        except KeyError:
+            raise KiwoomRestError(f"지원하지 않는 순위 기준이다: {criteria}")
         res = self._call(path, api_id, dict(body))
         rows = next(
             (v for v in res.values() if isinstance(v, list) and v
@@ -205,6 +229,9 @@ class KiwoomRestClient:
                 "volume": pick("trde_qty", "now_trde_qty", "acc_trde_qty"),
             })
         return out
+
+    def top_volume_stocks(self, limit: int = 10) -> list[dict]:
+        return self.top_stocks("volume", limit)
 
 
 # ── 설정 파일 ───────────────────────────────────────────────
