@@ -91,3 +91,31 @@ class ClaudeAnalyst:
         return "".join(
             block.text for block in response.content if block.type == "text"
         ).strip() or "분석 결과가 비어 있다."
+
+    def recommend(self, market: str, mode: str, rows: Sequence[dict]) -> str:
+        """당일 거래량 상위 목록에서 관심 후보를 골라 이유와 함께 정리한다."""
+        lines = "\n".join(
+            f"  {r.get('code','?')} {r.get('name','')} | 현재가 {r.get('price','?')} | "
+            f"등락률 {r.get('change_pct','?')}% | 거래량 {r.get('volume','?')}"
+            for r in rows
+        )
+        prompt = (
+            f"오늘 {'미국' if market == 'us' else '국내'} 주식 당일 거래량 상위 목록이다 "
+            f"(운용 모드: {'모의투자' if mode == 'mock' else '실전투자'}).\n\n{lines}\n\n"
+            "이 데이터만 근거로, 오늘 관심 있게 볼 후보 3~5개를 골라 "
+            "종목별로 선정 이유 1~2문장과 유의점 1문장을 정리해 달라. "
+            "제공된 수치 밖의 사실은 추정하지 말고, 추정이 섞이면 표시해 달라."
+        )
+        response = self._client.beta.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            system=_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.stop_reason == "refusal":
+            return "추천 요청이 안전상 거절되었다."
+        return "".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip() or "추천 결과가 비어 있다."

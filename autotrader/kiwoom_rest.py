@@ -36,6 +36,17 @@ _API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
 # 미국주식 현재가 응답에서 시도할 필드 후보
 _US_PRICE_KEYS = ("cur_prc", "last_pric", "cur_pric", "now_pric", "prpr")
 
+# 당일 거래량 상위 (추천 후보 수집용)
+_API_RANK_KR = ("/api/dostk/rkinfo", "ka10030", {
+    "mrkt_tp": "000", "sort_tp": "1", "mang_stk_incls": "0", "crd_tp": "0",
+    "trde_qty_tp": "0", "pric_tp": "0", "trde_prica_tp": "0",
+    "mrkt_open_tp": "0", "stex_tp": "3",
+})
+_API_RANK_US = ("/api/us/rkinfo", "usa20530", {
+    "stex_tp": "0", "inds_cd": "", "stk_tp": "0", "trde_qty_tp": "0",
+    "qry_tp": "0", "stk_cnd": "0", "pric_cnd": "0", "trde_prica_cnd": "0",
+})
+
 Transport = Callable[[str, dict, dict], dict]
 
 
@@ -169,6 +180,31 @@ class KiwoomRestClient:
         res = self._call(path, api_id, body)
         logger.info("주문 전송: [%s] %s %s %d주 (주문번호=%s)",
                     self.market, code, side, quantity, res.get("ord_no", "?"))
+
+    def top_volume_stocks(self, limit: int = 10) -> list[dict]:
+        """당일 거래량 상위 종목 목록(추천 후보). 필드는 방어적으로 파싱한다."""
+        path, api_id, body = _API_RANK_US if self.market == "us" else _API_RANK_KR
+        res = self._call(path, api_id, dict(body))
+        rows = next(
+            (v for v in res.values() if isinstance(v, list) and v
+             and isinstance(v[0], dict)),
+            [],
+        )
+        out = []
+        for row in rows[:limit]:
+            def pick(*keys):
+                for k in keys:
+                    if row.get(k) not in (None, ""):
+                        return str(row[k]).strip()
+                return ""
+            out.append({
+                "code": pick("stk_cd", "code"),
+                "name": pick("stk_nm", "name"),
+                "price": pick("cur_prc", "last_pric", "now_pric"),
+                "change_pct": pick("flu_rt", "updown_rt", "chg_rt"),
+                "volume": pick("trde_qty", "now_trde_qty", "acc_trde_qty"),
+            })
+        return out
 
 
 # ── 설정 파일 ───────────────────────────────────────────────
