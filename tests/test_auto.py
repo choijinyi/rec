@@ -126,6 +126,8 @@ class UsPerCodeLimitPriceTest(unittest.TestCase):
                 return {"token": "T", "expires_dt": ""}
             if "/api/us/stkinfo" in url:  # usa10098 거래소구분 조회
                 return {"return_code": 0, "list": [{"stex_tp": "ND"}]}
+            if "/api/us/acnt" in url:     # ust21050 미체결 (없음)
+                return {"return_code": 0, "result_list": []}
             if "/api/us/mrkcond" in url:
                 price = {"NVDA": "200.00", "TSLA": "300.00"}[body["stk_cd"]]
                 return {"return_code": 0, "cur_prc": price}

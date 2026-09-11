@@ -20,6 +20,8 @@ class RiskConfig:
     order_cash_pct: float = 0.1
     # 손절: 평균 매수단가 대비 이만큼 하락하면 전량 청산 (0이면 비활성)
     stop_loss_pct: float = 0.03
+    # 매도 후 같은 종목 재매수까지 기다릴 봉 수 (횡보장 과매매 완화, 0이면 끔)
+    reentry_cooldown_bars: int = 5
 
 
 class RiskManager:

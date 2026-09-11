@@ -91,6 +91,8 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo max_drawdown_pct = 15
         echo ; 평균단가 대비 이만큼 하락하면 전량 손절 매도 ^(0이면 끔^)
         echo stop_loss_pct = 3
+        echo ; 매도 후 같은 종목 재매수까지 기다릴 봉 수 ^(과매매 완화^)
+        echo reentry_cooldown_bars = 5
     )
 )
 echo    완료
