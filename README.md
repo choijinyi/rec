@@ -44,26 +44,33 @@ python -m unittest discover -s tests -v
 - **공매도 미지원, 낙폭 한도 기본 탑재**: 계좌 평가액이 초기 자본 대비
   15% 이상 하락하면 신규 매수를 중단한다.
 
-## 키움증권 모의투자 실시간 매매 (Windows)
+## 키움증권 모의투자 실시간 매매
 
-키움 OpenAPI+ 어댑터(`autotrader/kiwoom/`)로 모의투자 실시간 자동매매를
-지원한다. 설치와 사전 준비는 [docs/INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md) 참고.
+키움 **REST API**(`autotrader/kiwoom_rest.py`)가 기본이다. OCX와 달리
+32비트 파이썬·PyQt5가 필요 없고 표준 라이브러리만으로 동작한다.
+설치와 API 키 발급은 [docs/INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md) 참고.
+
+**원클릭 설치**: [scripts/AutoTrader-Setup.bat](scripts/AutoTrader-Setup.bat)를
+바탕화면에 내려받아 더블클릭하면 Python 확인·설치, 프로그램 다운로드,
+자체 점검, `config.ini` 생성, 바탕화면 실행 바로가기 생성까지 자동 진행된다.
+(키움 REST API 사용 신청과 모의투자용 키 발급은 openapi.kiwoom.com 에서 1회 수동)
 
 ```powershell
-python -m autotrader live --code 005930 --strategy sma_crossover
+python -m autotrader live-rest --code 005930 --strategy sma_crossover
 ```
 
 - 현재가 폴링 → 1분봉 집계 → 백테스트와 동일한 엔진 경로로 신호 평가 →
   시장가 주문 전송.
-- **안전장치**: 실전투자 서버 접속 시 `--allow-real` 없이는 즉시 종료,
-  장중(평일 09:00~15:30)에만 매매, 일일 주문 횟수 제한(기본 20회),
-  낙폭 한도 도달 시 신규 매수 중단.
+- **안전장치**: `mode=mock`(모의투자 서버)이 기본, 실전은 `mode=real` +
+  `--allow-real` 이중 명시 필요. 장중(평일 09:00~15:30)에만 매매,
+  일일 주문 횟수 제한(기본 20회), 낙폭 한도 도달 시 신규 매수 중단.
 
 | 추가 모듈 | 역할 |
 |---|---|
 | `autotrader/bars.py` | 폴링 시세를 봉(Bar)으로 집계 |
-| `autotrader/kiwoom/api.py` | 키움 OpenAPI+ OCX 래퍼 (로그인·시세·주문) |
-| `autotrader/kiwoom/live.py` | 실시간 매매 루프와 안전장치 |
+| `autotrader/kiwoom_rest.py` | 키움 REST API 클라이언트 (토큰·시세·주문) |
+| `autotrader/kiwoom/api.py` | (레거시) 키움 OpenAPI+ OCX 래퍼 — `live` 명령 |
+| `autotrader/kiwoom/live.py` | 실시간 매매 루프와 안전장치 (REST/OCX 공용) |
 
 ## 유의사항
 
