@@ -1,124 +1,128 @@
 @echo off
-chcp 65001 >nul
 setlocal
-title AutoTrader ì„¤ì¹˜ í”„ë¡œê·¸ëž¨
+title AutoTrader ¼³Ä¡ ÇÁ·Î±×·¥
 
 rem =====================================================
-rem  AutoTrader ì›í´ë¦­ ì„¤ì¹˜ í”„ë¡œê·¸ëž¨ (Windows)
-rem  - 32ë¹„íŠ¸ Python 3.10 í™•ì¸/ìžë™ ì„¤ì¹˜
-rem  - í”„ë¡œê·¸ëž¨ ë‹¤ìš´ë¡œë“œ (github.com/choijinyi/rec)
-rem  - ê°€ìƒí™˜ê²½ + PyQt5 ì„¤ì¹˜, ìžì²´ ì ê²€
-rem  - ë°”íƒ•í™”ë©´ì— ì‹¤í–‰ ë°”ë¡œê°€ê¸° ìƒì„±
+rem  AutoTrader ¿øÅ¬¸¯ ¼³Ä¡ ÇÁ·Î±×·¥ (Å°¿ò REST API ¹öÀü)
+rem  - Python 3.10+ È®ÀÎ/ÀÚµ¿ ¼³Ä¡ (64ºñÆ® °¡´É)
+rem  - ÇÁ·Î±×·¥ ´Ù¿î·Îµå (github.com/choijinyi/rec)
+rem  - ÀÚÃ¼ Á¡°Ë, config.ini »ý¼º, ¹ÙÅÁÈ­¸é ¹Ù·Î°¡±â
 rem =====================================================
 
 set "INSTALL_DIR=%USERPROFILE%\autotrader"
 set "REPO_ZIP=https://github.com/choijinyi/rec/archive/refs/heads/main.zip"
-set "PY_URL=https://www.python.org/ftp/python/3.10.11/python-3.10.11.exe"
-set "PY_SETUP=%TEMP%\python-3.10.11-32bit.exe"
+set "PY_URL=https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+set "PY_SETUP=%TEMP%\python-3.12.10-amd64.exe"
 set "ZIP_FILE=%TEMP%\autotrader-main.zip"
 set "SRC_DIR=%TEMP%\autotrader-src"
-set "VENV_PY=%INSTALL_DIR%\.venv\Scripts\python.exe"
 
 echo.
 echo  =====================================================
-echo    AutoTrader ì„¤ì¹˜ë¥¼ ì‹œìž‘í•©ë‹ˆë‹¤ (í‚¤ì›€ ëª¨ì˜íˆ¬ìž ìžë™ë§¤ë§¤)
-echo    ì„¤ì¹˜ ìœ„ì¹˜: %INSTALL_DIR%
+echo    AutoTrader ¼³Ä¡¸¦ ½ÃÀÛÇÕ´Ï´Ù (Å°¿ò REST API ÀÚµ¿¸Å¸Å)
+echo    ¼³Ä¡ À§Ä¡: %INSTALL_DIR%
 echo  =====================================================
 echo.
 
-echo [1/6] 32ë¹„íŠ¸ Python 3.10 í™•ì¸ ì¤‘...
-py -3.10-32 -V >nul 2>&1
-if errorlevel 1 (
-    echo    ì„¤ì¹˜ë˜ì–´ ìžˆì§€ ì•Šì•„ ìžë™ìœ¼ë¡œ ë‚´ë ¤ë°›ì•„ ì„¤ì¹˜í•©ë‹ˆë‹¤. 1~2ë¶„ ê±¸ë¦½ë‹ˆë‹¤...
+echo [1/5] Python È®ÀÎ Áß...
+set "PYCMD="
+py -3 -c "import sys; assert sys.version_info>=(3,10)" >nul 2>&1 && set "PYCMD=py -3"
+if not defined PYCMD (
+    python -c "import sys; assert sys.version_info>=(3,10)" >nul 2>&1 && set "PYCMD=python"
+)
+if not defined PYCMD (
+    echo    PythonÀÌ ¾ø¾î ÀÚµ¿À¸·Î ³»·Á¹Þ¾Æ ¼³Ä¡ÇÕ´Ï´Ù. 1~2ºÐ °É¸³´Ï´Ù...
     powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '%PY_URL%' -OutFile '%PY_SETUP%'"
     if errorlevel 1 goto :fail_net
     start /wait "" "%PY_SETUP%" /passive InstallAllUsers=0 PrependPath=1 Include_launcher=1
+    py -3 -V >nul 2>&1 && set "PYCMD=py -3"
+    if not defined PYCMD if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PYCMD="%LOCALAPPDATA%\Programs\Python\Python312\python.exe""
 )
-echo    í™•ì¸ ì™„ë£Œ
+if not defined PYCMD (
+    echo    ! Python ¼³Ä¡¸¦ È®ÀÎÇÏÁö ¸øÇß½À´Ï´Ù. ÄÄÇ»ÅÍ¸¦ Àç½ÃÀÛÇÑ µÚ ´Ù½Ã ½ÇÇàÇØ ÁÖ¼¼¿ä.
+    goto :fail
+)
+echo    È®ÀÎ ¿Ï·á
 
-echo [2/6] í”„ë¡œê·¸ëž¨ ë‚´ë ¤ë°›ëŠ” ì¤‘...
+echo [2/5] ÇÁ·Î±×·¥ ³»·Á¹Þ´Â Áß...
 powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '%REPO_ZIP%' -OutFile '%ZIP_FILE%'; Expand-Archive -Force '%ZIP_FILE%' '%SRC_DIR%'"
 if errorlevel 1 goto :fail_net
 robocopy "%SRC_DIR%\rec-main" "%INSTALL_DIR%" /E /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 goto :fail
-echo    ì™„ë£Œ
+echo    ¿Ï·á
 
-echo [3/6] íŒŒì´ì¬ ê°€ìƒí™˜ê²½ ì¤€ë¹„ ì¤‘...
-if not exist "%VENV_PY%" py -3.10-32 -m venv "%INSTALL_DIR%\.venv" 2>nul
-if not exist "%VENV_PY%" if exist "%LOCALAPPDATA%\Programs\Python\Python310-32\python.exe" "%LOCALAPPDATA%\Programs\Python\Python310-32\python.exe" -m venv "%INSTALL_DIR%\.venv"
-if not exist "%VENV_PY%" (
-    echo    ! 32ë¹„íŠ¸ íŒŒì´ì¬ì„ ì°¾ì§€ ëª»í–ˆìŠµë‹ˆë‹¤. ì»´í“¨í„°ë¥¼ ìž¬ì‹œìž‘í•œ ë’¤ ì´ íŒŒì¼ì„ ë‹¤ì‹œ ì‹¤í–‰í•´ ì£¼ì„¸ìš”.
-    goto :fail
-)
-echo    ì™„ë£Œ
-
-echo [4/6] í•„ìˆ˜ íŒ¨í‚¤ì§€ PyQt5 ì„¤ì¹˜ ì¤‘...
-"%VENV_PY%" -m pip install --quiet --upgrade pip
-"%VENV_PY%" -m pip install --quiet PyQt5==5.15.10
-if errorlevel 1 goto :fail_net
-echo    ì™„ë£Œ
-
-echo [5/6] ìžì²´ ì ê²€ ì‹¤í–‰ ì¤‘...
+echo [3/5] ÀÚÃ¼ Á¡°Ë ½ÇÇà Áß...
 pushd "%INSTALL_DIR%"
-"%VENV_PY%" -m unittest discover -s tests >nul 2>&1
+%PYCMD% -m unittest discover -s tests >nul 2>&1
 if errorlevel 1 (
     popd
-    echo    ! ìžì²´ ì ê²€ì— ì‹¤íŒ¨í–ˆìŠµë‹ˆë‹¤. ì„¤ì¹˜ ìƒíƒœë¥¼ í™•ì¸í•´ ì£¼ì„¸ìš”.
+    echo    ! ÀÚÃ¼ Á¡°Ë¿¡ ½ÇÆÐÇß½À´Ï´Ù. ¼³Ä¡ »óÅÂ¸¦ È®ÀÎÇØ ÁÖ¼¼¿ä.
     goto :fail
 )
 popd
-echo    ì „ì²´ í…ŒìŠ¤íŠ¸ í†µê³¼
+echo    ÀüÃ¼ Å×½ºÆ® Åë°ú
 
-echo [6/6] ë°”íƒ•í™”ë©´ ë°”ë¡œê°€ê¸° ë§Œë“œëŠ” ì¤‘...
+echo [4/5] ¼³Á¤ ÆÄÀÏ ÁØºñ Áß...
+if not exist "%INSTALL_DIR%\config.ini" (
+    > "%INSTALL_DIR%\config.ini" (
+        echo [kiwoom]
+        echo ; openapi.kiwoom.com ¿¡¼­ ¹ß±Þ¹ÞÀº Å°¸¦ = µÚ¿¡ ºÙ¿©³ÖÀ¸¼¼¿ä.
+        echo ; ¸ðÀÇÅõÀÚ¿ë Å°¸¦ »ç¿ëÇÏ¼¼¿ä.
+        echo appkey =
+        echo secretkey =
+        echo ; mock = ¸ðÀÇÅõÀÚ, real = ½ÇÀüÅõÀÚ
+        echo mode = mock
+    )
+)
+echo    ¿Ï·á
+
+echo [5/5] ¹ÙÅÁÈ­¸é ¹Ù·Î°¡±â ¸¸µå´Â Áß...
 set "DESKTOP="
 for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "DESKTOP=%%D"
 if not defined DESKTOP set "DESKTOP=%USERPROFILE%\Desktop"
 
-> "%DESKTOP%\AutoTrader ëª¨ì˜íˆ¬ìž ì‹œìž‘.bat" (
+> "%DESKTOP%\AutoTrader ¸ðÀÇÅõÀÚ ½ÃÀÛ.bat" (
     echo @echo off
-    echo chcp 65001 ^>nul
-    echo title AutoTrader ëª¨ì˜íˆ¬ìž
+    echo title AutoTrader ¸ðÀÇÅõÀÚ
     echo cd /d "%INSTALL_DIR%"
-    echo echo í‚¤ì›€ ë¡œê·¸ì¸ ì°½ì´ ëœ¨ë©´ ë°˜ë“œì‹œ "ëª¨ì˜íˆ¬ìž" ì„œë²„ë¥¼ ì„ íƒí•˜ì„¸ìš”.
-    echo "%VENV_PY%" -m autotrader live --code 005930 --strategy sma_crossover
+    echo %PYCMD% -m autotrader live-rest --code 005930 --strategy sma_crossover
     echo pause
 )
-> "%DESKTOP%\AutoTrader ë°±í…ŒìŠ¤íŠ¸.bat" (
+> "%DESKTOP%\AutoTrader ¹éÅ×½ºÆ®.bat" (
     echo @echo off
-    echo chcp 65001 ^>nul
-    echo title AutoTrader ë°±í…ŒìŠ¤íŠ¸
+    echo title AutoTrader ¹éÅ×½ºÆ®
     echo cd /d "%INSTALL_DIR%"
-    echo "%VENV_PY%" -m autotrader backtest --strategy sma_crossover --days 250
-    echo "%VENV_PY%" -m autotrader backtest --strategy rsi_reversion --days 250
+    echo %PYCMD% -m autotrader backtest --strategy sma_crossover --days 250
+    echo %PYCMD% -m autotrader backtest --strategy rsi_reversion --days 250
     echo pause
 )
-echo    ì™„ë£Œ
+echo    ¿Ï·á
 
 echo.
 echo  =====================================================
-echo    ì„¤ì¹˜ê°€ ëë‚¬ìŠµë‹ˆë‹¤!
+echo    ¼³Ä¡°¡ ³¡³µ½À´Ï´Ù!
 echo.
-echo    ë°”íƒ•í™”ë©´ì— ë‘ ê°œì˜ ë°”ë¡œê°€ê¸°ê°€ ìƒê²¼ìŠµë‹ˆë‹¤.
-echo      - "AutoTrader ë°±í…ŒìŠ¤íŠ¸"     : ì§€ê¸ˆ ë°”ë¡œ ì‹¤í–‰í•´ ë³¼ ìˆ˜ ìžˆìŠµë‹ˆë‹¤.
-echo      - "AutoTrader ëª¨ì˜íˆ¬ìž ì‹œìž‘" : ì•„ëž˜ ì¤€ë¹„ í›„ ìž¥ì¤‘ì— ì‹¤í–‰í•˜ì„¸ìš”.
+echo    ¹ÙÅÁÈ­¸é¿¡ ¹Ù·Î°¡±â µÎ °³°¡ »ý°å½À´Ï´Ù.
+echo      - "AutoTrader ¹éÅ×½ºÆ®"      : Áö±Ý ¹Ù·Î ½ÇÇàÇØ º¼ ¼ö ÀÖ½À´Ï´Ù.
+echo      - "AutoTrader ¸ðÀÇÅõÀÚ ½ÃÀÛ" : ¾Æ·¡ ÁØºñ ÈÄ ÀåÁß¿¡ ½ÇÇàÇÏ¼¼¿ä.
 echo.
-echo    [ëª¨ì˜íˆ¬ìž ì‹¤í–‰ ì „ ì¤€ë¹„ - í‚¤ì›€ì¦ê¶Œ, ìµœì´ˆ 1íšŒ]
-echo      1. í‚¤ì›€ì¦ê¶Œ í™ˆíŽ˜ì´ì§€ì—ì„œ "ëª¨ì˜íˆ¬ìž ì°¸ê°€ ì‹ ì²­"
-echo      2. "í‚¤ì›€ Open API+ ì‚¬ìš© ì‹ ì²­" í›„ OpenAPI+ ëª¨ë“ˆ ì„¤ì¹˜
-echo         (ì´ ë‘ ê°€ì§€ëŠ” í‚¤ì›€ í™ˆíŽ˜ì´ì§€ì—ì„œë§Œ ê°€ëŠ¥í•´ ìžë™í™”í•  ìˆ˜ ì—†ìŠµë‹ˆë‹¤)
+echo    [¸ðÀÇÅõÀÚ ½ÇÇà Àü ÁØºñ - ÃÖÃÊ 1È¸]
+echo      1. openapi.kiwoom.com Á¢¼Ó, Å°¿ò REST API »ç¿ë ½ÅÃ»
+echo      2. ¸ðÀÇÅõÀÚ ½ÅÃ» ÈÄ ¸ðÀÇÅõÀÚ¿ë appkey/secretkey ¹ß±Þ
+echo      3. Àá½Ã ÈÄ ¿­¸®´Â config.ini¿¡ µÎ Å°¸¦ ºÙ¿©³Ö°í ÀúÀå
 echo.
-echo    ìžë™ë§¤ë§¤ëŠ” ìˆ˜ìµì„ ë³´ìž¥í•˜ì§€ ì•ŠìŠµë‹ˆë‹¤. ëª¨ì˜íˆ¬ìžë¡œ ì¶©ë¶„ížˆ
-echo    ê²€ì¦í•œ ë’¤ì—ë§Œ ì‹¤ì „ ì „í™˜ì„ ê²€í† í•˜ì„¸ìš”.
+echo    ÀÚµ¿¸Å¸Å´Â ¼öÀÍÀ» º¸ÀåÇÏÁö ¾Ê½À´Ï´Ù. ¸ðÀÇÅõÀÚ·Î ÃæºÐÈ÷
+echo    °ËÁõÇÑ µÚ¿¡¸¸ ½ÇÀü ÀüÈ¯À» °ËÅäÇÏ¼¼¿ä.
 echo  =====================================================
 echo.
+start "" notepad "%INSTALL_DIR%\config.ini"
 pause
 exit /b 0
 
 :fail_net
 echo.
-echo  ! ì¸í„°ë„· ì—°ê²° ë˜ëŠ” ë‹¤ìš´ë¡œë“œì— ë¬¸ì œê°€ ìžˆìŠµë‹ˆë‹¤. ë„¤íŠ¸ì›Œí¬ í™•ì¸ í›„ ë‹¤ì‹œ ì‹¤í–‰í•´ ì£¼ì„¸ìš”.
+echo  ! ÀÎÅÍ³Ý ¿¬°á ¶Ç´Â ´Ù¿î·Îµå¿¡ ¹®Á¦°¡ ÀÖ½À´Ï´Ù. ³×Æ®¿öÅ© È®ÀÎ ÈÄ ´Ù½Ã ½ÇÇàÇØ ÁÖ¼¼¿ä.
 :fail
 echo.
-echo  ì„¤ì¹˜ë¥¼ ì™„ë£Œí•˜ì§€ ëª»í–ˆìŠµë‹ˆë‹¤. ìœ„ ë©”ì‹œì§€ë¥¼ í™•ì¸í•´ ì£¼ì„¸ìš”.
+echo  ¼³Ä¡¸¦ ¿Ï·áÇÏÁö ¸øÇß½À´Ï´Ù. À§ ¸Þ½ÃÁö¸¦ È®ÀÎÇØ ÁÖ¼¼¿ä.
 pause
 exit /b 1
