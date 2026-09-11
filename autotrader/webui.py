@@ -17,6 +17,7 @@ from .analysis import ClaudeAnalyst, MarketSnapshot
 from .broker import PaperBroker
 from .data import generate_synthetic_bars
 from .engine import run_backtest
+from .kiwoom.auto import AutoConfig, MultiLiveTrader
 from .kiwoom.live import LiveConfig, LiveTrader
 from .kiwoom_rest import (
     KiwoomRestClient, KiwoomRestError, _read_parser, load_config, load_risk_config,
@@ -37,8 +38,8 @@ class RecordingAPI:
     def current_price(self, code: str) -> float:
         price = self.inner.current_price(code)
         with self.lock:
-            self.prices.append((datetime.now().strftime("%H:%M:%S"), price))
-            del self.prices[:-600]
+            self.prices.append((datetime.now().strftime("%H:%M:%S"), code, price))
+            del self.prices[:-1800]
         return price
 
     def send_market_order(self, account_no: str, code: str, side: str,
@@ -49,6 +50,15 @@ class RecordingAPI:
             self.events.append(
                 f"{datetime.now().strftime('%H:%M:%S')} {label} {code} {quantity}주")
             del self.events[:-100]
+
+    def top_stocks(self, criteria: str = "volume", limit: int = 10) -> list[dict]:
+        rows = self.inner.top_stocks(criteria, limit)
+        with self.lock:
+            codes = ", ".join(r["code"] for r in rows[:5] if r.get("code"))
+            self.events.append(
+                f"{datetime.now().strftime('%H:%M:%S')} 순위 조회({criteria}): {codes}")
+            del self.events[:-100]
+        return rows
 
 
 class AppState:
@@ -65,7 +75,8 @@ class AppState:
         self.analyst_factory = ClaudeAnalyst
 
     # ── 실행 제어 ──────────────────────────────────────────
-    def start(self, market: str, code: str, strategy: str, confirm: str) -> dict:
+    def start(self, market: str, code: str, strategy: str, confirm: str,
+              auto: bool = False, criteria: str = "volume") -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -79,18 +90,31 @@ class AppState:
             client = self.client_factory(cfg["appkey"], cfg["secretkey"], mock=mock,
                                          market=market)
             api = RecordingAPI(client)
-            trader = LiveTrader(
-                api=api,
-                strategy=STRATEGIES[strategy](),
-                config=LiveConfig(account_no="", code=code, market=market,
-                                  initial_cash=cash, poll_interval=3.0,
-                                  allow_real=not mock),
-                risk=RiskManager(risk_cfg, initial_equity=cash),
-                is_simulation=mock,
-            )
+            if auto:
+                trader = MultiLiveTrader(
+                    api=api,
+                    strategy_factory=STRATEGIES[strategy],
+                    config=AutoConfig(market=market, criteria=criteria,
+                                      initial_cash=cash, allow_real=not mock),
+                    risk=RiskManager(risk_cfg, initial_equity=cash),
+                    is_simulation=mock,
+                )
+            else:
+                trader = LiveTrader(
+                    api=api,
+                    strategy=STRATEGIES[strategy](),
+                    config=LiveConfig(account_no="", code=code, market=market,
+                                      initial_cash=cash, poll_interval=3.0,
+                                      allow_real=not mock),
+                    risk=RiskManager(risk_cfg, initial_equity=cash),
+                    is_simulation=mock,
+                )
             thread = threading.Thread(target=trader.run, daemon=True)
             self.trader, self.api, self.thread = trader, api, thread
-            self.params = {"market": market, "code": code, "strategy": strategy,
+            self.params = {"market": market,
+                           "code": "자동선정" if auto else code,
+                           "strategy": strategy, "auto": auto,
+                           "criteria": criteria,
                            "mode": "mock" if mock else "real", "cash": cash}
             self.last_error = ""
             thread.start()
@@ -116,15 +140,33 @@ class AppState:
             "config_mode": mode,
             "params": self.params,
             "last_error": self.last_error,
-            "prices": [], "events": [], "fills": [],
+            "prices": [], "events": [], "fills": [], "symbols": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "position_qty": 0, "orders_today": 0, "bars_seen": 0,
+            "chart_code": "",
         }
         if self.api:
+            # 차트는 한 종목만 그린다: 직접 입력 종목 또는 자동 선정 첫 종목
+            chart_code = self.params.get("code", "")
+            if self.params.get("auto") and isinstance(self.trader, MultiLiveTrader) \
+                    and self.trader.symbols:
+                chart_code = self.trader.symbols[0]
+            out["chart_code"] = chart_code
             with self.api.lock:
-                out["prices"] = self.api.prices[-300:]
+                out["prices"] = [(t, p) for t, c, p in self.api.prices
+                                 if c == chart_code][-300:]
                 out["events"] = self.api.events[-30:]
-        if self.trader:
+        if isinstance(self.trader, MultiLiveTrader):
+            trader = self.trader
+            out["equity"] = trader.equity()
+            out["cash"] = trader.account.cash
+            out["realized_pnl"] = trader.account.realized_pnl
+            out["position_qty"] = sum(
+                p.quantity for p in trader.account.positions.values())
+            out["orders_today"] = trader.orders_today
+            out["symbols"] = trader.symbols
+            fills = trader.fills
+        elif self.trader:
             engine = self.trader.engine
             out["equity"] = engine.equity()
             out["cash"] = engine.account.cash
@@ -134,10 +176,15 @@ class AppState:
             out["orders_today"] = self.trader.orders_today
             closes = getattr(engine.strategy, "_closes", None)
             out["bars_seen"] = len(closes) if closes is not None else 0
+            fills = engine.fills
+        else:
+            fills = []
+        if self.trader:
             out["fills"] = [
-                f"{f.timestamp.strftime('%H:%M')} {'매수' if f.side.value == 'buy' else '매도'} "
+                f"{f.timestamp.strftime('%H:%M')} {f.symbol} "
+                f"{'매수' if f.side.value == 'buy' else '매도'} "
                 f"{f.quantity}주 @{f.price:,.2f}"
-                for f in engine.fills[-20:]
+                for f in fills[-20:]
             ]
         return out
 
@@ -250,7 +297,9 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
 
 <div class="row">
   <select id="market"><option value="us">미국주식</option><option value="kr">국내주식</option></select>
-  <input id="code" value="AAPL" size="8">
+  <select id="selMode"><option value="auto">자동 선정</option>
+  <option value="manual">직접 입력</option></select>
+  <input id="code" value="AAPL" size="8" style="display:none">
   <select id="strategy"><option value="sma_crossover">이동평균 교차</option>
   <option value="rsi_reversion">RSI 평균회귀</option></select>
   <span id="realConfirm">실전 확인: <input id="confirm" placeholder="YES 입력" size="6"></span>
@@ -263,6 +312,7 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
   <button onclick="recommend()" id="btnRec">오늘의 추천</button>
 </div>
 <div class="warn" id="msg"></div>
+<div class="sub" id="symLine"></div>
 
 <div class="grid">
   <div class="card"><div class="k">상태</div><div class="v" id="stRun">대기</div></div>
@@ -285,13 +335,16 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
 const $=id=>document.getElementById(id);
 let lastStatus=null;
 $("market").onchange=()=>{ $("code").value = $("market").value==="us" ? "AAPL" : "005930"; };
+$("selMode").onchange=()=>{ $("code").style.display = $("selMode").value==="manual" ? "inline-block" : "none"; };
 async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",
 headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
 return r.json();}
 async function start(){
+  const auto=$("selMode").value==="auto";
   const r=await api("/api/start",{market:$("market").value,code:$("code").value.trim(),
-    strategy:$("strategy").value,confirm:$("confirm").value.trim()});
-  $("msg").textContent=r.error||"";
+    strategy:$("strategy").value,confirm:$("confirm").value.trim(),
+    auto:auto,criteria:$("recBasis").value});
+  $("msg").textContent=r.error||(auto?"자동 선정 모드로 시작 - 장이 열리면 상위 종목을 선정합니다":"");
 }
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
 async function backtest(){
@@ -338,6 +391,8 @@ async function refresh(){
     $("stPnl").textContent=s.realized_pnl!=null?Math.round(s.realized_pnl).toLocaleString():"-";
     $("stPos").textContent=s.position_qty+"주";
     $("stOrders").textContent=s.orders_today+"회";
+    $("symLine").textContent=(s.symbols&&s.symbols.length)
+      ?("자동 선정 종목: "+s.symbols.join(", ")+"  (차트: "+s.chart_code+")"):"";
     drawChart(s.prices);
     $("log").innerHTML=[...s.fills,...s.events].slice(-15).reverse()
       .map(e=>"<li>"+e+"</li>").join("")||"<li>기록 없음</li>";
@@ -389,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
                     code=(body.get("code") or "005930").strip().upper(),
                     strategy=body.get("strategy", "sma_crossover"),
                     confirm=body.get("confirm", ""),
+                    auto=bool(body.get("auto")),
+                    criteria=body.get("criteria", "volume"),
                 ))
             elif self.path == "/api/stop":
                 self._send(self.state.stop())

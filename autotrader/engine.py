@@ -52,13 +52,15 @@ class BacktestResult:
 
 class TradingEngine:
     def __init__(self, strategy: Strategy, broker: Broker, risk: RiskManager,
-                 account: Account):
+                 account: Account, last_prices: dict[str, float] | None = None):
         self.strategy = strategy
         self.broker = broker
         self.risk = risk
         self.account = account
         self.fills: list[Fill] = []
-        self._last_prices: dict[str, float] = {}
+        # 다중 종목 운용 시 여러 엔진이 가격 사전을 공유해 계좌 평가액을 함께 계산한다
+        self._last_prices: dict[str, float] = (
+            last_prices if last_prices is not None else {})
 
     def equity(self) -> float:
         return self.account.equity(self._last_prices)
