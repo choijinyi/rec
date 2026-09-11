@@ -56,6 +56,74 @@ class MarketSnapshot:
         )
 
 
+def _recommend_prompt(market: str, mode: str, rows: Sequence[dict],
+                      criteria_label: str) -> str:
+    lines = "\n".join(
+        f"  {r.get('code','?')} {r.get('name','')} | 현재가 {r.get('price','?')} | "
+        f"등락률 {r.get('change_pct','?')}% | 거래량 {r.get('volume','?')}"
+        for r in rows
+    )
+    return (
+        f"오늘 {'미국' if market == 'us' else '국내'} 주식 {criteria_label} 목록이다 "
+        f"(운용 모드: {'모의투자' if mode == 'mock' else '실전투자'}).\n\n{lines}\n\n"
+        "이 데이터만 근거로, 오늘 관심 있게 볼 후보 3~5개를 골라 "
+        "종목별로 선정 이유 1~2문장과 유의점 1문장을 정리해 달라. "
+        "제공된 수치 밖의 사실은 추정하지 말고, 추정이 섞이면 표시해 달라."
+    )
+
+
+class ClaudeCodeAnalyst:
+    """API 키 대신 PC에 설치된 Claude Code(구독 로그인)로 분석한다.
+
+    claude.ai Pro/Max 구독 계정으로 `claude` 명령에 로그인되어 있어야 하며,
+    건당 API 과금 없이 구독 사용 한도 안에서 동작한다.
+    """
+
+    TIMEOUT = 240
+
+    def __init__(self, runner=None):
+        self._runner = runner or self._run_cli
+
+    @staticmethod
+    def _find_cli() -> str:
+        import shutil
+        for name in ("claude", "claude.cmd", "claude.exe"):
+            path = shutil.which(name)
+            if path:
+                return path
+        raise RuntimeError(
+            "Claude Code가 설치되어 있지 않다. PowerShell에서\n"
+            "  irm https://claude.ai/install.ps1 | iex\n"
+            "로 설치한 뒤 `claude`를 한 번 실행해 claude.ai 계정(Pro/Max)으로 "
+            "로그인해야 한다. 또는 config.ini [claude] api_key를 입력하면 "
+            "API 방식으로 동작한다."
+        )
+
+    def _run_cli(self, prompt: str) -> str:
+        import subprocess
+        exe = self._find_cli()
+        proc = subprocess.run(
+            [exe, "-p", prompt],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=self.TIMEOUT,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Claude Code 실행 실패: {(proc.stderr or proc.stdout)[:300]}")
+        return proc.stdout.strip()
+
+    def _ask(self, prompt: str) -> str:
+        full = f"{_SYSTEM}\n\n---\n\n{prompt}"
+        return self._runner(full) or "분석 결과가 비어 있다."
+
+    def analyze(self, snapshot: MarketSnapshot) -> str:
+        return self._ask(snapshot.to_prompt())
+
+    def recommend(self, market: str, mode: str, rows: Sequence[dict],
+                  criteria_label: str = "당일 거래량 상위") -> str:
+        return self._ask(_recommend_prompt(market, mode, rows, criteria_label))
+
+
 class ClaudeAnalyst:
     def __init__(self, api_key: str, client=None):
         if client is not None:
@@ -95,18 +163,7 @@ class ClaudeAnalyst:
     def recommend(self, market: str, mode: str, rows: Sequence[dict],
                   criteria_label: str = "당일 거래량 상위") -> str:
         """순위 상위 목록에서 관심 후보를 골라 이유와 함께 정리한다."""
-        lines = "\n".join(
-            f"  {r.get('code','?')} {r.get('name','')} | 현재가 {r.get('price','?')} | "
-            f"등락률 {r.get('change_pct','?')}% | 거래량 {r.get('volume','?')}"
-            for r in rows
-        )
-        prompt = (
-            f"오늘 {'미국' if market == 'us' else '국내'} 주식 {criteria_label} 목록이다 "
-            f"(운용 모드: {'모의투자' if mode == 'mock' else '실전투자'}).\n\n{lines}\n\n"
-            "이 데이터만 근거로, 오늘 관심 있게 볼 후보 3~5개를 골라 "
-            "종목별로 선정 이유 1~2문장과 유의점 1문장을 정리해 달라. "
-            "제공된 수치 밖의 사실은 추정하지 말고, 추정이 섞이면 표시해 달라."
-        )
+        prompt = _recommend_prompt(market, mode, rows, criteria_label)
         response = self._client.beta.messages.create(
             model=MODEL,
             max_tokens=16000,

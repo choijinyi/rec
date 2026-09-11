@@ -81,7 +81,9 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo mode = mock
         echo.
         echo [claude]
-        echo ; AI 분석용 Claude API 키. console.anthropic.com 에서 발급합니다.
+        echo ; AI 분석 방식. auto = 키가 있으면 API, 없으면 Claude Code 구독 로그인
+        echo backend = auto
+        echo ; API 방식을 쓸 때만 입력. 구독 로그인 사용 시 비워 두세요.
         echo api_key =
         echo.
         echo [risk]

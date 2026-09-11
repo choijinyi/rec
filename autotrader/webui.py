@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .analysis import ClaudeAnalyst, MarketSnapshot
+from .analysis import ClaudeAnalyst, ClaudeCodeAnalyst, MarketSnapshot
 from .broker import PaperBroker
 from .data import generate_synthetic_bars
 from .engine import run_backtest
@@ -76,7 +76,23 @@ class AppState:
         self.lock = threading.Lock()
         # 테스트에서 가짜 클라이언트/분석기를 주입할 수 있게 팩토리로 분리
         self.client_factory = KiwoomRestClient
-        self.analyst_factory = ClaudeAnalyst
+        self.analyst_factory = ClaudeAnalyst          # API 키 방식
+        self.cli_analyst_factory = ClaudeCodeAnalyst  # Claude Code 구독 로그인 방식
+
+    def _make_analyst(self):
+        """분석 백엔드 선택: api_key가 있으면 API, 없으면 Claude Code 로그인.
+
+        config.ini [claude] backend = auto(기본) | api | cli 로 강제할 수 있다.
+        """
+        parser = _read_parser(self.config_path)
+        api_key, backend = "", "auto"
+        if parser.has_section("claude"):
+            section = parser["claude"]
+            api_key = section.get("api_key", "").strip()
+            backend = (section.get("backend", "auto").strip().lower() or "auto")
+        if backend == "api" or (backend == "auto" and api_key):
+            return self.analyst_factory(api_key)
+        return self.cli_analyst_factory()
 
     # ── 실행 제어 ──────────────────────────────────────────
     @staticmethod
@@ -225,10 +241,6 @@ class AppState:
         }
 
     def analyze(self) -> dict:
-        parser = _read_parser(self.config_path)
-        api_key = ""
-        if parser.has_section("claude"):
-            api_key = parser["claude"].get("api_key", "").strip()
         status = self.status()
         params = self.params or {"market": "kr", "code": "-", "strategy": "-",
                                  "mode": status["config_mode"]}
@@ -255,7 +267,7 @@ class AppState:
             orders_today=status["orders_today"],
             recent_fills=status["fills"],
         )
-        analyst = self.analyst_factory(api_key)
+        analyst = self._make_analyst()
         return {"text": analyst.analyze(snapshot)}
 
     def recommend(self, market: str, criteria: str = "volume") -> dict:
@@ -275,15 +287,14 @@ class AppState:
             f"등락률 {r['change_pct']}%  거래량 {r['volume']}"
             for i, r in enumerate(rows)
         )
-        parser = _read_parser(self.config_path)
-        api_key = ""
-        if parser.has_section("claude"):
-            api_key = parser["claude"].get("api_key", "").strip()
-        if not api_key:
-            return {"text": f"[{label} - Claude 키가 없어 목록만 표시]\n" + listing}
-        analyst = self.analyst_factory(api_key)
-        text = analyst.recommend(market, "mock" if mock else "real", rows,
-                                 criteria_label=label)
+        try:
+            analyst = self._make_analyst()
+            text = analyst.recommend(market, "mock" if mock else "real", rows,
+                                     criteria_label=label)
+        except RuntimeError as e:
+            # AI 백엔드가 없어도 순위 목록은 보여준다
+            return {"text": f"[{label}] AI 분석 불가: {e}\n\n"
+                            f"--- 순위 목록 ---\n{listing}"}
         return {"text": f"[{label} 기반 관심 후보]\n{text}\n\n"
                         f"--- 원본 데이터 ---\n{listing}"}
 

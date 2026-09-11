@@ -80,7 +80,9 @@ class WebUiHttpTest(unittest.TestCase):
 
         cls.tmp = tempfile.TemporaryDirectory()
         cfg = Path(cls.tmp.name) / "config.ini"
-        cfg.write_text("[kiwoom]\nappkey=A\nsecretkey=B\nmode=mock\n",
+        # backend=api 강제: 키가 없으므로 "API 키가 없다" 오류 경로를 검증한다
+        cfg.write_text("[kiwoom]\nappkey=A\nsecretkey=B\nmode=mock\n"
+                       "[claude]\nbackend=api\napi_key=\n",
                        encoding="utf-8")
         Handler.state = AppState(str(cfg))
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
