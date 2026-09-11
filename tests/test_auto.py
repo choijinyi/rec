@@ -124,6 +124,8 @@ class UsPerCodeLimitPriceTest(unittest.TestCase):
             calls.append((url, headers, body))
             if url.endswith("/oauth2/token"):
                 return {"token": "T", "expires_dt": ""}
+            if "/api/us/stkinfo" in url:  # usa10098 거래소구분 조회
+                return {"return_code": 0, "list": [{"stex_tp": "ND"}]}
             if "/api/us/mrkcond" in url:
                 price = {"NVDA": "200.00", "TSLA": "300.00"}[body["stk_cd"]]
                 return {"return_code": 0, "cur_prc": price}

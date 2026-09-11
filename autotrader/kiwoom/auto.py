@@ -41,6 +41,8 @@ class AutoConfig:
     initial_cash: float = 10_000_000
     max_orders_per_day: int = 20  # 전 종목 합산 한도
     allow_real: bool = False
+    # 초저가 잡주 배제 필터. None이면 시장별 기본값(미국 $5, 국내 1,000원)
+    min_price: float | None = None
 
 
 @dataclass
@@ -80,6 +82,8 @@ class MultiLiveTrader:
         self.units: dict[str, _Unit] = {}
         self.symbols: list[str] = []
         self.orders_today = 0
+        self.last_error = ""
+        self._fail_counts: dict[str, int] = {}
         self._running = False
 
     # ── 상태 조회 (UI 공용 인터페이스) ─────────────────────
@@ -97,11 +101,33 @@ class MultiLiveTrader:
         self._running = False
 
     # ── 종목 선정 ──────────────────────────────────────────
+    def _min_price(self) -> float:
+        if self.config.min_price is not None:
+            return self.config.min_price
+        return 5.0 if self.config.market == "us" else 1000.0
+
+    @staticmethod
+    def _row_price(row: dict) -> float:
+        try:
+            return abs(float(str(row.get("price", "")).replace(",", "").replace("+", "")))
+        except ValueError:
+            return 0.0
+
     def ensure_selection(self) -> list[str]:
         if self.symbols:
             return self.symbols
         rows = self.api.top_stocks(self.config.criteria, limit=10)
-        codes = [r["code"] for r in rows if r.get("code")][: self.config.num_symbols]
+        min_price = self._min_price()
+
+        def too_cheap(row: dict) -> bool:
+            price = self._row_price(row)
+            return 0 < price < min_price  # 가격을 모르는 행(0)은 배제하지 않는다
+
+        eligible = [r for r in rows if r.get("code") and not too_cheap(r)]
+        skipped = [r["code"] for r in rows if r.get("code") and too_cheap(r)]
+        if skipped:
+            logger.info("저가 필터로 제외(기준 %.2f): %s", min_price, ", ".join(skipped))
+        codes = [r["code"] for r in eligible][: self.config.num_symbols]
         if not codes:
             return []
         for code in codes:
@@ -133,9 +159,20 @@ class MultiLiveTrader:
             return []
         now = self.clock()
         fills: list[Fill] = []
-        for code in self.symbols:
+        for code in list(self.symbols):
             unit = self.units[code]
-            price = self.api.current_price(code)
+            try:
+                price = self.api.current_price(code)
+            except Exception as e:  # 한 종목의 오류가 전체를 멈추지 않게 한다
+                self._fail_counts[code] = self._fail_counts.get(code, 0) + 1
+                self.last_error = f"{code} 시세 오류: {e}"
+                logger.warning("%s 시세 조회 실패(%d회): %s",
+                               code, self._fail_counts[code], e)
+                if self._fail_counts[code] >= 3:
+                    self.symbols.remove(code)
+                    logger.warning("%s 연속 실패로 감시에서 제외", code)
+                continue
+            self._fail_counts[code] = 0
             self.last_prices[code] = price
             bar = unit.aggregator.add_tick(now, price)
             if bar is None:
@@ -143,7 +180,12 @@ class MultiLiveTrader:
             if self.orders_today >= self.config.max_orders_per_day:
                 unit.engine.strategy.on_bar(bar)  # 지표는 계속 갱신
                 continue
-            fill = unit.engine.process_bar(bar)
+            try:
+                fill = unit.engine.process_bar(bar)
+            except Exception as e:
+                self.last_error = f"{code} 주문 오류: {e}"
+                logger.warning("%s 주문 처리 실패: %s", code, e)
+                continue
             if fill is not None:
                 self.orders_today += 1
                 fills.append(fill)
@@ -159,7 +201,11 @@ class MultiLiveTrader:
                     self.config.criteria, self.config.num_symbols)
         try:
             while self._running:
-                self.step()
+                try:
+                    self.step()
+                except Exception as e:  # 루프는 어떤 오류에도 살아남는다
+                    self.last_error = f"매매 루프 오류: {e}"
+                    logger.exception("매매 루프 오류, 계속 진행: %s", e)
                 self.sleep(self.config.poll_interval)
         except KeyboardInterrupt:
             logger.info("사용자 중단")

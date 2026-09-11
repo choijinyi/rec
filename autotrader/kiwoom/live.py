@@ -134,6 +134,7 @@ class LiveTrader:
             account=Account(cash=config.initial_cash),
         )
         self.orders_today = 0
+        self.last_error = ""
         self._running = False
 
     def stop(self) -> None:
@@ -169,9 +170,14 @@ class LiveTrader:
         logger.info("자동매매 시작: %s, 봉 %d초, 폴링 %.1f초",
                     self.config.code, self.config.bar_interval,
                     self.config.poll_interval)
+        self.last_error = ""
         try:
             while self._running:
-                self.step()
+                try:
+                    self.step()
+                except Exception as e:  # 일시 오류로 루프가 죽지 않게 한다
+                    self.last_error = f"매매 루프 오류: {e}"
+                    logger.exception("매매 루프 오류, 계속 진행: %s", e)
                 self.sleep(self.config.poll_interval)
         except KeyboardInterrupt:
             logger.info("사용자 중단")

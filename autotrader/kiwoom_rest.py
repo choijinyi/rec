@@ -99,6 +99,7 @@ class KiwoomRestClient:
         self._token: str | None = None
         self._token_expires_at = 0.0
         self._last_prices: dict[str, float] = {}  # 종목별 직전 시세 (미국 지정가 주문용)
+        self._exchanges: dict[str, str] = {}      # 종목별 거래소구분 캐시 (NA/ND/NY)
 
     # ── 인증 ────────────────────────────────────────────────
     def _ensure_token(self) -> str:
@@ -151,10 +152,26 @@ class KiwoomRestClient:
     def _parse_price(raw) -> float:
         return abs(float(str(raw).replace(",", "").replace("+", "")))
 
+    def resolve_exchange(self, code: str) -> str:
+        """종목의 거래소구분(NA=AMEX, ND=NASDAQ, NY=NYSE)을 조회·캐시한다."""
+        cached = self._exchanges.get(code)
+        if cached:
+            return cached
+        try:
+            res = self._call("/api/us/stkinfo", "usa10098", {"stk_cd": code})
+            rows = res.get("list") or []
+            ex = str(rows[0].get("stex_tp", "")).strip() if rows else ""
+        except (KiwoomRestError, IndexError, AttributeError):
+            ex = ""
+        ex = ex or self.exchange
+        self._exchanges[code] = ex
+        return ex
+
     def current_price(self, code: str) -> float:
         if self.market == "us":
             res = self._call(_API_PRICE_US[0], _API_PRICE_US[1],
-                             {"stex_tp": self.exchange, "stk_cd": code})
+                             {"stex_tp": self.resolve_exchange(code),
+                              "stk_cd": code})
             for key in _US_PRICE_KEYS:
                 if res.get(key) not in (None, ""):
                     price = self._parse_price(res[key])
@@ -181,7 +198,7 @@ class KiwoomRestClient:
                 raise KiwoomRestError(f"{code}의 직전 시세가 없어 주문 단가를 정할 수 없다")
             path, api_id = _API_ORDER_US[side]
             body = {
-                "stex_tp": self.exchange,
+                "stex_tp": self.resolve_exchange(code),
                 "stk_cd": code,
                 "ord_qty": str(quantity),
                 "ord_uv": f"{last:.2f}",
@@ -222,13 +239,18 @@ class KiwoomRestClient:
                     if row.get(k) not in (None, ""):
                         return str(row[k]).strip()
                 return ""
-            out.append({
+            item = {
                 "code": pick("stk_cd", "code"),
                 "name": pick("stk_nm", "name"),
                 "price": pick("cur_prc", "last_pric", "now_pric"),
                 "change_pct": pick("flu_rt", "updown_rt", "chg_rt"),
                 "volume": pick("trde_qty", "now_trde_qty", "acc_trde_qty"),
-            })
+                "exchange": pick("stex_tp"),
+            }
+            # 순위 응답이 알려준 거래소를 캐시해 두면 시세·주문에 그대로 쓴다
+            if item["code"] and item["exchange"]:
+                self._exchanges[item["code"]] = item["exchange"]
+            out.append(item)
         return out
 
     def top_volume_stocks(self, limit: int = 10) -> list[dict]:
