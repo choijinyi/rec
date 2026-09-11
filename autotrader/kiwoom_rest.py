@@ -98,7 +98,7 @@ class KiwoomRestClient:
         self._transport = transport
         self._token: str | None = None
         self._token_expires_at = 0.0
-        self._last_price: float | None = None  # 미국주식 지정가 주문에 사용
+        self._last_prices: dict[str, float] = {}  # 종목별 직전 시세 (미국 지정가 주문용)
 
     # ── 인증 ────────────────────────────────────────────────
     def _ensure_token(self) -> str:
@@ -169,21 +169,22 @@ class KiwoomRestClient:
                 raise KiwoomRestError(
                     f"현재가(cur_prc)를 찾지 못했다. 응답 키: {sorted(res.keys())}")
             price = self._parse_price(raw)
-        self._last_price = price
+        self._last_prices[code] = price
         return price
 
     def send_market_order(self, account_no: str, code: str, side: str,
                           quantity: int) -> None:
         if self.market == "us":
-            # 미국주식은 시장가 코드가 없어 현재가 지정가로 집행한다
-            if self._last_price is None:
-                raise KiwoomRestError("직전 시세가 없어 미국주식 주문 단가를 정할 수 없다")
+            # 미국주식은 시장가 코드가 없어 해당 종목의 직전 시세 지정가로 집행한다
+            last = self._last_prices.get(code)
+            if last is None:
+                raise KiwoomRestError(f"{code}의 직전 시세가 없어 주문 단가를 정할 수 없다")
             path, api_id = _API_ORDER_US[side]
             body = {
                 "stex_tp": self.exchange,
                 "stk_cd": code,
                 "ord_qty": str(quantity),
-                "ord_uv": f"{self._last_price:.2f}",
+                "ord_uv": f"{last:.2f}",
                 "trde_tp": "00",     # 00 = 지정가
             }
             if side == "sell":
