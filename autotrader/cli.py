@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-real", action="store_true",
         help="실전투자(mode=real) 허용. 지정하지 않으면 모의투자(mock)만 실행된다",
     )
+
+    ui = sub.add_parser("ui", help="브라우저 대시보드 UI 실행 (권장)")
+    ui.add_argument("--config", default="config.ini", help="설정 파일 경로")
+    ui.add_argument("--port", type=int, default=8899, help="로컬 포트 (기본 8899)")
+    ui.add_argument("--no-browser", action="store_true", help="브라우저 자동 열기 생략")
     return parser
 
 
@@ -168,6 +173,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{'미국' if args.market == 'us' else '국내'} {code}] 전략 {args.strategy}, "
               f"{'모의투자(mockapi)' if mock else '실전투자(api)'} 서버")
         trader.run()
+
+    elif args.command == "ui":
+        from .webui import run_ui
+
+        run_ui(config_path=args.config, port=args.port,
+               open_browser=not args.no_browser)
     return 0
 
 
