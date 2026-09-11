@@ -89,6 +89,8 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo max_position_pct = 20
         echo order_cash_pct = 10
         echo max_drawdown_pct = 15
+        echo ; 평균단가 대비 이만큼 하락하면 전량 손절 매도 ^(0이면 끔^)
+        echo stop_loss_pct = 3
     )
 )
 echo    완료

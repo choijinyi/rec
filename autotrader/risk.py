@@ -18,6 +18,8 @@ class RiskConfig:
     max_drawdown_pct: float = 0.15
     # 한 번의 매수에 쓸 현금 비중
     order_cash_pct: float = 0.1
+    # 손절: 평균 매수단가 대비 이만큼 하락하면 전량 청산 (0이면 비활성)
+    stop_loss_pct: float = 0.03
 
 
 class RiskManager:
@@ -27,6 +29,12 @@ class RiskManager:
 
     def drawdown_exceeded(self, equity: float) -> bool:
         return equity < self.initial_equity * (1.0 - self.config.max_drawdown_pct)
+
+    def should_stop_out(self, avg_price: float, quantity: int, price: float) -> bool:
+        """손절 조건: 보유 중이고 평균단가 대비 stop_loss_pct 이상 하락."""
+        if self.config.stop_loss_pct <= 0 or quantity <= 0 or avg_price <= 0:
+            return False
+        return price <= avg_price * (1.0 - self.config.stop_loss_pct)
 
     def size_order(self, account: Account, symbol: str, side: Side, price: float,
                    equity: float) -> int:

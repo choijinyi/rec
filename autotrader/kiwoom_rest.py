@@ -277,14 +277,16 @@ def load_risk_config(path: str | Path):
         return None
     section = parser["risk"]
 
-    def pct(key: str, default: float) -> float:
+    def pct(key: str, default: float, allow_zero: bool = False) -> float:
         value = float(section.get(key, default))
-        if not 0 < value <= 100:
-            raise KiwoomRestError(f"[risk] {key}는 0보다 크고 100 이하여야 한다: {value}")
+        low_ok = value >= 0 if allow_zero else value > 0
+        if not (low_ok and value <= 100):
+            raise KiwoomRestError(f"[risk] {key} 값이 범위를 벗어났다: {value}")
         return value / 100.0
 
     return RiskConfig(
         max_position_pct=pct("max_position_pct", 20.0),
         order_cash_pct=pct("order_cash_pct", 10.0),
         max_drawdown_pct=pct("max_drawdown_pct", 15.0),
+        stop_loss_pct=pct("stop_loss_pct", 3.0, allow_zero=True),  # 0 = 손절 끔
     )

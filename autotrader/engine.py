@@ -68,6 +68,17 @@ class TradingEngine:
     def process_bar(self, bar: Bar) -> Fill | None:
         """봉 하나를 처리한다. 실시간 루프에서도 이 메서드를 그대로 호출한다."""
         self._last_prices[bar.symbol] = bar.close
+
+        # 손절이 전략 신호보다 우선한다. 지표는 계속 갱신한다.
+        pos = self.account.position(bar.symbol)
+        if self.risk.should_stop_out(pos.avg_price, pos.quantity, bar.close):
+            self.strategy.on_bar(bar)
+            fill = self.broker.execute(
+                Order(bar.symbol, Side.SELL, pos.quantity), bar)
+            if fill is not None:
+                self._apply_fill(fill)
+            return fill
+
         signal = self.strategy.on_bar(bar)
         if signal is Signal.HOLD:
             return None

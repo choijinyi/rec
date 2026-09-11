@@ -68,7 +68,11 @@ py -3 -m autotrader backtest --strategy rsi_reversion --days 250
 max_position_pct = 20   ; 종목당 최대 투자 비중
 order_cash_pct = 10     ; 1회 매수에 쓰는 자본 비중
 max_drawdown_pct = 15   ; 자본이 이만큼 줄면 신규 매수 중단
+stop_loss_pct = 3       ; 평균단가 대비 이만큼 하락하면 전량 손절 (0 = 끔)
 ```
+
+손절은 전략 신호보다 우선하며 백테스트·단일 매매·자동 선정 매매에
+동일하게 적용된다.
 
 ## 문제 해결
 
