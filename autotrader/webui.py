@@ -60,6 +60,9 @@ class AppState:
         self.params: dict = {}
         self.last_error = ""
         self.lock = threading.Lock()
+        # 테스트에서 가짜 클라이언트/분석기를 주입할 수 있게 팩토리로 분리
+        self.client_factory = KiwoomRestClient
+        self.analyst_factory = ClaudeAnalyst
 
     # ── 실행 제어 ──────────────────────────────────────────
     def start(self, market: str, code: str, strategy: str, confirm: str) -> dict:
@@ -73,8 +76,8 @@ class AppState:
                         "error": "실전투자 모드다. 확인란에 YES를 입력해야 시작된다."}
             risk_cfg = load_risk_config(self.config_path) or RiskConfig()
             cash = 10_000 if market == "us" else 10_000_000
-            client = KiwoomRestClient(cfg["appkey"], cfg["secretkey"], mock=mock,
-                                      market=market)
+            client = self.client_factory(cfg["appkey"], cfg["secretkey"], mock=mock,
+                                         market=market)
             api = RecordingAPI(client)
             trader = LiveTrader(
                 api=api,
@@ -177,8 +180,34 @@ class AppState:
             orders_today=status["orders_today"],
             recent_fills=status["fills"],
         )
-        analyst = ClaudeAnalyst(api_key)
+        analyst = self.analyst_factory(api_key)
         return {"text": analyst.analyze(snapshot)}
+
+    def recommend(self, market: str) -> dict:
+        """당일 거래량 상위를 키움에서 받아 Claude가 관심 후보를 고른다."""
+        cfg = load_config(self.config_path)
+        mock = cfg["mode"] != "real"
+        client = self.client_factory(cfg["appkey"], cfg["secretkey"], mock=mock,
+                                     market=market)
+        rows = client.top_volume_stocks(limit=10)
+        if not rows:
+            return {"error": "순위 데이터가 비어 있다. 장 시간과 API 키를 확인해 달라."}
+        listing = "\n".join(
+            f"{i+1}. {r['code']} {r['name']}  현재가 {r['price']}  "
+            f"등락률 {r['change_pct']}%  거래량 {r['volume']}"
+            for i, r in enumerate(rows)
+        )
+        parser = _read_parser(self.config_path)
+        api_key = ""
+        if parser.has_section("claude"):
+            api_key = parser["claude"].get("api_key", "").strip()
+        if not api_key:
+            return {"text": "[당일 거래량 상위 - Claude 키가 없어 목록만 표시]\n"
+                            + listing}
+        analyst = self.analyst_factory(api_key)
+        text = analyst.recommend(market, "mock" if mock else "real", rows)
+        return {"text": f"[당일 거래량 상위 기반 관심 후보]\n{text}\n\n"
+                        f"--- 원본 데이터 ---\n{listing}"}
 
 
 PAGE = """<!DOCTYPE html>
@@ -226,6 +255,7 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
   <button class="danger" onclick="stopT()">중지</button>
   <button onclick="backtest()">백테스트</button>
   <button onclick="analyze()" id="btnAI">AI 분석 (Fable)</button>
+  <button onclick="recommend()" id="btnRec">오늘의 추천</button>
 </div>
 <div class="warn" id="msg"></div>
 
@@ -269,6 +299,14 @@ async function analyze(){
   $("btnAI").disabled=true;$("analysis").textContent="Claude Fable이 분석 중입니다...";
   try{const r=await api("/api/analyze",{});
     $("analysis").textContent=r.error||r.text;}finally{$("btnAI").disabled=false;}
+}
+async function recommend(){
+  $("btnRec").disabled=true;
+  $("analysis").textContent="당일 거래량 상위를 조회하고 Claude Fable이 후보를 고르는 중...";
+  try{const r=await api("/api/recommend",{market:$("market").value});
+    $("analysis").textContent=(r.error||r.text)+
+      "\\n\\n※ 추천은 참고 자료이며 투자 자문이 아닙니다.";}
+  finally{$("btnRec").disabled=false;}
 }
 function drawChart(prices){
   const c=$("chart"),x=c.getContext("2d");x.clearRect(0,0,c.width,c.height);
@@ -352,6 +390,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(self.state.backtest(body.get("strategy", "sma_crossover")))
             elif self.path == "/api/analyze":
                 self._send(self.state.analyze())
+            elif self.path == "/api/recommend":
+                self._send(self.state.recommend(body.get("market", "kr")))
             else:
                 self._send({"error": "not found"}, 404)
         except (KiwoomRestError, PermissionError, RuntimeError, KeyError) as e:
