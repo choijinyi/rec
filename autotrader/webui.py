@@ -60,6 +60,10 @@ class RecordingAPI:
             del self.events[:-100]
         return rows
 
+    def __getattr__(self, name):
+        # us_balances, cancel_open_orders 등 나머지는 원본 클라이언트로 위임
+        return getattr(self.inner, name)
+
 
 class AppState:
     def __init__(self, config_path: str = "config.ini"):
@@ -230,8 +234,13 @@ class AppState:
                                  "mode": status["config_mode"]}
         pos_avg = 0.0
         if self.trader:
-            pos = self.trader.engine.account.positions.get(params.get("code", ""))
-            pos_avg = pos.avg_price if pos else 0.0
+            # LiveTrader는 engine.account, MultiLiveTrader는 account를 가진다
+            account = getattr(self.trader, "account", None)
+            if account is None:
+                account = self.trader.engine.account
+            positions = [p for p in account.positions.values() if p.quantity > 0]
+            if positions:
+                pos_avg = positions[0].avg_price
         snapshot = MarketSnapshot(
             market=params.get("market", "kr"),
             code=params.get("code", "-"),

@@ -146,6 +146,35 @@ class MultiLiveTrader:
                     self.config.criteria, ", ".join(codes))
         return codes
 
+    # ── 실계좌 동기화 ─────────────────────────────────────
+    def reconcile_positions(self) -> None:
+        """실제 계좌 잔고와 내부 장부를 맞춘다 (미체결 매수로 생긴 유령 포지션 정리).
+
+        미국주식(us_balances 지원 API)에서만 동작한다.
+        """
+        if self.config.market != "us" or not self.symbols:
+            return
+        if not hasattr(self.api, "us_balances"):
+            return
+        try:
+            balances = self.api.us_balances()
+        except Exception as e:
+            logger.warning("잔고 동기화 실패(다음 주기에 재시도): %s", e)
+            return
+        for code in self.symbols:
+            pos = self.account.position(code)
+            actual = balances.get(code, {}).get("qty", 0)
+            if actual == pos.quantity:
+                continue
+            ref_price = pos.avg_price or self.last_prices.get(code, 0.0)
+            diff = pos.quantity - actual  # 양수 = 장부가 과대(미체결 매수 등)
+            self.account.cash += diff * ref_price
+            logger.info("잔고 동기화: %s %d주 → 실제 %d주 (현금 %+.2f 보정)",
+                        code, pos.quantity, actual, diff * ref_price)
+            pos.quantity = actual
+            if actual == 0:
+                pos.avg_price = 0.0
+
     # ── 매매 루프 ──────────────────────────────────────────
     def _market_open(self) -> bool:
         if self.config.market == "us":
@@ -177,14 +206,18 @@ class MultiLiveTrader:
             bar = unit.aggregator.add_tick(now, price)
             if bar is None:
                 continue
-            if self.orders_today >= self.config.max_orders_per_day:
-                unit.engine.strategy.on_bar(bar)  # 지표는 계속 갱신
-                continue
+            # 주문 한도는 신규 매수만 막는다. 매도·손절은 항상 나간다.
+            allow_buy = self.orders_today < self.config.max_orders_per_day
             try:
-                fill = unit.engine.process_bar(bar)
+                fill = unit.engine.process_bar(bar, allow_buy=allow_buy)
             except Exception as e:
                 self.last_error = f"{code} 주문 오류: {e}"
                 logger.warning("%s 주문 처리 실패: %s", code, e)
+                # 애초에 매수가 불가능한 종목(예: 571242)은 즉시 감시 제외
+                pos = self.account.positions.get(code)
+                if "불가" in str(e) and (pos is None or pos.quantity == 0):
+                    self.symbols.remove(code)
+                    logger.warning("%s 매수 불가 종목으로 감시에서 제외", code)
                 continue
             if fill is not None:
                 self.orders_today += 1
@@ -199,10 +232,15 @@ class MultiLiveTrader:
         logger.info("자동 선정 매매 시작: %s / %s 기준 상위 %d종목",
                     "미국" if self.config.market == "us" else "국내",
                     self.config.criteria, self.config.num_symbols)
+        last_reconcile = 0.0
         try:
             while self._running:
                 try:
                     self.step()
+                    # 1분마다 실계좌 잔고와 동기화해 유령 포지션을 정리한다
+                    if time.monotonic() - last_reconcile >= 60:
+                        self.reconcile_positions()
+                        last_reconcile = time.monotonic()
                 except Exception as e:  # 루프는 어떤 오류에도 살아남는다
                     self.last_error = f"매매 루프 오류: {e}"
                     logger.exception("매매 루프 오류, 계속 진행: %s", e)

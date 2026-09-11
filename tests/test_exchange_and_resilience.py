@@ -28,6 +28,8 @@ class ExchangeTransport:
         if "/api/us/stkinfo" in url:  # usa10098
             return {"return_code": 0,
                     "list": [{"stex_tp": "NA", "stk_cd": body.get("stk_cd")}]}
+        if "/api/us/acnt" in url:     # ust21050 미체결 (없음)
+            return {"return_code": 0, "result_list": []}
         if "/api/us/mrkcond" in url:
             return {"return_code": 0, "cur_prc": "12.50"}
         if "/api/us/ordr" in url:

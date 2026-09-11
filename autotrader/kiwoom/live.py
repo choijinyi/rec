@@ -152,11 +152,9 @@ class LiveTrader:
         completed = self.aggregator.add_tick(now, price)
         if completed is None:
             return None
-        if self.orders_today >= self.config.max_orders_per_day:
-            logger.warning("일일 주문 한도(%d) 도달, 신호 무시", self.config.max_orders_per_day)
-            self.engine.strategy.on_bar(completed)  # 지표는 계속 갱신
-            return None
-        fill = self.engine.process_bar(completed)
+        # 주문 한도는 신규 매수만 막는다. 매도·손절은 항상 나간다.
+        allow_buy = self.orders_today < self.config.max_orders_per_day
+        fill = self.engine.process_bar(completed, allow_buy=allow_buy)
         if fill is not None:
             self.orders_today += 1
             logger.info("체결 기록: %s %s %d주 @ %.0f (평가액 %.0f)",

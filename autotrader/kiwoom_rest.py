@@ -192,6 +192,12 @@ class KiwoomRestClient:
     def send_market_order(self, account_no: str, code: str, side: str,
                           quantity: int) -> None:
         if self.market == "us":
+            # 같은 종목의 미체결 주문이 남아 있으면 자전거래 거부(999999)와
+            # 유령 포지션의 원인이 되므로 먼저 취소한다
+            try:
+                self.cancel_open_orders(code)
+            except Exception as e:
+                logger.warning("%s 미체결 취소 중 오류(주문은 계속 진행): %s", code, e)
             # 미국주식은 시장가 코드가 없어 해당 종목의 직전 시세 지정가로 집행한다
             last = self._last_prices.get(code)
             if last is None:
@@ -256,6 +262,55 @@ class KiwoomRestClient:
     def top_volume_stocks(self, limit: int = 10) -> list[dict]:
         return self.top_stocks("volume", limit)
 
+    # ── 미국주식 계좌·주문 관리 ─────────────────────────────
+    @staticmethod
+    def _to_int(raw) -> int:
+        try:
+            return int(float(str(raw).strip() or 0))
+        except ValueError:
+            return 0
+
+    def us_balances(self) -> dict[str, dict]:
+        """실제 계좌의 미국주식 보유 현황(ust21070). {종목: {qty, sellable}}"""
+        res = self._call("/api/us/acnt", "ust21070", {"stex_tp": "", "stk_cd": ""})
+        out: dict[str, dict] = {}
+        for row in res.get("result_list") or []:
+            code = str(row.get("stk_cd", "")).strip()
+            if code:
+                out[code] = {"qty": self._to_int(row.get("poss_qty")),
+                             "sellable": self._to_int(row.get("sell_alowq"))}
+        return out
+
+    def us_open_orders(self, code: str = "") -> list[dict]:
+        """미체결 주문 목록(ust21050)."""
+        res = self._call("/api/us/acnt", "ust21050",
+                         {"ord_dt": "", "slby_tp": "0", "stex_tp": "",
+                          "stk_cd": code})
+        out = []
+        for row in res.get("result_list") or []:
+            ord_no = str(row.get("ord_no", "")).strip()
+            row_code = str(row.get("stk_cd", "")).strip()
+            if ord_no and (not code or row_code == code):
+                out.append({"ord_no": ord_no, "code": row_code})
+        return out
+
+    def cancel_open_orders(self, code: str) -> int:
+        """해당 종목의 미체결 주문을 전부 취소(ust20003)한다. 취소 건수 반환."""
+        count = 0
+        for order in self.us_open_orders(code):
+            try:
+                self._call("/api/us/ordr", "ust20003",
+                           {"orig_ord_no": order["ord_no"],
+                            "stex_tp": self.resolve_exchange(code),
+                            "stk_cd": code})
+                count += 1
+            except KiwoomRestError as e:
+                logger.warning("%s 미체결 취소 실패(%s): %s",
+                               code, order["ord_no"], e)
+        if count:
+            logger.info("%s 미체결 %d건 취소", code, count)
+        return count
+
 
 # ── 설정 파일 ───────────────────────────────────────────────
 def _read_parser(path: str | Path) -> configparser.ConfigParser:
@@ -309,9 +364,14 @@ def load_risk_config(path: str | Path):
             raise KiwoomRestError(f"[risk] {key} 값이 범위를 벗어났다: {value}")
         return value / 100.0
 
+    cooldown = int(float(section.get("reentry_cooldown_bars", 5)))
+    if cooldown < 0:
+        raise KiwoomRestError(f"[risk] reentry_cooldown_bars는 0 이상이어야 한다: {cooldown}")
+
     return RiskConfig(
         max_position_pct=pct("max_position_pct", 20.0),
         order_cash_pct=pct("order_cash_pct", 10.0),
         max_drawdown_pct=pct("max_drawdown_pct", 15.0),
         stop_loss_pct=pct("stop_loss_pct", 3.0, allow_zero=True),  # 0 = 손절 끔
+        reentry_cooldown_bars=cooldown,  # 매도 후 재매수 대기 봉 수 (0 = 끔)
     )
