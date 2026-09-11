@@ -34,15 +34,40 @@ PyQt5, 키움 모듈 설치가 전혀 필요 없고 파이썬 표준 라이브�
 ## 실행
 
 - **백테스트**: 바탕화면 "AutoTrader 백테스트" 더블클릭. 장이 닫혀 있어도 된다.
-- **모의투자 자동매매**: 평일 09:00~15:30 장중에 "AutoTrader 모의투자 시작"
-  더블클릭. 종료는 `Ctrl+C` 또는 창 닫기.
+- **미국주식 모의투자**: "AutoTrader 미국주식 모의투자" 더블클릭.
+  미국 정규장은 한국시간 밤 22:30~새벽 5:00(겨울철 23:30~6:00)이며,
+  장 시간은 프로그램이 서머타임까지 자동 판정한다. 종료는 `Ctrl+C`.
+- **국내주식**: `--market us`를 빼면 국내주식(평일 09:00~15:30)으로 동작한다.
 
 명령행에서 직접 실행할 때:
 
 ```powershell
 cd %USERPROFILE%\autotrader
+py -3 -m autotrader live-rest --market us --code AAPL --strategy sma_crossover
 py -3 -m autotrader live-rest --code 005930 --strategy sma_crossover
 py -3 -m autotrader backtest --strategy rsi_reversion --days 250
+```
+
+미국주식 주문은 시장가 코드가 없어 직전 시세 기준 지정가로 집행되며,
+나스닥 외 거래소 종목은 `--exchange` 옵션으로 거래소 구분을 지정한다.
+
+## 실전투자 전환
+
+실전투자는 삼중 확인을 거쳐야 실행된다. 모두 의도된 안전장치다.
+
+1. openapi.kiwoom.com 에서 **실전용** appkey/secretkey를 발급받아
+   `config.ini`에 입력하고 `mode = real`로 바꾼다.
+2. "AutoTrader 미국주식 실전투자" 바로가기(내부적으로 `--allow-real`)를 실행한다.
+3. 시작 시 운용 조건(시장·종목·자본·일일 한도)이 요약되고,
+   `YES`를 직접 입력해야 주문이 시작된다.
+
+리스크 한도는 `config.ini`의 `[risk]` 섹션에서 조절한다(퍼센트 단위):
+
+```ini
+[risk]
+max_position_pct = 20   ; 종목당 최대 투자 비중
+order_cash_pct = 10     ; 1회 매수에 쓰는 자본 비중
+max_drawdown_pct = 15   ; 자본이 이만큼 줄면 신규 매수 중단
 ```
 
 ## 문제 해결

@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 MARKET_OPEN = dt.time(9, 0)
 MARKET_CLOSE = dt.time(15, 30)
+US_OPEN = dt.time(9, 30)   # 미국 동부시간 기준
+US_CLOSE = dt.time(16, 0)
 
 
 class MarketAPI(Protocol):
@@ -43,12 +45,13 @@ class MarketAPI(Protocol):
 @dataclass
 class LiveConfig:
     account_no: str
-    code: str                     # 종목코드 (예: 005930)
+    code: str                     # 종목코드 (국내: 005930, 미국: AAPL)
     bar_interval: int = 60        # 봉 주기(초)
     poll_interval: float = 2.0    # 시세 폴링 주기(초)
     initial_cash: float = 10_000_000
     max_orders_per_day: int = 20
     allow_real: bool = False      # True가 아니면 실전 서버에서 실행 거부
+    market: str = "kr"            # kr = 국내(09:00~15:30 KST), us = 미국(09:30~16:00 ET)
 
 
 class KiwoomBrokerAdapter:
@@ -84,11 +87,33 @@ def in_market_hours(now: dt.datetime) -> bool:
     return MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
 
+def _us_dst_active(utc: dt.datetime) -> bool:
+    """미국 서머타임(EDT) 여부: 3월 둘째 일요일 ~ 11월 첫째 일요일."""
+    def nth_sunday(month: int, n: int) -> dt.datetime:
+        first = dt.datetime(utc.year, month, 1, tzinfo=dt.timezone.utc)
+        offset = (6 - first.weekday()) % 7
+        return first + dt.timedelta(days=offset + 7 * (n - 1))
+
+    start = nth_sunday(3, 2).replace(hour=7)   # EST 02:00 = 07:00 UTC
+    end = nth_sunday(11, 1).replace(hour=6)    # EDT 02:00 = 06:00 UTC
+    return start <= utc < end
+
+
+def in_us_market_hours(utc_now: dt.datetime) -> bool:
+    """미국 정규장(09:30~16:00 ET) 여부. utc_now는 timezone-aware UTC."""
+    offset = -4 if _us_dst_active(utc_now) else -5
+    et = utc_now + dt.timedelta(hours=offset)
+    if et.weekday() >= 5:
+        return False
+    return US_OPEN <= et.time() <= US_CLOSE
+
+
 class LiveTrader:
     def __init__(self, api: MarketAPI, strategy: Strategy, config: LiveConfig,
                  risk: RiskManager | None = None,
                  is_simulation: bool = True,
                  clock: Callable[[], dt.datetime] = dt.datetime.now,
+                 utc_clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
                  sleep: Callable[[float], None] = time.sleep):
         if not is_simulation and not config.allow_real:
             raise PermissionError(
@@ -98,6 +123,7 @@ class LiveTrader:
         self.api = api
         self.config = config
         self.clock = clock
+        self.utc_clock = utc_clock
         self.sleep = sleep
         self.aggregator = BarAggregator(config.code, config.bar_interval)
         broker = KiwoomBrokerAdapter(api, config.account_no)
@@ -116,7 +142,10 @@ class LiveTrader:
     def step(self) -> Fill | None:
         """한 번의 폴링 사이클. 봉이 완성되면 전략을 평가하고 주문까지 처리한다."""
         now = self.clock()
-        if not in_market_hours(now):
+        if self.config.market == "us":
+            if not in_us_market_hours(self.utc_clock()):
+                return None
+        elif not in_market_hours(now):
             return None
         price = self.api.current_price(self.config.code)
         completed = self.aggregator.add_tick(now, price)
