@@ -49,6 +49,11 @@ python -m unittest discover -s tests -v
 키움 OpenAPI+ 어댑터(`autotrader/kiwoom/`)로 모의투자 실시간 자동매매를
 지원한다. 설치와 사전 준비는 [docs/INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md) 참고.
 
+**원클릭 설치**: [scripts/AutoTrader-Setup.bat](scripts/AutoTrader-Setup.bat)를
+바탕화면에 내려받아 더블클릭하면 32비트 파이썬 확인·설치, 프로그램 다운로드,
+PyQt5 설치, 자체 점검, 바탕화면 실행 바로가기 생성까지 자동으로 진행된다.
+(키움 모의투자 참가 신청과 OpenAPI+ 모듈 설치는 키움 홈페이지에서 1회 수동 진행)
+
 ```powershell
 python -m autotrader live --code 005930 --strategy sma_crossover
 ```
