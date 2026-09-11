@@ -1,0 +1,111 @@
+"""매매 엔진: 데이터 → 전략 신호 → 리스크 검증 → 브로커 체결.
+
+백테스트와 (미래의) 실시간 루프가 같은 경로를 쓰도록 설계했다.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Iterable
+
+from .broker import Broker
+from .models import Account, Bar, Fill, Order, Side
+from .risk import RiskManager
+from .strategy import Signal, Strategy
+
+
+@dataclass
+class BacktestResult:
+    initial_cash: float
+    final_equity: float
+    fills: list[Fill] = field(default_factory=list)
+    equity_curve: list[float] = field(default_factory=list)
+
+    @property
+    def total_return_pct(self) -> float:
+        return (self.final_equity / self.initial_cash - 1.0) * 100.0
+
+    @property
+    def max_drawdown_pct(self) -> float:
+        peak = -math.inf
+        max_dd = 0.0
+        for eq in self.equity_curve:
+            peak = max(peak, eq)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - eq) / peak)
+        return max_dd * 100.0
+
+    @property
+    def num_trades(self) -> int:
+        return len(self.fills)
+
+    def summary(self) -> str:
+        return (
+            f"초기 자본      : {self.initial_cash:,.0f}\n"
+            f"최종 평가액    : {self.final_equity:,.0f}\n"
+            f"총 수익률      : {self.total_return_pct:+.2f}%\n"
+            f"최대 낙폭(MDD) : {self.max_drawdown_pct:.2f}%\n"
+            f"체결 횟수      : {self.num_trades}"
+        )
+
+
+class TradingEngine:
+    def __init__(self, strategy: Strategy, broker: Broker, risk: RiskManager,
+                 account: Account):
+        self.strategy = strategy
+        self.broker = broker
+        self.risk = risk
+        self.account = account
+        self.fills: list[Fill] = []
+        self._last_prices: dict[str, float] = {}
+
+    def equity(self) -> float:
+        return self.account.equity(self._last_prices)
+
+    def process_bar(self, bar: Bar) -> Fill | None:
+        """봉 하나를 처리한다. 실시간 루프에서도 이 메서드를 그대로 호출한다."""
+        self._last_prices[bar.symbol] = bar.close
+        signal = self.strategy.on_bar(bar)
+        if signal is Signal.HOLD:
+            return None
+
+        side = Side.BUY if signal is Signal.BUY else Side.SELL
+        qty = self.risk.size_order(self.account, bar.symbol, side, bar.close, self.equity())
+        if qty <= 0:
+            return None
+
+        fill = self.broker.execute(Order(bar.symbol, side, qty), bar)
+        if fill is None:
+            return None
+        self._apply_fill(fill)
+        return fill
+
+    def _apply_fill(self, fill: Fill) -> None:
+        pos = self.account.position(fill.symbol)
+        realized = pos.apply_fill(fill)
+        cost = fill.price * fill.quantity
+        if fill.side is Side.BUY:
+            self.account.cash -= cost
+        else:
+            self.account.cash += cost
+        self.account.cash -= fill.commission
+        self.account.realized_pnl += realized - fill.commission
+        self.fills.append(fill)
+
+
+def run_backtest(strategy: Strategy, broker: Broker, risk: RiskManager,
+                 bars: Iterable[Bar], initial_cash: float) -> BacktestResult:
+    account = Account(cash=initial_cash)
+    engine = TradingEngine(strategy, broker, risk, account)
+    equity_curve: list[float] = []
+    for bar in bars:
+        engine.process_bar(bar)
+        equity_curve.append(engine.equity())
+    final_equity = equity_curve[-1] if equity_curve else initial_cash
+    return BacktestResult(
+        initial_cash=initial_cash,
+        final_equity=final_equity,
+        fills=engine.fills,
+        equity_curve=equity_curve,
+    )
