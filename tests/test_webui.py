@@ -150,3 +150,38 @@ class ResolveCashTest(unittest.TestCase):
         self.assertEqual(AppState.resolve_cash("us", "abc"), 1000.0)
         self.assertEqual(AppState.resolve_cash("us", "-50"), 1000.0)
         self.assertEqual(AppState.resolve_cash("kr", ""), 1000000.0)
+
+
+class HandlerErrorTest(unittest.TestCase):
+    """어떤 예외든 500 스택이 아니라 JSON 오류 메시지로 응답해야 한다."""
+
+    def test_unexpected_exception_returns_json_error(self):
+        import tempfile
+        from pathlib import Path
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Path(tmp.name) / "config.ini"
+        cfg.write_text("[kiwoom]\nappkey=A\nsecretkey=B\nmode=mock\n",
+                       encoding="utf-8")
+        state = AppState(str(cfg))
+
+        def boom(*a, **k):
+            raise ValueError("예상 밖 오류")
+
+        state.client_factory = boom
+        Handler.state = state
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/recommend",
+            data=json.dumps({"market": "kr"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req) as r:
+            data = json.loads(r.read())
+        self.assertIn("error", data)
+        self.assertIn("예상 밖 오류", data["error"])

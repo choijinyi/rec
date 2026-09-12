@@ -67,13 +67,49 @@ class KiwoomRestError(RuntimeError):
     pass
 
 
+def _decode_json(raw: bytes, url: str) -> dict:
+    """서버 응답을 JSON으로 해석한다. 빈/비정상 응답은 원인 안내와 함께 실패."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise KiwoomRestError(
+            f"키움 서버가 빈 응답을 반환했다 ({url}). "
+            "서버 점검 시간이거나 일시 장애일 수 있으니 잠시 후 다시 시도해 달라."
+        )
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise KiwoomRestError(
+            f"키움 서버 응답이 JSON이 아니다 ({url}): {text[:200]}"
+        ) from None
+
+
 def _http_post(url: str, headers: dict, body: dict) -> dict:
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"),
-        headers=headers, method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    import urllib.error
+
+    data = json.dumps(body).encode("utf-8")
+    error: KiwoomRestError | None = None
+    for attempt in (1, 2):  # 일시 장애는 1회 재시도
+        req = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return _decode_json(resp.read(), url)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return json.loads(raw.decode("utf-8"))  # JSON 오류 응답은 그대로 전달
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                error = KiwoomRestError(
+                    f"HTTP {e.code} 오류 ({url}): {raw[:200]!r}")
+        except urllib.error.URLError as e:
+            error = KiwoomRestError(f"네트워크 오류 ({url}): {e.reason}")
+        except KiwoomRestError as e:
+            error = e
+        if attempt == 1:
+            logger.warning("요청 실패, 1초 후 재시도: %s", error)
+            time.sleep(1.0)
+    assert error is not None
+    raise error
 
 
 class KiwoomRestClient:
