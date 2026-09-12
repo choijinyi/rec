@@ -501,8 +501,8 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("market", "kr"), body.get("criteria", "volume")))
             else:
                 self._send({"error": "not found"}, 404)
-        except (KiwoomRestError, PermissionError, RuntimeError, KeyError) as e:
-            self._send({"error": str(e)})
+        except Exception as e:  # 어떤 오류든 콘솔 스택 대신 화면에 안내한다
+            self._send({"error": f"{type(e).__name__}: {e}"})
 
 
 def run_ui(config_path: str = "config.ini", port: int = 8899,

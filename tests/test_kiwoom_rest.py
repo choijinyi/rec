@@ -97,3 +97,22 @@ class LoadConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecodeJsonTest(unittest.TestCase):
+    def test_empty_response_gives_korean_guidance(self):
+        from autotrader.kiwoom_rest import _decode_json
+        with self.assertRaises(KiwoomRestError) as ctx:
+            _decode_json(b"", "https://mockapi.kiwoom.com/oauth2/token")
+        self.assertIn("점검", str(ctx.exception))
+
+    def test_non_json_response_shows_snippet(self):
+        from autotrader.kiwoom_rest import _decode_json
+        with self.assertRaises(KiwoomRestError) as ctx:
+            _decode_json(b"<html>Service Unavailable</html>", "https://x/y")
+        self.assertIn("JSON이 아니다", str(ctx.exception))
+        self.assertIn("Service Unavailable", str(ctx.exception))
+
+    def test_valid_json_passes(self):
+        from autotrader.kiwoom_rest import _decode_json
+        self.assertEqual(_decode_json(b'{"token": "T"}', "u"), {"token": "T"})
