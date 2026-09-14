@@ -22,6 +22,8 @@ class RiskConfig:
     stop_loss_pct: float = 0.03
     # 매도 후 같은 종목 재매수까지 기다릴 봉 수 (횡보장 과매매 완화, 0이면 끔)
     reentry_cooldown_bars: int = 5
+    # 매수 후 전략 매도까지 최소 보유 봉 수 (손절은 예외, 0이면 끔)
+    min_hold_bars: int = 3
 
 
 class RiskManager:

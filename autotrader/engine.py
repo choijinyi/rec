@@ -61,7 +61,8 @@ class TradingEngine:
         # 다중 종목 운용 시 여러 엔진이 가격 사전을 공유해 계좌 평가액을 함께 계산한다
         self._last_prices: dict[str, float] = (
             last_prices if last_prices is not None else {})
-        self._bars_since_exit: dict[str, int] = {}  # 재매수 쿨다운용
+        self._bars_since_exit: dict[str, int] = {}   # 재매수 쿨다운용
+        self._bars_since_entry: dict[str, int] = {}  # 최소 보유 시간용
 
     def equity(self) -> float:
         return self.account.equity(self._last_prices)
@@ -75,6 +76,8 @@ class TradingEngine:
         self._last_prices[bar.symbol] = bar.close
         if bar.symbol in self._bars_since_exit:
             self._bars_since_exit[bar.symbol] += 1
+        if bar.symbol in self._bars_since_entry:
+            self._bars_since_entry[bar.symbol] += 1
 
         # 손절이 전략 신호보다 우선한다. 지표는 계속 갱신한다.
         pos = self.account.position(bar.symbol)
@@ -99,6 +102,13 @@ class TradingEngine:
             since_exit = self._bars_since_exit.get(bar.symbol)
             if cooldown > 0 and since_exit is not None and since_exit <= cooldown:
                 return None  # 매도 후 cooldown개 봉 동안 재매수 금지 (과매매 완화)
+        else:
+            # 매수 직후의 전략 매도(1분 왕복 매매)를 막는다. 손절은 위에서
+            # 이미 처리되므로 이 제한의 영향을 받지 않는다.
+            hold = self.risk.config.min_hold_bars
+            since_entry = self._bars_since_entry.get(bar.symbol)
+            if hold > 0 and since_entry is not None and since_entry <= hold:
+                return None
         qty = self.risk.size_order(self.account, bar.symbol, side, bar.close, self.equity())
         if qty <= 0:
             return None
@@ -109,6 +119,8 @@ class TradingEngine:
         self._apply_fill(fill)
         if side is Side.SELL:
             self._bars_since_exit[bar.symbol] = 0
+        else:
+            self._bars_since_entry[bar.symbol] = 0
         return fill
 
     def _apply_fill(self, fill: Fill) -> None:

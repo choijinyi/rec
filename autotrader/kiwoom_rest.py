@@ -404,14 +404,17 @@ def load_risk_config(path: str | Path):
             raise KiwoomRestError(f"[risk] {key} 값이 범위를 벗어났다: {value}")
         return value / 100.0
 
-    cooldown = int(float(section.get("reentry_cooldown_bars", 5)))
-    if cooldown < 0:
-        raise KiwoomRestError(f"[risk] reentry_cooldown_bars는 0 이상이어야 한다: {cooldown}")
+    def bars(key: str, default: int) -> int:
+        value = int(float(section.get(key, default)))
+        if value < 0:
+            raise KiwoomRestError(f"[risk] {key}는 0 이상이어야 한다: {value}")
+        return value
 
     return RiskConfig(
         max_position_pct=pct("max_position_pct", 20.0),
         order_cash_pct=pct("order_cash_pct", 10.0),
         max_drawdown_pct=pct("max_drawdown_pct", 15.0),
         stop_loss_pct=pct("stop_loss_pct", 3.0, allow_zero=True),  # 0 = 손절 끔
-        reentry_cooldown_bars=cooldown,  # 매도 후 재매수 대기 봉 수 (0 = 끔)
+        reentry_cooldown_bars=bars("reentry_cooldown_bars", 5),  # 매도 후 재매수 대기
+        min_hold_bars=bars("min_hold_bars", 3),  # 매수 후 최소 보유 (손절 예외)
     )

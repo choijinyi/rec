@@ -81,6 +81,8 @@ max_position_pct = 20   ; 종목당 최대 투자 비중
 order_cash_pct = 10     ; 1회 매수에 쓰는 자본 비중
 max_drawdown_pct = 15   ; 자본이 이만큼 줄면 신규 매수 중단
 stop_loss_pct = 3       ; 평균단가 대비 이만큼 하락하면 전량 손절 (0 = 끔)
+reentry_cooldown_bars = 5  ; 매도 후 재매수까지 대기 봉 수 (0 = 끔)
+min_hold_bars = 3       ; 매수 후 전략 매도까지 최소 보유 봉 수, 손절 예외 (0 = 끔)
 ```
 
 손절은 전략 신호보다 우선하며 백테스트·단일 매매·자동 선정 매매에
