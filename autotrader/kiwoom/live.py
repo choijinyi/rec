@@ -52,6 +52,7 @@ class LiveConfig:
     max_orders_per_day: int = 20
     allow_real: bool = False      # True가 아니면 실전 서버에서 실행 거부
     market: str = "kr"            # kr = 국내(09:00~15:30 KST), us = 미국(09:30~16:00 ET)
+    us_day_session: bool = False  # True면 키움 주간거래 시간(한국 낮)에도 매매
 
 
 class KiwoomBrokerAdapter:
@@ -108,6 +109,19 @@ def in_us_market_hours(utc_now: dt.datetime) -> bool:
     return US_OPEN <= et.time() <= US_CLOSE
 
 
+def in_us_day_session(utc_now: dt.datetime) -> bool:
+    """키움 미국주식 주간거래(블루오션 ATS) 시간 여부.
+
+    한국시간 10:00~18:00, 미국 서머타임 기간에는 09:00~17:00.
+    """
+    kst = utc_now + dt.timedelta(hours=9)
+    if kst.weekday() >= 5:
+        return False
+    if _us_dst_active(utc_now):
+        return dt.time(9, 0) <= kst.time() <= dt.time(17, 0)
+    return dt.time(10, 0) <= kst.time() <= dt.time(18, 0)
+
+
 class LiveTrader:
     def __init__(self, api: MarketAPI, strategy: Strategy, config: LiveConfig,
                  risk: RiskManager | None = None,
@@ -144,7 +158,10 @@ class LiveTrader:
         """한 번의 폴링 사이클. 봉이 완성되면 전략을 평가하고 주문까지 처리한다."""
         now = self.clock()
         if self.config.market == "us":
-            if not in_us_market_hours(self.utc_clock()):
+            utc_now = self.utc_clock()
+            open_now = in_us_market_hours(utc_now) or (
+                self.config.us_day_session and in_us_day_session(utc_now))
+            if not open_now:
                 return None
         elif not in_market_hours(now):
             return None

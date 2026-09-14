@@ -122,12 +122,14 @@ class AppState:
             client = self.client_factory(cfg["appkey"], cfg["secretkey"], mock=mock,
                                          market=market)
             api = RecordingAPI(client)
+            day_session = cfg.get("us_day_session", True)
             if auto:
                 trader = MultiLiveTrader(
                     api=api,
                     strategy_factory=STRATEGIES[strategy],
                     config=AutoConfig(market=market, criteria=criteria,
-                                      initial_cash=cash, allow_real=not mock),
+                                      initial_cash=cash, allow_real=not mock,
+                                      us_day_session=day_session),
                     risk=RiskManager(risk_cfg, initial_equity=cash),
                     is_simulation=mock,
                 )
@@ -137,7 +139,8 @@ class AppState:
                     strategy=STRATEGIES[strategy](),
                     config=LiveConfig(account_no="", code=code, market=market,
                                       initial_cash=cash, poll_interval=3.0,
-                                      allow_real=not mock),
+                                      allow_real=not mock,
+                                      us_day_session=day_session),
                     risk=RiskManager(risk_cfg, initial_equity=cash),
                     is_simulation=mock,
                 )

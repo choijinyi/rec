@@ -79,6 +79,8 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo secretkey =
         echo ; mock = 모의투자, real = 실전투자
         echo mode = mock
+        echo ; 미국주식 주간거래^(한국 낮 시간^) 매매 허용. 끄려면 false
+        echo us_day_session = true
         echo.
         echo [claude]
         echo ; AI 분석 방식. auto = 키가 있으면 API, 없으면 Claude Code 구독 로그인

@@ -19,7 +19,9 @@ from ..engine import TradingEngine
 from ..models import Account, Fill
 from ..risk import RiskConfig, RiskManager
 from ..strategy import Strategy
-from .live import KiwoomBrokerAdapter, in_market_hours, in_us_market_hours
+from .live import (
+    KiwoomBrokerAdapter, in_market_hours, in_us_day_session, in_us_market_hours,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ class AutoConfig:
     allow_real: bool = False
     # 초저가 잡주 배제 필터. None이면 시장별 기본값(미국 $5, 국내 1,000원)
     min_price: float | None = None
+    us_day_session: bool = False  # True면 키움 주간거래 시간(한국 낮)에도 매매
 
 
 @dataclass
@@ -182,7 +185,9 @@ class MultiLiveTrader:
     # ── 매매 루프 ──────────────────────────────────────────
     def _market_open(self) -> bool:
         if self.config.market == "us":
-            return in_us_market_hours(self.utc_clock())
+            utc_now = self.utc_clock()
+            return in_us_market_hours(utc_now) or (
+                self.config.us_day_session and in_us_day_session(utc_now))
         return in_market_hours(self.clock())
 
     def step(self) -> list[Fill]:
