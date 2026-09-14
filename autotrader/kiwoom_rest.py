@@ -318,10 +318,14 @@ class KiwoomRestClient:
         return out
 
     def us_open_orders(self, code: str = "") -> list[dict]:
-        """미체결 주문 목록(ust21050)."""
+        """미체결 주문 목록(ust21050).
+
+        종목을 지정해 조회하면 stex_tp가 필수라 1517 오류가 나므로,
+        항상 전체를 조회한 뒤 파이썬에서 종목을 걸러낸다.
+        """
         res = self._call("/api/us/acnt", "ust21050",
                          {"ord_dt": "", "slby_tp": "0", "stex_tp": "",
-                          "stk_cd": code})
+                          "stk_cd": ""})
         out = []
         for row in res.get("result_list") or []:
             ord_no = str(row.get("ord_no", "")).strip()
