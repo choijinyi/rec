@@ -95,6 +95,8 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo stop_loss_pct = 3
         echo ; 매도 후 같은 종목 재매수까지 기다릴 봉 수 ^(과매매 완화^)
         echo reentry_cooldown_bars = 5
+        echo ; 매수 후 전략 매도까지 최소 보유 봉 수 ^(손절은 예외^)
+        echo min_hold_bars = 3
     )
 )
 echo    완료
