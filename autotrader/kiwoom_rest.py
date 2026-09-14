@@ -382,6 +382,9 @@ def load_config(path: str | Path) -> dict:
         "appkey": section.get("appkey", "").strip(),
         "secretkey": section.get("secretkey", "").strip(),
         "mode": section.get("mode", "mock").strip().lower(),
+        # 미국주식 주간거래(한국 낮) 매매 허용. 기본 켬 — 끄려면 false
+        "us_day_session": section.get("us_day_session", "true").strip().lower()
+                          in ("1", "true", "yes", "y", "on"),
     }
 
 
