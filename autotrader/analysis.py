@@ -99,13 +99,21 @@ class ClaudeCodeAnalyst:
             "API 방식으로 동작한다."
         )
 
+    # 여러 줄 프롬프트를 명령 인자로 넘기면 Windows cmd 셔틀에서 잘릴 수
+    # 있으므로, 인자는 한 줄 지시만 주고 본문은 표준 입력으로 전달한다.
+    _INSTRUCTION = ("표준 입력으로 전달된 지침과 데이터만 근거로 "
+                    "한국어 분석 결과 본문만 출력하라.")
+
     def _run_cli(self, prompt: str) -> str:
         import subprocess
+        import tempfile
         exe = self._find_cli()
         proc = subprocess.run(
-            [exe, "-p", prompt],
+            [exe, "-p", self._INSTRUCTION],
+            input=prompt,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=self.TIMEOUT,
+            cwd=tempfile.gettempdir(),  # 코드 저장소를 뒤지지 않게 중립 폴더에서 실행
         )
         if proc.returncode != 0:
             raise RuntimeError(

@@ -174,6 +174,10 @@ class MultiLiveTrader:
             pos.quantity = actual
             if actual == 0:
                 pos.avg_price = 0.0
+            elif pos.avg_price <= 0:
+                # 외부 체결로 늘어난 수량에 단가 0이 남으면 매도 시
+                # 전액이 이익으로 잡히는 오류가 생기므로 시세로 채운다
+                pos.avg_price = ref_price
 
     # ── 매매 루프 ──────────────────────────────────────────
     def _market_open(self) -> bool:

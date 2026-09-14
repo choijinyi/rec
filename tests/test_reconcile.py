@@ -79,6 +79,8 @@ class CancelBeforeOrderTest(unittest.TestCase):
             if api_id == "usa10098":
                 return {"return_code": 0, "list": [{"stex_tp": "ND"}]}
             if api_id == "ust21050":   # 미체결 2건
+                # 1517 오류 방지: 전체 조회(빈 파라미터)여야 한다
+                assert body["stk_cd"] == "" and body["stex_tp"] == ""
                 return {"return_code": 0, "result_list": [
                     {"ord_no": "111", "stk_cd": "ACVA"},
                     {"ord_no": "222", "stk_cd": "ACVA"},
@@ -139,6 +141,24 @@ class ReconcileTest(unittest.TestCase):
         trader.reconcile_positions()
         self.assertEqual(pos.quantity, 0)
         self.assertAlmostEqual(trader.account.cash, 1000.0)  # 현금 환급
+
+    def test_external_fill_gets_reference_avg_price(self):
+        """외부(지연) 체결로 수량이 늘 때 평균단가 0이 남으면 안 된다.
+
+        단가 0이 남으면 매도 시 전액이 이익으로 잡혀 실현손익이 부풀려진다.
+        """
+        api = FakeUsAPI()
+        trader = self.make_trader(api)
+        trader.step()
+        trader.last_prices["AAA"] = 10.0
+        pos = trader.account.position("AAA")
+        pos.quantity, pos.avg_price = 0, 0.0       # 장부엔 없음
+        api.balances = {"AAA": {"qty": 3, "sellable": 3}}  # 실제 3주 체결
+        trader.reconcile_positions()
+        self.assertEqual(pos.quantity, 3)
+        self.assertAlmostEqual(pos.avg_price, 10.0)  # 시세로 단가 설정
+        # 이제 손절 판정도 정상 작동한다 (단가 0이면 영구히 손절 불가였다)
+        self.assertTrue(trader.risk.should_stop_out(pos.avg_price, 3, 9.0))
 
     def test_matching_balance_untouched(self):
         api = FakeUsAPI()
