@@ -36,6 +36,17 @@ class ParseSelectionTest(unittest.TestCase):
     def test_empty_when_nothing_matches(self):
         self.assertEqual(parse_selection("후보가 마땅치 않다.", self.VALID, 3), [])
 
+    def test_bare_code_matches_nxt_suffixed_candidate(self):
+        # 순위 응답이 233740_AL로 와도 AI가 233740으로 답하면 인정한다
+        valid = ["233740_AL", "114800_AL", "462330_AL"]
+        text = "선정: 233740, 114800, 462330"
+        self.assertEqual(parse_selection(text, valid, 3),
+                         ["233740_AL", "114800_AL", "462330_AL"])
+
+    def test_suffixed_answer_matches_bare_candidate(self):
+        valid = ["233740", "114800"]
+        self.assertEqual(parse_selection("선정: 114800_AL", valid, 1), ["114800"])
+
 
 class SelectSymbolsTest(unittest.TestCase):
     ROWS = [
@@ -160,6 +171,29 @@ class MultiTraderAiSelectionTest(unittest.TestCase):
             lambda rows, num: (["BBB", "AAA", "CCC"], ""), num_symbols=2)
         trader.step()
         self.assertEqual(trader.symbols, ["BBB", "AAA"])
+
+
+class KrRankingCodeSuffixTest(unittest.TestCase):
+    """국내 순위 응답의 NXT 통합 표기(005930_AL)가 순수 코드로 정규화되는지."""
+
+    def test_strips_al_suffix_for_kr(self):
+        from autotrader.kiwoom_rest import KiwoomRestClient
+
+        def transport(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            if "/api/dostk/rkinfo" in url:
+                return {"return_code": 0, "result_list": [
+                    {"stk_cd": "114800_AL", "stk_nm": "KODEX 인버스",
+                     "cur_prc": "1052", "flu_rt": "0.5", "trde_qty": "1000"},
+                    {"stk_cd": "005930", "stk_nm": "삼성전자",
+                     "cur_prc": "70000", "flu_rt": "1.0", "trde_qty": "900"},
+                ]}
+            raise AssertionError(url)
+
+        client = KiwoomRestClient("A", "S", market="kr", transport=transport)
+        rows = client.top_stocks("volume", limit=10)
+        self.assertEqual([r["code"] for r in rows], ["114800", "005930"])
 
 
 class WebUiWiringTest(unittest.TestCase):

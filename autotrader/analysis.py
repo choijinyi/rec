@@ -97,25 +97,33 @@ def parse_selection(text: str, valid_codes: Sequence[str],
     """분석 응답에서 선정 종목 코드를 추출한다.
 
     '선정:' 줄을 우선 찾고, 없으면 본문 전체에서 후보 코드의 등장 순서를 쓴다.
-    후보 목록에 없는 코드는 버린다.
+    후보 목록에 없는 코드는 버린다. 국내 NXT 통합 표기(005930_AL)와 순수
+    코드(005930)는 어느 쪽으로 답해도 같은 후보로 인정한다.
     """
-    valid = {str(c).upper(): str(c) for c in valid_codes if c}
+    valid: dict[str, str] = {}
+    for c in valid_codes:
+        if not c:
+            continue
+        code = str(c)
+        valid.setdefault(code.upper(), code)
+        valid.setdefault(code.upper().split("_", 1)[0], code)
     picked: list[str] = []
 
     def take(tokens: Sequence[str]) -> None:
         for token in tokens:
-            code = valid.get(token.upper())
+            key = token.upper()
+            code = valid.get(key) or valid.get(key.split("_", 1)[0])
             if code and code not in picked:
                 picked.append(code)
 
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("선정") or stripped.upper().startswith("SELECTED"):
-            take(re.findall(r"[A-Za-z0-9.]+", stripped.split(":", 1)[-1]))
+            take(re.findall(r"[A-Za-z0-9._]+", stripped.split(":", 1)[-1]))
             if picked:
                 break
     if not picked:
-        take(re.findall(r"[A-Za-z0-9.]+", text))
+        take(re.findall(r"[A-Za-z0-9._]+", text))
     return picked[:num]
 
 

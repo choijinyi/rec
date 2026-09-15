@@ -281,8 +281,13 @@ class KiwoomRestClient:
                     if row.get(k) not in (None, ""):
                         return str(row[k]).strip()
                 return ""
+            # 국내 순위 응답은 NXT 통합 표기(예: 005930_AL)로 올 수 있는데,
+            # 주문·시세 API는 순수 6자리 코드만 받으므로 접미사를 뗀다
+            code = pick("stk_cd", "code")
+            if self.market != "us" and "_" in code:
+                code = code.split("_", 1)[0]
             item = {
-                "code": pick("stk_cd", "code"),
+                "code": code,
                 "name": pick("stk_nm", "name"),
                 "price": pick("cur_prc", "last_pric", "now_pric"),
                 "change_pct": pick("flu_rt", "updown_rt", "chg_rt"),
