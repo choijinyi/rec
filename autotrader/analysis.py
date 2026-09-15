@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -72,6 +73,59 @@ def _recommend_prompt(market: str, mode: str, rows: Sequence[dict],
     )
 
 
+def _select_prompt(market: str, num: int, rows: Sequence[dict],
+                   criteria_label: str) -> str:
+    lines = "\n".join(
+        f"  {r.get('code','?')} {r.get('name','')} | 현재가 {r.get('price','?')} | "
+        f"등락률 {r.get('change_pct','?')}% | 거래량 {r.get('volume','?')}"
+        for r in rows
+    )
+    return (
+        f"오늘 {'미국' if market == 'us' else '국내'} 주식 {criteria_label} 후보 "
+        f"목록이다. 자동매매 프로그램이 이 중 {num}개 종목을 골라 단기 자동매매를 "
+        f"진행하려 한다.\n\n{lines}\n\n"
+        f"제공된 수치만 근거로, 유동성(거래량)·추세·급반전 위험을 고려해 매매 "
+        f"후보 {num}개를 골라 달라.\n"
+        f"출력 형식(반드시 지킬 것):\n"
+        f"첫 줄: 선정: 코드1, 코드2, ...  (정확히 {num}개, 위 목록에 있는 코드만)\n"
+        "다음 줄부터: 종목별 선정 이유 1문장과 유의점 1문장."
+    )
+
+
+def parse_selection(text: str, valid_codes: Sequence[str],
+                    num: int) -> list[str]:
+    """분석 응답에서 선정 종목 코드를 추출한다.
+
+    '선정:' 줄을 우선 찾고, 없으면 본문 전체에서 후보 코드의 등장 순서를 쓴다.
+    후보 목록에 없는 코드는 버린다.
+    """
+    valid = {str(c).upper(): str(c) for c in valid_codes if c}
+    picked: list[str] = []
+
+    def take(tokens: Sequence[str]) -> None:
+        for token in tokens:
+            code = valid.get(token.upper())
+            if code and code not in picked:
+                picked.append(code)
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("선정") or stripped.upper().startswith("SELECTED"):
+            take(re.findall(r"[A-Za-z0-9.]+", stripped.split(":", 1)[-1]))
+            if picked:
+                break
+    if not picked:
+        take(re.findall(r"[A-Za-z0-9.]+", text))
+    return picked[:num]
+
+
+def _run_selection(ask, market: str, rows: Sequence[dict], num: int,
+                   criteria_label: str) -> tuple[list[str], str]:
+    text = ask(_select_prompt(market, num, rows, criteria_label))
+    codes = parse_selection(text, [r.get("code", "") for r in rows], num)
+    return codes, text
+
+
 class ClaudeCodeAnalyst:
     """API 키 대신 PC에 설치된 Claude Code(구독 로그인)로 분석한다.
 
@@ -131,6 +185,12 @@ class ClaudeCodeAnalyst:
                   criteria_label: str = "당일 거래량 상위") -> str:
         return self._ask(_recommend_prompt(market, mode, rows, criteria_label))
 
+    def select_symbols(self, market: str, rows: Sequence[dict], num: int,
+                       criteria_label: str = "당일 거래량 상위",
+                       ) -> tuple[list[str], str]:
+        """후보 목록에서 매매 대상 종목 코드를 골라 (코드들, 근거 본문)을 준다."""
+        return _run_selection(self._ask, market, rows, num, criteria_label)
+
 
 class ClaudeAnalyst:
     def __init__(self, api_key: str, client=None):
@@ -185,3 +245,24 @@ class ClaudeAnalyst:
         return "".join(
             block.text for block in response.content if block.type == "text"
         ).strip() or "추천 결과가 비어 있다."
+
+    def select_symbols(self, market: str, rows: Sequence[dict], num: int,
+                       criteria_label: str = "당일 거래량 상위",
+                       ) -> tuple[list[str], str]:
+        """후보 목록에서 매매 대상 종목 코드를 골라 (코드들, 근거 본문)을 준다."""
+        return _run_selection(self._ask, market, rows, num, criteria_label)
+
+    def _ask(self, prompt: str) -> str:
+        response = self._client.beta.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            system=_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.stop_reason == "refusal":
+            return "요청이 안전상 거절되었다."
+        return "".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip()

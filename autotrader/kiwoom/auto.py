@@ -64,7 +64,9 @@ class MultiLiveTrader:
                  is_simulation: bool = True,
                  clock: Callable[[], dt.datetime] = dt.datetime.now,
                  utc_clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 selector: Callable[[list[dict], int],
+                                    tuple[list[str], str]] | None = None):
         if not is_simulation and not config.allow_real:
             raise PermissionError(
                 "실전투자 접속이 감지되었다. 모의투자로 검증하거나 allow_real을 "
@@ -86,6 +88,9 @@ class MultiLiveTrader:
         self.symbols: list[str] = []
         self.orders_today = 0
         self.last_error = ""
+        # (후보 목록, 선정 수) → (선정 코드들, 근거 본문). 예: Fable AI 선정.
+        self.selector = selector
+        self.selection_note = ""
         self._fail_counts: dict[str, int] = {}
         self._running = False
 
@@ -130,7 +135,9 @@ class MultiLiveTrader:
         skipped = [r["code"] for r in rows if r.get("code") and too_cheap(r)]
         if skipped:
             logger.info("저가 필터로 제외(기준 %.2f): %s", min_price, ", ".join(skipped))
-        codes = [r["code"] for r in eligible][: self.config.num_symbols]
+        codes = self._ai_select(eligible)
+        if not codes:
+            codes = [r["code"] for r in eligible][: self.config.num_symbols]
         if not codes:
             return []
         for code in codes:
@@ -147,6 +154,31 @@ class MultiLiveTrader:
         self.symbols = codes
         logger.info("자동 선정 종목(%s 기준): %s",
                     self.config.criteria, ", ".join(codes))
+        return codes
+
+    def _ai_select(self, eligible: list[dict]) -> list[str]:
+        """selector(예: Fable AI)로 후보에서 종목을 고른다. 실패하면 빈 목록.
+
+        선정은 한 번만 시도한다 — 실패해도 순위 상위로 대체하고 매매를 막지
+        않는다. AI 응답이 후보 밖 코드를 내면 그 코드는 버린다.
+        """
+        if self.selector is None or not eligible:
+            return []
+        selector, self.selector = self.selector, None  # 1회만 시도
+        try:
+            picked, note = selector(eligible, self.config.num_symbols)
+        except Exception as e:
+            self.last_error = f"AI 종목 선정 실패, 순위 상위로 대체: {e}"
+            logger.warning(self.last_error)
+            return []
+        valid = {r["code"] for r in eligible}
+        codes = [c for c in picked if c in valid][: self.config.num_symbols]
+        if not codes:
+            self.last_error = "AI 선정 결과에서 유효한 종목을 찾지 못해 순위 상위로 대체"
+            logger.warning("%s: %s", self.last_error, note[:200])
+            return []
+        self.selection_note = note
+        logger.info("AI 종목 선정: %s", ", ".join(codes))
         return codes
 
     # ── 실계좌 동기화 ─────────────────────────────────────

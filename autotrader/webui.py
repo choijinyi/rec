@@ -20,7 +20,8 @@ from .engine import run_backtest
 from .kiwoom.auto import AutoConfig, MultiLiveTrader
 from .kiwoom.live import LiveConfig, LiveTrader
 from .kiwoom_rest import (
-    KiwoomRestClient, KiwoomRestError, _read_parser, load_config, load_risk_config,
+    RANK_CRITERIA_LABELS, KiwoomRestClient, KiwoomRestError, _read_parser,
+    load_config, load_risk_config,
 )
 from .risk import RiskConfig, RiskManager
 from .strategy import STRATEGIES
@@ -108,7 +109,7 @@ class AppState:
 
     def start(self, market: str, code: str, strategy: str, confirm: str,
               auto: bool = False, criteria: str = "volume",
-              cash=None) -> dict:
+              cash=None, ai_select: bool = False) -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -124,6 +125,16 @@ class AppState:
             api = RecordingAPI(client)
             day_session = cfg.get("us_day_session", True)
             if auto:
+                selector = None
+                if ai_select:
+                    label = RANK_CRITERIA_LABELS.get(criteria, criteria)
+
+                    def selector(rows, num):
+                        # 선정 시점(장 시작)에 분석 백엔드를 만든다. 백엔드가
+                        # 없으면 여기서 예외가 나고, 트레이더가 순위 상위로 대체한다.
+                        analyst = self._make_analyst()
+                        return analyst.select_symbols(market, rows, num,
+                                                      criteria_label=label)
                 trader = MultiLiveTrader(
                     api=api,
                     strategy_factory=STRATEGIES[strategy],
@@ -132,6 +143,7 @@ class AppState:
                                       us_day_session=day_session),
                     risk=RiskManager(risk_cfg, initial_equity=cash),
                     is_simulation=mock,
+                    selector=selector,
                 )
             else:
                 trader = LiveTrader(
@@ -155,7 +167,7 @@ class AppState:
             self.params = {"market": market,
                            "code": "자동선정" if auto else code,
                            "strategy": strategy, "auto": auto,
-                           "criteria": criteria,
+                           "criteria": criteria, "ai_select": bool(ai_select),
                            "mode": "mock" if mock else "real", "cash": cash}
             self.last_error = ""
             thread.start()
@@ -185,7 +197,7 @@ class AppState:
             "prices": [], "events": [], "fills": [], "symbols": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "position_qty": 0, "orders_today": 0, "bars_seen": 0,
-            "chart_code": "",
+            "chart_code": "", "selection_note": "",
         }
         if self.api:
             # 차트는 한 종목만 그린다: 직접 입력 종목 또는 자동 선정 첫 종목
@@ -207,6 +219,7 @@ class AppState:
                 p.quantity for p in trader.account.positions.values())
             out["orders_today"] = trader.orders_today
             out["symbols"] = trader.symbols
+            out["selection_note"] = trader.selection_note
             fills = trader.fills
         elif self.trader:
             engine = self.trader.engine
@@ -275,8 +288,6 @@ class AppState:
 
     def recommend(self, market: str, criteria: str = "volume") -> dict:
         """순위 상위를 키움에서 받아 Claude가 관심 후보를 고른다."""
-        from .kiwoom_rest import RANK_CRITERIA_LABELS
-
         label = RANK_CRITERIA_LABELS.get(criteria, criteria)
         cfg = load_config(self.config_path)
         mock = cfg["mode"] != "real"
@@ -341,6 +352,7 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
   <select id="market"><option value="us">미국주식</option><option value="kr">국내주식</option></select>
   <select id="selMode"><option value="auto">자동 선정</option>
   <option value="manual">직접 입력</option></select>
+  <label id="aiSelWrap" title="장이 열리면 순위 상위 후보를 Claude Fable에게 보내 매매 종목을 고르게 합니다. 실패 시 순위 상위로 자동 대체됩니다."><input type="checkbox" id="aiSelect" checked> Fable 종목 선정</label>
   <input id="code" value="AAPL" size="8" style="display:none">
   <select id="strategy"><option value="sma_crossover">이동평균 교차</option>
   <option value="rsi_reversion">RSI 평균회귀</option></select>
@@ -376,11 +388,13 @@ ul{list-style:none} li{padding:3px 0;border-bottom:1px solid var(--line);font-si
 
 <script>
 const $=id=>document.getElementById(id);
-let lastStatus=null;
+let lastStatus=null,shownNote="";
 $("market").onchange=()=>{ const us=$("market").value==="us";
   $("code").value = us ? "AAPL" : "005930";
   $("cash").value = us ? "1000" : "1000000"; };
-$("selMode").onchange=()=>{ $("code").style.display = $("selMode").value==="manual" ? "inline-block" : "none"; };
+$("selMode").onchange=()=>{ const manual=$("selMode").value==="manual";
+  $("code").style.display = manual ? "inline-block" : "none";
+  $("aiSelWrap").style.display = manual ? "none" : "inline"; };
 async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",
 headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
 return r.json();}
@@ -388,8 +402,11 @@ async function start(){
   const auto=$("selMode").value==="auto";
   const r=await api("/api/start",{market:$("market").value,code:$("code").value.trim(),
     strategy:$("strategy").value,confirm:$("confirm").value.trim(),
-    auto:auto,criteria:$("recBasis").value,cash:$("cash").value.trim()});
-  $("msg").textContent=r.error||(auto?"자동 선정 모드로 시작 - 장이 열리면 상위 종목을 선정합니다":"");
+    auto:auto,criteria:$("recBasis").value,cash:$("cash").value.trim(),
+    ai_select:auto&&$("aiSelect").checked});
+  $("msg").textContent=r.error||(auto?($("aiSelect").checked
+    ?"자동 선정 모드로 시작 - 장이 열리면 Fable이 후보 중 매매 종목을 고릅니다"
+    :"자동 선정 모드로 시작 - 장이 열리면 상위 종목을 선정합니다"):"");
 }
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
 async function backtest(){
@@ -438,6 +455,9 @@ async function refresh(){
     $("stOrders").textContent=s.orders_today+"회";
     $("symLine").textContent=(s.symbols&&s.symbols.length)
       ?("자동 선정 종목: "+s.symbols.join(", ")+"  (차트: "+s.chart_code+")"):"";
+    if(s.selection_note&&s.selection_note!==shownNote){shownNote=s.selection_note;
+      $("analysis").textContent="[Fable 종목 선정 근거]\\n"+s.selection_note+
+        "\\n\\n※ 선정은 참고 자료이며 투자 자문이 아닙니다.";}
     drawChart(s.prices);
     $("log").innerHTML=[...s.fills,...s.events].slice(-15).reverse()
       .map(e=>"<li>"+e+"</li>").join("")||"<li>기록 없음</li>";
@@ -492,6 +512,7 @@ class Handler(BaseHTTPRequestHandler):
                     auto=bool(body.get("auto")),
                     criteria=body.get("criteria", "volume"),
                     cash=body.get("cash"),
+                    ai_select=bool(body.get("ai_select")),
                 ))
             elif self.path == "/api/stop":
                 self._send(self.state.stop())
