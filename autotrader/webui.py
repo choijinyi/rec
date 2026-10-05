@@ -64,7 +64,7 @@ class AppState:
         self.client_factory = KiwoomRestClient
 
     # ── 실행 제어 ──────────────────────────────────────────
-    def start(self, market: str, code: str, base_price, step_pct,
+    def start(self, market: str, code: str, buy_price, sell_price, step_pct,
               buy_splits, sell_splits, cash, confirm: str = "") -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
@@ -78,7 +78,8 @@ class AppState:
             try:
                 split_cfg = SplitConfig(
                     code=code,
-                    base_price=_parse_float(base_price, "기준 가격"),
+                    buy_start_price=_parse_float(buy_price, "매수 시작 금액"),
+                    sell_start_price=_parse_float(sell_price, "매도 시작 금액"),
                     step_pct=_parse_float(step_pct, "분할 %"),
                     buy_splits=_parse_int(buy_splits, "매수 분할"),
                     sell_splits=_parse_int(sell_splits, "매도 분할"),
@@ -104,7 +105,8 @@ class AppState:
             thread = threading.Thread(target=run_guarded, daemon=True)
             self.trader, self.api, self.thread = trader, api, thread
             self.params = {"market": market, "code": code,
-                           "base_price": split_cfg.base_price,
+                           "buy_start_price": split_cfg.buy_start_price,
+                           "sell_start_price": split_cfg.sell_start_price,
                            "step_pct": split_cfg.step_pct,
                            "buy_splits": split_cfg.buy_splits,
                            "sell_splits": split_cfg.sell_splits,
@@ -205,12 +207,13 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 .okmsg{color:var(--ok)}
 </style></head><body>
 <h1>AutoTrader 분할매매 <span id="modeBadge" class="badge mock">모의투자</span></h1>
-<div class="sub">기준 가격에서부터 정해진 %마다 자동 분할매수 · 분할매도</div>
+<div class="sub">매수 시작가에서부터 %씩 내려가며 분할매수 · 매도 시작가에서부터 %씩 올라가며 분할매도</div>
 
 <div class="row">
   <select id="market"><option value="kr">국내주식</option><option value="us">미국주식</option></select>
   <span><label>종목코드</label><br><input id="code" value="005930" size="8"></span>
-  <span><label>기준 가격</label><br><input id="base" value="" size="9" placeholder="예: 70000"></span>
+  <span><label>매수 시작가</label><br><input id="buyStart" value="" size="9" placeholder="예: 68000" title="가격이 이 금액 이하로 오면 1차 매수, 이후 분할 %씩 내려갈 때마다 추가 매수"></span>
+  <span><label>매도 시작가</label><br><input id="sellStart" value="" size="9" placeholder="예: 72000" title="가격이 이 금액 이상으로 오면 1차 매도, 이후 분할 %씩 올라갈 때마다 추가 매도"></span>
   <span><label>분할 %</label><br><input id="step" value="3" size="4"></span>
   <span><label>매수 분할</label><br><input id="nbuy" value="3" size="3"></span>
   <span><label>매도 분할</label><br><input id="nsell" value="3" size="3"></span>
@@ -250,10 +253,11 @@ headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undef
 return r.json();}
 async function start(){
   const r=await api("/api/start",{market:$("market").value,code:$("code").value.trim(),
-    base_price:$("base").value.trim(),step_pct:$("step").value.trim(),
+    buy_price:$("buyStart").value.trim(),sell_price:$("sellStart").value.trim(),
+    step_pct:$("step").value.trim(),
     buy_splits:$("nbuy").value.trim(),sell_splits:$("nsell").value.trim(),
     cash:$("cash").value.trim(),confirm:$("confirm").value.trim()});
-  $("msg").textContent=r.error||"분할매매 시작 - 장중에 기준 가격 도달 시 자동 집행됩니다";
+  $("msg").textContent=r.error||"분할매매 시작 - 장중에 시작 금액 도달 시 자동 집행됩니다";
   $("msg").className=r.error?"warn":"warn okmsg";
 }
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
@@ -343,7 +347,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(self.state.start(
                     market=body.get("market", "kr"),
                     code=body.get("code", ""),
-                    base_price=body.get("base_price"),
+                    buy_price=body.get("buy_price"),
+                    sell_price=body.get("sell_price"),
                     step_pct=body.get("step_pct"),
                     buy_splits=body.get("buy_splits", 3),
                     sell_splits=body.get("sell_splits", 3),

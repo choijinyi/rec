@@ -1,11 +1,12 @@
 """분할매매 전용 자동매매.
 
-사용자가 정한 종목·기준 가격·분할 %·분할 횟수·총 투입 금액을 받아,
-기준 가격에서부터 분할 %만큼 내려갈 때마다 자동 분할매수, 기준 가격에서
-분할 %만큼 올라갈 때마다 자동 분할매도를 수행한다.
+사용자가 정한 종목·매수 시작 금액·매도 시작 금액·분할 %·분할 횟수·
+총 투입 금액을 받아, 가격이 매수 시작 금액 이하로 내려오면 거기서부터
+분할 %만큼 내려갈 때마다 자동 분할매수, 매도 시작 금액 이상으로
+올라가면 거기서부터 분할 %만큼 올라갈 때마다 자동 분할매도를 수행한다.
 
-- 1차 매수가 = 기준 가격, i차 매수가 = 기준가 × (1 - 분할% × (i-1))
-- j차 매도가 = 기준가 × (1 + 분할% × j)
+- i차 매수가 = 매수 시작가 × (1 - 분할% × (i-1))  (1차 = 매수 시작가)
+- j차 매도가 = 매도 시작가 × (1 + 분할% × (j-1))  (1차 = 매도 시작가)
 - 각 매수는 (총 투입 금액 ÷ 매수 분할 횟수)만큼, 각 매도는 보유 수량을
   남은 매도 횟수로 나눈 만큼(마지막 매도는 전량) 집행한다.
 - 각 분할 레벨은 1회만 집행한다. 가격이 여러 레벨을 한 번에 지나가면
@@ -81,7 +82,8 @@ def in_us_day_session(utc_now: dt.datetime) -> bool:
 @dataclass
 class SplitConfig:
     code: str                     # 종목코드 (국내: 005930, 미국: AAPL)
-    base_price: float             # 기준 가격
+    buy_start_price: float        # 분할매수 시작 금액 (1차 매수 발동가)
+    sell_start_price: float       # 분할매도 시작 금액 (1차 매도 발동가)
     step_pct: float               # 분할 간격(%)
     buy_splits: int = 3           # 매수 분할 횟수
     sell_splits: int = 3          # 매도 분할 횟수
@@ -124,8 +126,14 @@ class SplitTrader:
             )
         if not config.code:
             raise ValueError("종목코드가 비어 있다")
-        if config.base_price <= 0:
-            raise ValueError("기준 가격은 0보다 커야 한다")
+        if config.buy_start_price <= 0:
+            raise ValueError("매수 시작 금액은 0보다 커야 한다")
+        if config.sell_start_price <= 0:
+            raise ValueError("매도 시작 금액은 0보다 커야 한다")
+        if config.sell_start_price <= config.buy_start_price:
+            raise ValueError(
+                "매도 시작 금액은 매수 시작 금액보다 높아야 한다 "
+                "(같거나 낮으면 사자마자 파는 주문이 된다)")
         if not 0 < config.step_pct < 100:
             raise ValueError("분할 %는 0보다 크고 100보다 작아야 한다")
         if config.buy_splits < 1 or config.sell_splits < 1:
@@ -140,12 +148,12 @@ class SplitTrader:
 
         step = config.step_pct / 100.0
         self.buy_levels = [
-            Level(i + 1, "buy", config.base_price * (1 - step * i))
+            Level(i + 1, "buy", config.buy_start_price * (1 - step * i))
             for i in range(config.buy_splits)
         ]
         self.sell_levels = [
-            Level(j, "sell", config.base_price * (1 + step * j))
-            for j in range(1, config.sell_splits + 1)
+            Level(j + 1, "sell", config.sell_start_price * (1 + step * j))
+            for j in range(config.sell_splits)
         ]
         self.per_buy_cash = config.total_cash / config.buy_splits
 
@@ -288,9 +296,10 @@ class SplitTrader:
         self._running = True
         cfg = self.config
         self._log(
-            f"분할매매 시작: {cfg.code} 기준가 {cfg.base_price:,.2f}, "
-            f"간격 {cfg.step_pct}%, 매수 {cfg.buy_splits}분할 / "
-            f"매도 {cfg.sell_splits}분할, 총 {cfg.total_cash:,.0f}")
+            f"분할매매 시작: {cfg.code} 매수 시작가 {cfg.buy_start_price:,.2f} / "
+            f"매도 시작가 {cfg.sell_start_price:,.2f}, 간격 {cfg.step_pct}%, "
+            f"매수 {cfg.buy_splits}분할 / 매도 {cfg.sell_splits}분할, "
+            f"총 {cfg.total_cash:,.0f}")
         last_reconcile = 0.0
         try:
             while self._running:
