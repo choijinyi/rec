@@ -225,3 +225,34 @@ class ReconcileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarketSessionLabelTest(unittest.TestCase):
+    def _us_trader(self, day_session=True):
+        return SplitTrader(
+            api=FakeAPI([]),
+            config=SplitConfig(code="AAPL", buy_start_price=100,
+                               sell_start_price=110, step_pct=5, market="us",
+                               us_day_session=day_session),
+            is_simulation=True,
+        )
+
+    def test_us_regular_day_and_closed(self):
+        utc = timezone.utc
+        trader = self._us_trader()
+        trader.utc_clock = lambda: datetime(2025, 10, 6, 14, 0, tzinfo=utc)
+        self.assertEqual(trader.market_session(), "정규장")
+        trader.utc_clock = lambda: datetime(2025, 10, 6, 3, 0, tzinfo=utc)
+        self.assertEqual(trader.market_session(), "주간거래")   # KST 낮 12시
+        trader.utc_clock = lambda: datetime(2025, 10, 6, 10, 0, tzinfo=utc)
+        self.assertEqual(trader.market_session(), "장외")
+
+    def test_day_session_off_reads_closed(self):
+        trader = self._us_trader(day_session=False)
+        trader.utc_clock = lambda: datetime(2025, 10, 6, 3, 0,
+                                            tzinfo=timezone.utc)
+        self.assertEqual(trader.market_session(), "장외")
+
+    def test_kr_labels(self):
+        trader, _ = make_trader([])
+        self.assertEqual(trader.market_session(), "정규장")  # clock은 장중 고정

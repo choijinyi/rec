@@ -140,7 +140,7 @@ class AppState:
             "prices": [], "events": [], "fills": [], "levels": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "position_qty": 0, "avg_price": 0.0, "last_price": None,
-            "completed": False,
+            "completed": False, "session": "",
         }
         if self.api:
             with self.api.lock:
@@ -154,6 +154,7 @@ class AppState:
             out["avg_price"] = trader.avg_price
             out["last_price"] = trader.last_price or None
             out["completed"] = trader.completed
+            out["session"] = trader.market_session()
             out["events"] = trader.events[-30:]
             out["fills"] = [
                 f"{f.timestamp.strftime('%H:%M:%S')} "
@@ -285,7 +286,8 @@ async function refresh(){
     $("modeBadge").textContent=real?"실전투자":"모의투자";
     $("modeBadge").className="badge "+(real?"real":"mock");
     $("realConfirm").style.display=real?"inline-block":"none";
-    $("stRun").textContent=s.completed?"완료":(s.running?"실행 중":"대기");
+    $("stRun").textContent=s.completed?"완료":(s.running
+      ?(s.session==="장외"?"대기 (장외)":"실행 중 · "+s.session):"대기");
     $("stPrice").textContent=s.last_price?s.last_price.toLocaleString():"-";
     $("stPos").textContent=s.position_qty+"주";
     $("stAvg").textContent=s.avg_price?s.avg_price.toLocaleString(undefined,{maximumFractionDigits:2}):"-";

@@ -231,12 +231,19 @@ class SplitTrader:
                   f"(발동가 {level.price:,.2f}, 실현손익 {self.realized_pnl:,.2f})")
 
     # ── 매매 루프 ─────────────────────────────────────────
-    def _market_open(self) -> bool:
+    def market_session(self) -> str:
+        """지금 어떤 장에서 동작 중인지: 정규장 / 주간거래 / 장외."""
         if self.config.market == "us":
             utc_now = self.utc_clock()
-            return in_us_market_hours(utc_now) or (
-                self.config.us_day_session and in_us_day_session(utc_now))
-        return in_kr_market_hours(self.clock())
+            if in_us_market_hours(utc_now):
+                return "정규장"
+            if self.config.us_day_session and in_us_day_session(utc_now):
+                return "주간거래"
+            return "장외"
+        return "정규장" if in_kr_market_hours(self.clock()) else "장외"
+
+    def _market_open(self) -> bool:
+        return self.market_session() != "장외"
 
     def _check_completed(self) -> None:
         if self.position_qty != 0:
