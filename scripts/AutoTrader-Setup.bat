@@ -44,6 +44,9 @@ if not defined PYCMD (
 echo    확인 완료
 
 echo [2/5] 프로그램 내려받는 중...
+rem 이전 버전 파일이 남아 새 코드와 섞이지 않게 프로그램 폴더만 비운다 (config.ini는 보존)
+if exist "%INSTALL_DIR%\autotrader" rd /s /q "%INSTALL_DIR%\autotrader"
+if exist "%INSTALL_DIR%\tests" rd /s /q "%INSTALL_DIR%\tests"
 powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '%REPO_ZIP%' -OutFile '%ZIP_FILE%'; Expand-Archive -Force '%ZIP_FILE%' '%SRC_DIR%'"
 if errorlevel 1 goto :fail_net
 robocopy "%SRC_DIR%\rec-main" "%INSTALL_DIR%" /E /NFL /NDL /NJH /NJS /NP >nul
