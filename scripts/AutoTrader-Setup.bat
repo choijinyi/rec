@@ -5,7 +5,7 @@ title AutoTrader 설치 프로그램
 rem =====================================================
 rem  AutoTrader 원클릭 설치 프로그램 (대시보드 UI 버전)
 rem  - Python 3.10+ 확인/자동 설치
-rem  - 프로그램 다운로드 + anthropic(Claude) 패키지 설치
+rem  - 프로그램 다운로드
 rem  - 자체 점검, config.ini 생성, 바탕화면 바로가기
 rem =====================================================
 
@@ -23,7 +23,7 @@ echo    설치 위치: %INSTALL_DIR%
 echo  =====================================================
 echo.
 
-echo [1/6] Python 확인 중...
+echo [1/5] Python 확인 중...
 set "PYCMD="
 py -3 -c "import sys; assert sys.version_info>=(3,10)" >nul 2>&1 && set "PYCMD=py -3"
 if not defined PYCMD (
@@ -43,22 +43,14 @@ if not defined PYCMD (
 )
 echo    확인 완료
 
-echo [2/6] 프로그램 내려받는 중...
+echo [2/5] 프로그램 내려받는 중...
 powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '%REPO_ZIP%' -OutFile '%ZIP_FILE%'; Expand-Archive -Force '%ZIP_FILE%' '%SRC_DIR%'"
 if errorlevel 1 goto :fail_net
 robocopy "%SRC_DIR%\rec-main" "%INSTALL_DIR%" /E /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 goto :fail
 echo    완료
 
-echo [3/6] Claude 분석 패키지(anthropic) 설치 중...
-%PYCMD% -m pip install --quiet --upgrade anthropic
-if errorlevel 1 (
-    echo    ! anthropic 설치에 실패했습니다. AI 분석 기능만 제한되고 매매는 정상 동작합니다.
-) else (
-    echo    완료
-)
-
-echo [4/6] 자체 점검 실행 중...
+echo [3/5] 자체 점검 실행 중...
 pushd "%INSTALL_DIR%"
 %PYCMD% -m unittest discover -s tests >nul 2>&1
 if errorlevel 1 (
@@ -69,7 +61,7 @@ if errorlevel 1 (
 popd
 echo    전체 테스트 통과
 
-echo [5/6] 설정 파일 준비 중...
+echo [4/5] 설정 파일 준비 중...
 if not exist "%INSTALL_DIR%\config.ini" (
     > "%INSTALL_DIR%\config.ini" (
         echo [kiwoom]
@@ -81,29 +73,11 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo mode = mock
         echo ; 미국주식 주간거래^(한국 낮 시간^) 매매 허용. 끄려면 false
         echo us_day_session = true
-        echo.
-        echo [claude]
-        echo ; AI 분석 방식. auto = 키가 있으면 API, 없으면 Claude Code 구독 로그인
-        echo backend = auto
-        echo ; API 방식을 쓸 때만 입력. 구독 로그인 사용 시 비워 두세요.
-        echo api_key =
-        echo.
-        echo [risk]
-        echo ; 숫자는 퍼센트 단위입니다.
-        echo max_position_pct = 20
-        echo order_cash_pct = 10
-        echo max_drawdown_pct = 15
-        echo ; 평균단가 대비 이만큼 하락하면 전량 손절 매도 ^(0이면 끔^)
-        echo stop_loss_pct = 3
-        echo ; 매도 후 같은 종목 재매수까지 기다릴 봉 수 ^(과매매 완화^)
-        echo reentry_cooldown_bars = 5
-        echo ; 매수 후 전략 매도까지 최소 보유 봉 수 ^(손절은 예외^)
-        echo min_hold_bars = 3
     )
 )
 echo    완료
 
-echo [6/6] 바탕화면 바로가기 만드는 중...
+echo [5/5] 바탕화면 바로가기 만드는 중...
 set "DESKTOP="
 for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "DESKTOP=%%D"
 if not defined DESKTOP set "DESKTOP=%USERPROFILE%\Desktop"
@@ -123,13 +97,12 @@ echo  =====================================================
 echo    설치가 끝났습니다!
 echo.
 echo    바탕화면의 "AutoTrader 실행"을 더블클릭하면 브라우저에
-echo    대시보드가 열립니다. 시작/중지, 시세 차트, 백테스트,
-echo    Claude Fable AI 분석을 모두 화면에서 사용합니다.
+echo    분할매매 대시보드가 열립니다. 종목, 기준 가격, 분할 %%,
+echo    분할 횟수, 총 투입 금액을 입력하고 시작을 누르면 됩니다.
 echo.
 echo    [준비 - 최초 1회, 잠시 후 열리는 config.ini에 입력]
-echo      1. openapi.kiwoom.com : 키움 REST API 신청 후
-echo         appkey / secretkey 발급 (모의투자용)
-echo      2. console.anthropic.com : Claude API 키 발급 (AI 분석용)
+echo      openapi.kiwoom.com : 키움 REST API 신청 후
+echo      appkey / secretkey 발급 (모의투자용)
 echo.
 echo    실전투자는 config.ini에서 mode=real + 실전용 키로 바꾼 뒤
 echo    대시보드 확인란에 YES를 입력해야만 시작됩니다.

@@ -36,30 +36,6 @@ _API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
 # 미국주식 현재가 응답에서 시도할 필드 후보
 _US_PRICE_KEYS = ("cur_prc", "last_pric", "cur_pric", "now_pric", "prpr")
 
-# 순위 조회 (추천 후보 수집용): (market, criteria) → (경로, api-id, 본문)
-_API_RANK = {
-    ("kr", "volume"): ("/api/dostk/rkinfo", "ka10030", {   # 당일거래량상위
-        "mrkt_tp": "000", "sort_tp": "1", "mang_stk_incls": "0", "crd_tp": "0",
-        "trde_qty_tp": "0", "pric_tp": "0", "trde_prica_tp": "0",
-        "mrkt_open_tp": "0", "stex_tp": "3",
-    }),
-    ("kr", "change"): ("/api/dostk/rkinfo", "ka10027", {   # 전일대비등락률상위
-        "mrkt_tp": "000", "sort_tp": "1", "trde_qty_cnd": "0000",
-        "stk_cnd": "0", "crd_cnd": "0", "updown_incls": "1",
-        "pric_cnd": "0", "trde_prica_cnd": "0", "stex_tp": "3",
-    }),
-    ("us", "volume"): ("/api/us/rkinfo", "usa20530", {     # 당일 거래량 상위
-        "stex_tp": "0", "inds_cd": "", "stk_tp": "0", "trde_qty_tp": "0",
-        "qry_tp": "0", "stk_cnd": "0", "pric_cnd": "0", "trde_prica_cnd": "0",
-    }),
-    ("us", "change"): ("/api/us/rkinfo", "usa20910", {     # 전일대비 등락률상위
-        "stex_tp": "0", "inds_cd": "", "inds_cls_tp": "0", "sort_tp": "1",
-        "stk_tp": "0", "stk_cnd": "0", "pric_cnd": "0",
-        "trde_prica_cnd": "0", "trde_qty_tp": "",
-    }),
-}
-RANK_CRITERIA_LABELS = {"volume": "당일 거래량 상위", "change": "등락률 상위"}
-
 Transport = Callable[[str, dict, dict], dict]
 
 
@@ -262,47 +238,6 @@ class KiwoomRestClient:
         logger.info("주문 전송: [%s] %s %s %d주 (주문번호=%s)",
                     self.market, code, side, quantity, res.get("ord_no", "?"))
 
-    def top_stocks(self, criteria: str = "volume", limit: int = 10) -> list[dict]:
-        """순위 상위 종목 목록(추천 후보). criteria: volume(거래량) | change(등락률)."""
-        try:
-            path, api_id, body = _API_RANK[(self.market, criteria)]
-        except KeyError:
-            raise KiwoomRestError(f"지원하지 않는 순위 기준이다: {criteria}")
-        res = self._call(path, api_id, dict(body))
-        rows = next(
-            (v for v in res.values() if isinstance(v, list) and v
-             and isinstance(v[0], dict)),
-            [],
-        )
-        out = []
-        for row in rows[:limit]:
-            def pick(*keys):
-                for k in keys:
-                    if row.get(k) not in (None, ""):
-                        return str(row[k]).strip()
-                return ""
-            # 국내 순위 응답은 NXT 통합 표기(예: 005930_AL)로 올 수 있는데,
-            # 주문·시세 API는 순수 6자리 코드만 받으므로 접미사를 뗀다
-            code = pick("stk_cd", "code")
-            if self.market != "us" and "_" in code:
-                code = code.split("_", 1)[0]
-            item = {
-                "code": code,
-                "name": pick("stk_nm", "name"),
-                "price": pick("cur_prc", "last_pric", "now_pric"),
-                "change_pct": pick("flu_rt", "updown_rt", "chg_rt"),
-                "volume": pick("trde_qty", "now_trde_qty", "acc_trde_qty"),
-                "exchange": pick("stex_tp"),
-            }
-            # 순위 응답이 알려준 거래소를 캐시해 두면 시세·주문에 그대로 쓴다
-            if item["code"] and item["exchange"]:
-                self._exchanges[item["code"]] = item["exchange"]
-            out.append(item)
-        return out
-
-    def top_volume_stocks(self, limit: int = 10) -> list[dict]:
-        return self.top_stocks("volume", limit)
-
     # ── 미국주식 계좌·주문 관리 ─────────────────────────────
     @staticmethod
     def _to_int(raw) -> int:
@@ -391,38 +326,3 @@ def load_config(path: str | Path) -> dict:
         "us_day_session": section.get("us_day_session", "true").strip().lower()
                           in ("1", "true", "yes", "y", "on"),
     }
-
-
-def load_risk_config(path: str | Path):
-    """config.ini의 [risk] 섹션을 RiskConfig로 읽는다. 값은 퍼센트 숫자.
-
-    섹션이 없으면 None을 반환한다(기본 리스크 설정 사용).
-    """
-    from .risk import RiskConfig
-
-    parser = _read_parser(path)
-    if not parser.has_section("risk"):
-        return None
-    section = parser["risk"]
-
-    def pct(key: str, default: float, allow_zero: bool = False) -> float:
-        value = float(section.get(key, default))
-        low_ok = value >= 0 if allow_zero else value > 0
-        if not (low_ok and value <= 100):
-            raise KiwoomRestError(f"[risk] {key} 값이 범위를 벗어났다: {value}")
-        return value / 100.0
-
-    def bars(key: str, default: int) -> int:
-        value = int(float(section.get(key, default)))
-        if value < 0:
-            raise KiwoomRestError(f"[risk] {key}는 0 이상이어야 한다: {value}")
-        return value
-
-    return RiskConfig(
-        max_position_pct=pct("max_position_pct", 20.0),
-        order_cash_pct=pct("order_cash_pct", 10.0),
-        max_drawdown_pct=pct("max_drawdown_pct", 15.0),
-        stop_loss_pct=pct("stop_loss_pct", 3.0, allow_zero=True),  # 0 = 손절 끔
-        reentry_cooldown_bars=bars("reentry_cooldown_bars", 5),  # 매도 후 재매수 대기
-        min_hold_bars=bars("min_hold_bars", 3),  # 매수 후 최소 보유 (손절 예외)
-    )
