@@ -26,8 +26,8 @@ class FakeAPI:
         self.orders.append((code, side, quantity))
 
 
-def make_trader(prices, base=10_000, step=5.0, nbuy=3, nsell=2,
-                cash=3_000_000, market="kr"):
+def make_trader(prices, buy_start=10_000, sell_start=10_500, step=5.0,
+                nbuy=3, nsell=2, cash=3_000_000, market="kr"):
     clock_state = {"now": datetime(2025, 10, 6, 10, 0, 0)}  # 월요일 장중
 
     def clock():
@@ -38,7 +38,8 @@ def make_trader(prices, base=10_000, step=5.0, nbuy=3, nsell=2,
     api = FakeAPI(prices)
     trader = SplitTrader(
         api=api,
-        config=SplitConfig(code="005930", base_price=base, step_pct=step,
+        config=SplitConfig(code="005930", buy_start_price=buy_start,
+                           sell_start_price=sell_start, step_pct=step,
                            buy_splits=nbuy, sell_splits=nsell,
                            total_cash=cash, market=market),
         is_simulation=True,
@@ -48,15 +49,18 @@ def make_trader(prices, base=10_000, step=5.0, nbuy=3, nsell=2,
 
 
 class LevelPlanTest(unittest.TestCase):
-    def test_levels_built_from_base_price(self):
-        trader, _ = make_trader([], base=10_000, step=5.0, nbuy=3, nsell=2)
+    def test_levels_built_from_start_prices(self):
+        trader, _ = make_trader([], buy_start=10_000, sell_start=10_500,
+                                step=5.0, nbuy=3, nsell=2)
         self.assertEqual([l.price for l in trader.buy_levels],
-                         [10_000, 9_500, 9_000])      # 기준가, -5%, -10%
+                         [10_000, 9_500, 9_000])      # 매수 시작가, -5%, -10%
         self.assertEqual([l.price for l in trader.sell_levels],
-                         [10_500, 11_000])            # +5%, +10%
+                         [10_500, 11_025])            # 매도 시작가, +5%
 
     def test_invalid_config_rejected(self):
-        for kwargs in ({"base": 0}, {"step": 0}, {"step": 100},
+        for kwargs in ({"buy_start": 0}, {"sell_start": 0},
+                       {"sell_start": 9_000},  # 매도 시작가 <= 매수 시작가
+                       {"step": 0}, {"step": 100},
                        {"nbuy": 0}, {"nsell": 0}, {"cash": 0}):
             with self.assertRaises(ValueError):
                 make_trader([], **kwargs)
@@ -65,8 +69,9 @@ class LevelPlanTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             SplitTrader(
                 api=FakeAPI([]),
-                config=SplitConfig(code="005930", base_price=1000,
-                                   step_pct=5, allow_real=False),
+                config=SplitConfig(code="005930", buy_start_price=1000,
+                                   sell_start_price=1100, step_pct=5,
+                                   allow_real=False),
                 is_simulation=False,
             )
 
@@ -126,12 +131,12 @@ class SellLadderTest(unittest.TestCase):
         self.assertAlmostEqual(trader.realized_pnl, 50 * 500)
 
     def test_last_sell_clears_position(self):
-        trader, api = make_trader([10_000, 10_500, 11_000], nsell=2)
+        trader, api = make_trader([10_000, 10_500, 11_100], nsell=2)
         for _ in range(3):
             trader.step()
         self.assertEqual(trader.position_qty, 0)
         self.assertEqual(api.orders[-1], ("005930", "sell", 50))
-        self.assertAlmostEqual(trader.realized_pnl, 50 * 500 + 50 * 1000)
+        self.assertAlmostEqual(trader.realized_pnl, 50 * 500 + 50 * 1100)
 
     def test_no_sell_without_position(self):
         trader, api = make_trader([10_600])   # 매수 없이 상승
@@ -159,7 +164,7 @@ class CompletionTest(unittest.TestCase):
         self.assertEqual(len(api.orders), 5)
 
     def test_remaining_sells_closed_when_no_position(self):
-        trader, api = make_trader([10_000, 10_500, 11_000], nsell=2)
+        trader, api = make_trader([10_000, 10_500, 11_100], nsell=2)
         for _ in range(3):
             trader.step()
         self.assertTrue(all(l.done for l in trader.sell_levels))
@@ -185,7 +190,8 @@ class MarketHoursTest(unittest.TestCase):
         api = FakeAPI([10_000])
         trader = SplitTrader(
             api=api,
-            config=SplitConfig(code="005930", base_price=10_000, step_pct=5),
+            config=SplitConfig(code="005930", buy_start_price=10_000,
+                               sell_start_price=10_500, step_pct=5),
             is_simulation=True,
             clock=lambda: datetime(2025, 10, 6, 22, 0, 0),  # 장 마감 후
         )
@@ -203,7 +209,8 @@ class ReconcileTest(unittest.TestCase):
         api = UsAPI([100.0])
         trader = SplitTrader(
             api=api,
-            config=SplitConfig(code="AAPL", base_price=100, step_pct=5,
+            config=SplitConfig(code="AAPL", buy_start_price=100,
+                               sell_start_price=110, step_pct=5,
                                buy_splits=1, sell_splits=1, total_cash=1000,
                                market="us"),
             is_simulation=True,
