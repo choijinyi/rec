@@ -1,27 +1,32 @@
-# autotrader — 주식 자동매매 프레임워크
+# autotrader — 분할매수·분할매도 자동 집행 프로그램
 
-**대시보드 UI**: `python -m autotrader ui` 를 실행하면 브라우저에서
-시작/중지, 실시간 시세 차트, 손익 현황, 백테스트, Claude Fable AI 분석을
-한 화면에서 쓸 수 있다(로컬 127.0.0.1 전용). AI 분석은 `config.ini`의
-`[claude] api_key`(console.anthropic.com 발급)와 `pip install anthropic`이
-필요하며, 참고 자료일 뿐 투자 자문이 아니다.
+사용자가 정한 **종목·기준 가격·분할 %·분할 횟수·총 투입 금액**대로,
+키움증권 REST API를 통해 기준 가격에서부터 자동으로 분할매수와
+분할매도를 수행한다. 파이썬 표준 라이브러리만으로 동작한다.
 
-전략 신호 → 리스크 검증 → 주문 체결의 파이프라인으로 구성된 파이썬 자동매매
-프레임워크다. 기본 동작은 모의투자(페이퍼 트레이딩)와 백테스트이며, 외부
-패키지 없이 파이썬 표준 라이브러리만으로 실행된다.
+## 동작 방식
 
-## 빠른 시작
+- 1차 매수가 = 기준 가격, i차 매수가 = 기준가에서 분할 %씩 아래
+  (예: 기준 10,000원·3%면 10,000 → 9,700 → 9,400 ...)
+- j차 매도가 = 기준가에서 분할 %씩 위 (10,300 → 10,600 ...)
+- 각 매수는 총 투입 금액 ÷ 매수 분할 횟수만큼, 각 매도는 보유 수량을
+  남은 매도 횟수로 나눈 만큼(마지막 매도는 전량) 집행한다.
+- 각 레벨은 1회만 집행되며, 모든 레벨이 끝나고 보유가 0이면 자동 완료된다.
+- 장중에만 동작한다: 국내 09:00~15:30, 미국 정규장 + 주간거래(옵션).
+
+## 실행
 
 ```bash
-# 가상 시세 250일로 이동평균 교차 전략 백테스트
-python -m autotrader backtest --strategy sma_crossover --days 250
-
-# RSI 평균회귀 전략
-python -m autotrader backtest --strategy rsi_reversion --days 250
-
-# 실제 시세 CSV(timestamp,open,high,low,close,volume)로 백테스트
-python -m autotrader backtest --strategy sma_crossover --csv data/005930.csv --symbol 005930
+python -m autotrader ui        # 브라우저 대시보드 (127.0.0.1 전용)
 ```
+
+대시보드에서 시장(국내/미국), 종목코드, 기준 가격, 분할 %, 매수/매도
+분할 횟수, 총 투입 금액을 입력하고 시작을 누른다. 분할 계획표와 시세
+차트(레벨선 표시), 체결 로그가 실시간으로 표시된다.
+
+**원클릭 설치(Windows)**: [scripts/AutoTrader-Setup.bat](scripts/AutoTrader-Setup.bat)를
+바탕화면에 내려받아 더블클릭. 자세한 안내는
+[docs/INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md) 참고.
 
 테스트 실행:
 
@@ -33,54 +38,22 @@ python -m unittest discover -s tests -v
 
 | 모듈 | 역할 |
 |---|---|
-| `autotrader/models.py` | Bar·Order·Fill·Position·Account 도메인 모델 |
-| `autotrader/data.py` | CSV 데이터 피드, 데모용 가상 시세 생성기 |
-| `autotrader/strategy.py` | 전략 인터페이스와 SMA 교차·RSI 평균회귀 전략 |
-| `autotrader/risk.py` | 종목당 비중 제한, 낙폭 한도, 포지션 사이징 |
-| `autotrader/broker.py` | 수수료·슬리피지를 반영한 모의 브로커(PaperBroker) |
-| `autotrader/engine.py` | 백테스트/실시간 공용 매매 엔진과 성과 리포트 |
+| `autotrader/split.py` | 분할 레벨 계획과 자동 집행 루프(SplitTrader) |
+| `autotrader/kiwoom_rest.py` | 키움 REST API 클라이언트 (토큰·시세·주문·잔고) |
+| `autotrader/webui.py` | 로컬 웹 대시보드 |
 | `autotrader/cli.py` | 명령행 인터페이스 |
 
-## 설계 원칙
+## 안전장치
 
-- **전략과 집행의 분리**: 전략은 신호(BUY/SELL/HOLD)만 내고, 수량 결정과
-  한도 검증은 `RiskManager`가, 체결은 `Broker`가 담당한다.
-- **백테스트 = 실시간 경로**: `TradingEngine.process_bar`를 백테스트와
-  실시간 루프가 공유하므로, 검증한 로직이 그대로 운용된다.
-- **공매도 미지원, 낙폭 한도 기본 탑재**: 계좌 평가액이 초기 자본 대비
-  15% 이상 하락하면 신규 매수를 중단한다.
-
-## 키움증권 모의투자 실시간 매매
-
-키움 **REST API**(`autotrader/kiwoom_rest.py`)가 기본이다. OCX와 달리
-32비트 파이썬·PyQt5가 필요 없고 표준 라이브러리만으로 동작한다.
-설치와 API 키 발급은 [docs/INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md) 참고.
-
-**원클릭 설치**: [scripts/AutoTrader-Setup.bat](scripts/AutoTrader-Setup.bat)를
-바탕화면에 내려받아 더블클릭하면 Python 확인·설치, 프로그램 다운로드,
-자체 점검, `config.ini` 생성, 바탕화면 실행 바로가기 생성까지 자동 진행된다.
-(키움 REST API 사용 신청과 모의투자용 키 발급은 openapi.kiwoom.com 에서 1회 수동)
-
-```powershell
-python -m autotrader live-rest --code 005930 --strategy sma_crossover
-```
-
-- 현재가 폴링 → 1분봉 집계 → 백테스트와 동일한 엔진 경로로 신호 평가 →
-  시장가 주문 전송.
-- **안전장치**: `mode=mock`(모의투자 서버)이 기본, 실전은 `mode=real` +
-  `--allow-real` 이중 명시 필요. 장중(평일 09:00~15:30)에만 매매,
-  일일 주문 횟수 제한(기본 20회), 낙폭 한도 도달 시 신규 매수 중단.
-
-| 추가 모듈 | 역할 |
-|---|---|
-| `autotrader/bars.py` | 폴링 시세를 봉(Bar)으로 집계 |
-| `autotrader/kiwoom_rest.py` | 키움 REST API 클라이언트 (토큰·시세·주문) |
-| `autotrader/kiwoom/api.py` | (레거시) 키움 OpenAPI+ OCX 래퍼 — `live` 명령 |
-| `autotrader/kiwoom/live.py` | 실시간 매매 루프와 안전장치 (REST/OCX 공용) |
+- `mode = mock`(모의투자 서버)이 기본. 실전은 `config.ini`의 `mode = real`
+  + 대시보드 확인란 `YES` 입력의 이중 확인이 필요하다.
+- 미국주식은 1분마다 실계좌 잔고와 내부 장부를 동기화해 미체결로 생긴
+  차이를 보정한다.
+- API 키는 `config.ini`(내 컴퓨터)에만 두며 저장소에 올리지 않는다
+  (`.gitignore`에 포함).
 
 ## 유의사항
 
-자동매매는 수익을 보장하지 않으며 원금 손실 위험이 있다. 반드시 모의투자
-계좌에서 충분히 검증한 뒤 실전 전환을 검토해야 하고, 투자 결과의 책임은
-사용자에게 있다. 계좌 비밀번호 등 인증 정보는 코드와 저장소에 저장하지
-않는다(로그인은 키움 공식 로그인 창에서만 수행).
+자동매매는 수익을 보장하지 않으며 원금 손실 위험이 있다. 분할매수는
+하락이 계속되면 손실도 분할로 쌓인다. 반드시 모의투자에서 충분히 검증한
+뒤 실전 전환을 검토해야 하고, 투자 결과의 책임은 사용자에게 있다.
