@@ -320,3 +320,39 @@ class RejectedBuyTest(unittest.TestCase):
         until = trader._cooldown["AAA"]
         secs = (until - trader.clock()).total_seconds()
         self.assertLessEqual(secs, 2 * 3600)           # 1시간 제외
+
+
+class PreexistingHoldingsTest(unittest.TestCase):
+    """계좌에 원래 있던 주식(장부보다 많은 실보유)은 흡수하지 않는다."""
+
+    def test_reconcile_never_grows_position(self):
+        class UsAPI(FakeAPI):
+            def us_balances(self):
+                # 프로그램은 14주만 샀는데 계좌에는 기존 보유 포함 75주
+                return {"SOXL": {"qty": 75, "sellable": 75}}
+
+        api = UsAPI(price_seqs={"SOXL": [48.0]},
+                    ranking=[{"code": "SOXL", "price": "48",
+                              "change_pct": "2.0"}])
+        trader = Scalper(
+            api=api,
+            config=ScalpConfig(market="us", max_positions=1, total_cash=700,
+                               scan_interval=99999.0),
+            selector=lambda r, n: (["SOXL"], ""),
+            is_simulation=True,
+            utc_clock=lambda: datetime(2025, 10, 6, 14, 0, tzinfo=timezone.utc),
+        )
+        trader._last_scan = time.monotonic()
+        trader._scan_worker(1)
+        trader.step()
+        self.assertEqual(trader.positions["SOXL"].quantity, 14)  # 700//48
+        cash_before = trader.cash
+        trader.reconcile()
+        self.assertEqual(trader.positions["SOXL"].quantity, 14)  # 늘지 않음
+        self.assertEqual(trader.cash, cash_before)
+        # 익절 시에도 프로그램이 산 14주만 판다
+        api.price_seqs["SOXL"] = [48.8]
+        api.idx["SOXL"] = 0
+        trader.step()
+        sells = [o for o in api.orders if o[1] == "sell"]
+        self.assertEqual(sells[-1][2], 14)

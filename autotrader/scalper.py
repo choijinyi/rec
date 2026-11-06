@@ -444,7 +444,13 @@ class Scalper:
             self._maybe_scan(slots)
 
     def reconcile(self) -> None:
-        """실계좌 잔고와 내부 장부를 맞춘다 (미국주식, us_balances 지원 시)."""
+        """실계좌 잔고와 내부 장부를 맞춘다 (미국주식, us_balances 지원 시).
+
+        장부 수량보다 실제 보유가 적을 때만(미체결 매수 등) 줄여서 맞춘다.
+        실제 보유가 더 많아도 장부를 늘리지 않는다 — 그 초과분은 사용자가
+        이 프로그램과 무관하게 들고 있는 주식이므로, 흡수하면 익절·손절
+        때 사용자의 기존 보유분까지 팔아버리게 된다.
+        """
         if self.config.market != "us" or not hasattr(self.api, "us_balances"):
             return
         try:
@@ -455,8 +461,8 @@ class Scalper:
         for code in list(self.positions):
             pos = self.positions[code]
             actual = balances.get(code, {}).get("qty", pos.quantity)
-            if actual == pos.quantity:
-                continue
+            if actual >= pos.quantity:
+                continue   # 기존 보유분(초과)은 이 프로그램이 건드리지 않는다
             ref = pos.last_price or pos.entry_price
             diff = pos.quantity - actual
             self.cash += diff * ref
