@@ -116,3 +116,53 @@ class DecodeJsonTest(unittest.TestCase):
     def test_valid_json_passes(self):
         from autotrader.kiwoom_rest import _decode_json
         self.assertEqual(_decode_json(b'{"token": "T"}', "u"), {"token": "T"})
+
+
+class KrRankingAndNxtOrderTest(unittest.TestCase):
+    def _client(self):
+        def transport(url, headers, body):
+            self.calls.append((url, headers, body))
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            if "/api/dostk/rkinfo" in url:
+                return {"return_code": 0, "result_list": [
+                    {"stk_cd": "114800_AL", "stk_nm": "KODEX 인버스",
+                     "cur_prc": "1052", "flu_rt": "0.5", "trde_qty": "1000"},
+                    {"stk_cd": "005930", "stk_nm": "삼성전자",
+                     "cur_prc": "70000", "flu_rt": "1.0", "trde_qty": "900"},
+                ]}
+            if "/api/dostk/stkinfo" in url:
+                return {"return_code": 0, "cur_prc": "70000"}
+            if "/api/dostk/ordr" in url:
+                return {"return_code": 0, "ord_no": "1"}
+            raise AssertionError(url)
+
+        self.calls = []
+        from autotrader.kiwoom_rest import KiwoomRestClient
+        return KiwoomRestClient("A", "S", market="kr", transport=transport)
+
+    def test_ranking_strips_nxt_suffix(self):
+        rows = self._client().top_stocks("volume", limit=10)
+        self.assertEqual([r["code"] for r in rows], ["114800", "005930"])
+
+    def test_krx_order_is_market_type(self):
+        client = self._client()
+        client.send_market_order("", "005930", "buy", 3, kr_exchange="KRX")
+        body = self.calls[-1][2]
+        self.assertEqual(body["dmst_stex_tp"], "KRX")
+        self.assertEqual(body["trde_tp"], "3")
+        self.assertEqual(body["ord_uv"], "")
+
+    def test_nxt_order_uses_limit_at_last_price(self):
+        client = self._client()
+        client.current_price("005930")   # 직전 시세 캐시
+        client.send_market_order("", "005930", "sell", 3, kr_exchange="NXT")
+        body = self.calls[-1][2]
+        self.assertEqual(body["dmst_stex_tp"], "NXT")
+        self.assertEqual(body["trde_tp"], "0")       # 보통(지정가)
+        self.assertEqual(body["ord_uv"], "70000")
+
+    def test_nxt_order_without_price_raises(self):
+        with self.assertRaises(KiwoomRestError):
+            self._client().send_market_order("", "005930", "buy", 1,
+                                             kr_exchange="NXT")
