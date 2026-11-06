@@ -34,6 +34,8 @@ _API_ORDER_KR = {"buy": ("/api/dostk/ordr", "kt10000"),
 _API_PRICE_US = ("/api/us/mrkcond", "usa20100")
 # 현재가 10호가 — usa20100이 서버 오류(1632 등)를 낼 때의 대체 시세원
 _API_PRICE_US_BID = ("/api/us/mrkcond", "usa20101")
+# 틱 차트 — mrkcond 엔드포인트가 통째로 죽었을 때의 3차 시세원 (다른 엔드포인트)
+_API_PRICE_US_TICK = ("/api/us/chart", "usa06010")
 _API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
                  "sell": ("/api/us/ordr", "ust20001")}
 # 미국주식 현재가 응답에서 시도할 필드 후보
@@ -155,7 +157,8 @@ class KiwoomRestClient:
         self._token: str | None = None
         self._token_expires_at = 0.0
         self._last_prices: dict[str, float] = {}
-        self._prefer_bid_until = 0.0   # usa20101을 우선 쓰는 기한(monotonic)  # 종목별 직전 시세 (미국 지정가 주문용)
+        self._quote_pref = ""          # 최근 성공한 대체 시세 소스 (bid/tick)
+        self._quote_pref_until = 0.0   # 그 소스를 우선 쓰는 기한(monotonic)
         self._exchanges: dict[str, str] = {}      # 종목별 거래소구분 캐시 (NA/ND/NY)
 
     # ── 인증 ────────────────────────────────────────────────
@@ -232,35 +235,68 @@ class KiwoomRestClient:
         raise KiwoomRestError(
             f"미국주식 현재가 필드를 찾지 못했다. 응답 키: {sorted(res.keys())}")
 
-    def _us_price(self, code: str) -> float:
-        """usa20100 실패 시 거래소 구분 재확인 → usa20101(10호가)로 대체한다.
+    def _us_tick_price(self, code: str, exchange: str) -> float:
+        """틱 차트(usa06010)의 최근 체결가. mrkcond 엔드포인트 장애 때의 3차 시세원."""
+        res = self._call(_API_PRICE_US_TICK[0], _API_PRICE_US_TICK[1],
+                         {"stex_tp": exchange, "stk_cd": code,
+                          "tic_scope": "1", "upd_stkpc_tp": "0",
+                          "exrt_appl_tp": "0"})
+        for row in (res.get("result_list") or [])[:3]:
+            raw = row.get("cur_prc")
+            if raw not in (None, ""):
+                return self._parse_price(raw)
+        raise KiwoomRestError("틱 차트에서 현재가를 찾지 못했다")
 
-        대체 조회가 성공하면 2분간 usa20101을 우선 사용해, 서버 오류가
-        이어지는 동안 실패 호출을 반복하지 않는다.
+    def _us_price(self, code: str) -> float:
+        """미국 시세 3중 조회: 현재가(usa20100) → 10호가(usa20101) → 틱차트(usa06010).
+
+        20100/20101은 같은 mrkcond 엔드포인트라 함께 죽을 수 있어, 다른
+        엔드포인트(chart)의 틱 종가를 마지막 보루로 둔다. 첫 실패 시
+        거래소 구분을 한 번 재확인하고(캐시 오염 치유), 대체 소스가
+        성공하면 2분간 그 소스를 우선 사용해 실패 호출을 반복하지 않는다.
         """
-        primary, secondary = _API_PRICE_US, _API_PRICE_US_BID
-        if time.monotonic() < self._prefer_bid_until:
-            primary, secondary = secondary, primary
+        fetchers = {
+            "main": lambda ex: self._us_price_once(code, _API_PRICE_US, ex),
+            "bid": lambda ex: self._us_price_once(code, _API_PRICE_US_BID, ex),
+            "tick": lambda ex: self._us_tick_price(code, ex),
+        }
+        order = ["main", "bid", "tick"]
+        if time.monotonic() < self._quote_pref_until and self._quote_pref in order:
+            order.remove(self._quote_pref)
+            order.insert(0, self._quote_pref)
         exchange = self.resolve_exchange(code)
-        try:
-            return self._us_price_once(code, primary, exchange)
-        except KiwoomRestError as first_err:
-            # 순위 응답이 심어 둔 거래소 구분이 틀렸을 수 있으니 새로 확인한다
-            self._exchanges.pop(code, None)
-            fresh = self.resolve_exchange(code)
+        first_err = None
+        tried_refresh = False
+        i = 0
+        while i < len(order):
+            name = order[i]
             try:
-                price = self._us_price_once(code, secondary, fresh)
-            except KiwoomRestError:
-                if fresh != exchange:
-                    try:
-                        return self._us_price_once(code, primary, fresh)
-                    except KiwoomRestError:
-                        pass
-                raise first_err
-            if secondary is _API_PRICE_US_BID:
-                self._prefer_bid_until = time.monotonic() + 120
-                logger.info("%s 시세를 10호가(usa20101)로 대체 조회한다", code)
+                price = fetchers[name](exchange)
+            except KiwoomRestError as e:
+                if first_err is None:
+                    first_err = e
+                if not tried_refresh:
+                    # 순위 응답이 심은 거래소 구분이 틀렸을 수 있으니 재확인
+                    tried_refresh = True
+                    self._exchanges.pop(code, None)
+                    fresh = self.resolve_exchange(code)
+                    if fresh != exchange:
+                        exchange = fresh
+                        continue   # 같은 소스를 새 거래소 구분으로 재시도
+                i += 1
+                continue
+            if name == "main":
+                self._quote_pref_until = 0.0
+            elif self._quote_pref != name:
+                self._quote_pref = name
+                self._quote_pref_until = time.monotonic() + 120
+                logger.info("%s 시세를 대체 소스(%s)로 조회한다", code,
+                            "10호가(usa20101)" if name == "bid"
+                            else "틱차트(usa06010)")
+            else:
+                self._quote_pref_until = time.monotonic() + 120
             return price
+        raise first_err
 
     def current_price(self, code: str) -> float:
         if self.market == "us":
