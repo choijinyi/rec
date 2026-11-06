@@ -124,6 +124,7 @@ class ScalpConfig:
     win_cooldown_min: float = 5.0  # 익절한 종목 재매수 대기(분) — 짧게 두어 반복 매매
     stale_min: float = 60.0       # 이 시간(분) 안에 익절/손절 미도달 시 교체
     daily_loss_pct: float = 6.0   # 당일 누적 손실이 자본의 이 % 도달 시 신규 매수 중단
+    blind_exit_min: float = 5.0   # 시세 조회가 이 시간(분) 이상 막히면 보호 청산
     max_trades_per_day: int = 40  # 당일 최대 청산 횟수
     allow_real: bool = False
     us_day_session: bool = True
@@ -139,6 +140,7 @@ class Position:
     entry_price: float
     entry_time: dt.datetime
     last_price: float = 0.0
+    last_quote_time: dt.datetime | None = None   # 마지막으로 시세를 받은 시각
 
     def pct(self, price: float | None = None) -> float:
         p = price if price is not None else self.last_price
@@ -258,7 +260,8 @@ class Scalper:
             return False
         self._order(code, "buy", quantity)
         self.positions[code] = Position(code, quantity, price, self.clock(),
-                                        last_price=price)
+                                        last_price=price,
+                                        last_quote_time=self.clock())
         self.cash -= quantity * price
         self._log(f"매수: {code} {quantity}주 @{price:,.2f} "
                   f"(목표 +{self.config.target_pct}% / 손절 -{self.config.stop_pct}%)")
@@ -287,13 +290,26 @@ class Scalper:
             try:
                 price = self.api.current_price(code)
             except Exception as e:   # 한 종목의 시세 오류가 전체를 멈추지 않게
-                self._fail_counts[code] = self._fail_counts.get(code, 0) + 1
+                count = self._fail_counts.get(code, 0) + 1
+                self._fail_counts[code] = count
                 self.last_error = f"{code} 시세 오류: {e}"
-                logger.warning("%s 시세 조회 실패(%d회): %s",
-                               code, self._fail_counts[code], e)
+                if count == 1 or count % 10 == 0:   # 3초마다 쏟아지지 않게 간추림
+                    logger.warning("%s 시세 조회 실패(%d회째): %s", code, count, e)
+                # 시세 공백이 길어지면 익절·손절 감시가 눈을 감은 상태가 되므로
+                # 마지막 시세 기준으로 보호 청산을 시도한다
+                blind_min = (self.clock() - (pos.last_quote_time
+                                             or pos.entry_time)
+                             ).total_seconds() / 60
+                if blind_min >= self.config.blind_exit_min and pos.last_price:
+                    try:
+                        self._close(pos, pos.last_price, "시세공백 보호청산")
+                    except Exception as e2:
+                        logger.warning("%s 보호 청산 실패(다음 주기에 재시도): %s",
+                                       code, e2)
                 continue
             self._fail_counts[code] = 0
             pos.last_price = price
+            pos.last_quote_time = self.clock()
             pct = pos.pct(price)
             held_min = (self.clock() - pos.entry_time).total_seconds() / 60
             try:

@@ -429,3 +429,46 @@ class ContinuousTradingTest(unittest.TestCase):
         self.assertEqual(trader.positions, {})
         self.assertGreaterEqual(time.monotonic() - trader._last_scan,
                                 trader.config.scan_interval - 31)
+
+
+class BlindQuoteProtectionTest(unittest.TestCase):
+    """시세 조회가 장시간 막히면 마지막 시세로 보호 청산한다."""
+
+    def _blind_trader(self):
+        trader, api = make_trader(price_seqs={"AAA": [10_000]},
+                                  selector=lambda r, n: (["AAA"], ""),
+                                  max_positions=1, total_cash=1_000_000)
+        scan_now(trader, 1)      # 10,000에 진입
+
+        def boom(code):
+            raise RuntimeError("usa20100 실패 (return_code=7) [1632]")
+
+        api.current_price = boom
+        return trader, api
+
+    def test_short_outage_keeps_position(self):
+        trader, api = self._blind_trader()
+        trader._clock_state["now"] += timedelta(minutes=2)
+        trader.step()
+        self.assertIn("AAA", trader.positions)   # 5분 미만 공백은 유지
+
+    def test_long_outage_exits_at_last_price(self):
+        trader, api = self._blind_trader()
+        trader._clock_state["now"] += timedelta(minutes=6)
+        trader.step()
+        self.assertNotIn("AAA", trader.positions)
+        self.assertEqual(trader.trades[-1].reason, "시세공백 보호청산")
+        self.assertEqual(api.orders[-1][1], "sell")
+
+    def test_quote_recovery_resets_blind_timer(self):
+        trader, api = self._blind_trader()
+        # 시세가 복구되면 타이머가 리셋된다
+        api.current_price = lambda code: 10_050.0
+        trader._clock_state["now"] += timedelta(minutes=4)
+        trader.step()            # 성공 → last_quote_time 갱신
+        def boom(code):
+            raise RuntimeError("다시 실패")
+        api.current_price = boom
+        trader._clock_state["now"] += timedelta(minutes=4)
+        trader.step()            # 공백 4분 — 아직 유지
+        self.assertIn("AAA", trader.positions)
