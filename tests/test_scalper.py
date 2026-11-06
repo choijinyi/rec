@@ -284,3 +284,39 @@ class UsExtendedSessionTest(unittest.TestCase):
         utc = timezone.utc
         self.assertEqual(us_session(datetime(2026, 11, 6, 15, 0, tzinfo=utc)),
                          "정규장")   # ET 10:00
+
+
+class RejectedBuyTest(unittest.TestCase):
+    """매수 거부(레버리지 ETP 예탁금 등) 시 제외하고 다음 후보로 교체."""
+
+    def _trader_with_rejection(self, message):
+        trader, api = make_trader(selector=lambda r, n: (["AAA"], "AI 선정"),
+                                  max_positions=1)
+        orig = api.send_market_order
+
+        def send(account_no, code, side, qty, kr_exchange="KRX"):
+            if code == "AAA" and side == "buy":
+                raise RuntimeError(message)
+            orig(account_no, code, side, qty, kr_exchange)
+
+        api.send_market_order = send
+        return trader, api
+
+    def test_deposit_requirement_excludes_for_day_and_rotates(self):
+        trader, api = self._trader_with_rejection(
+            "ust20000 실패: [2000](573501:단일 해외레버리지ETP 기본예탁금 미만입니다)")
+        scan_now(trader, 1)
+        self.assertNotIn("AAA", trader.positions)
+        self.assertIn("BBB", trader.positions)         # 예비 후보로 교체 매수
+        until = trader._cooldown["AAA"]
+        self.assertGreaterEqual((until - trader.clock()).total_seconds(),
+                                23 * 3600)             # 당일 제외
+        self.assertTrue(any("매수 실패" in e for e in trader.events))
+
+    def test_transient_failure_gets_short_cooldown(self):
+        trader, api = self._trader_with_rejection("일시 오류")
+        scan_now(trader, 1)
+        self.assertIn("BBB", trader.positions)
+        until = trader._cooldown["AAA"]
+        secs = (until - trader.clock()).total_seconds()
+        self.assertLessEqual(secs, 2 * 3600)           # 1시간 제외
