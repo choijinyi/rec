@@ -24,6 +24,10 @@ from typing import Callable, Protocol
 
 logger = logging.getLogger(__name__)
 
+
+class QuoteUnavailable(RuntimeError):
+    """매수 직전 시세 조회 실패 — 종목의 문제가 아니므로 제외하지 않는다."""
+
 KR_REG_OPEN = dt.time(9, 0)
 KR_REG_CLOSE = dt.time(15, 30)
 KR_EXT_OPEN = dt.time(8, 0)     # NXT 프리마켓 시작
@@ -253,7 +257,10 @@ class Scalper:
         return self.config.total_cash / self.config.max_positions
 
     def _buy(self, code: str) -> bool:
-        price = self.api.current_price(code)
+        try:
+            price = self.api.current_price(code)
+        except Exception as e:
+            raise QuoteUnavailable(f"{code} 시세 조회 실패: {e}") from e
         quantity = int(min(self._per_slot_budget(), self.cash) // price)
         if quantity < 1:
             self._log(f"{code} 매수 건너뜀: 1주 금액({price:,.2f})이 슬롯 예산보다 크다")
@@ -438,6 +445,12 @@ class Scalper:
             try:
                 if self._buy(code):
                     filled += 1
+            except QuoteUnavailable as e:
+                # 서버측 시세 오류일 뿐 종목의 문제가 아니다 — 제외 없이
+                # 다음 후보로 넘어가고, 이 종목은 다음 탐색에서 다시 시도한다
+                self.last_error = str(e)
+                self._log(f"매수 보류({code}): 시세 조회 실패 — 제외 없이 잠시 후 재시도")
+                continue
             except Exception as e:
                 message = str(e)
                 self.last_error = f"{code} 매수 오류: {message}"

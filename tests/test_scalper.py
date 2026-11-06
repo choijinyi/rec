@@ -472,3 +472,37 @@ class BlindQuoteProtectionTest(unittest.TestCase):
         trader._clock_state["now"] += timedelta(minutes=4)
         trader.step()            # 공백 4분 — 아직 유지
         self.assertIn("AAA", trader.positions)
+
+
+class QuoteFailureOnBuyTest(unittest.TestCase):
+    """매수 직전 시세 오류는 종목을 제외하지 않고 다음 후보로 넘어간다."""
+
+    def _trader_with_quote_failure(self):
+        trader, api = make_trader(price_seqs={"BBB": [20_000]},
+                                  selector=lambda r, n: (["AAA"], ""),
+                                  max_positions=1)
+        orig = api.current_price
+
+        def flaky(code):
+            if code == "AAA":
+                raise RuntimeError("usa20100 실패 (return_code=7) [1632]")
+            return orig(code)
+
+        api.current_price = flaky
+        return trader, api
+
+    def test_no_cooldown_and_rotates_to_backup(self):
+        trader, api = self._trader_with_quote_failure()
+        scan_now(trader, 1)
+        self.assertNotIn("AAA", trader._cooldown)    # 억울한 제외 없음
+        self.assertIn("BBB", trader.positions)       # 예비 후보로 교체
+        self.assertTrue(any("매수 보류" in e for e in trader.events))
+
+    def test_retried_on_next_scan(self):
+        trader, api = self._trader_with_quote_failure()
+        scan_now(trader, 1)
+        trader._close(trader.positions["BBB"], 20_000, "중지")  # 슬롯 비움
+        # 시세가 복구되면 같은 종목을 다시 살 수 있다
+        api.current_price = lambda code: 10_000.0
+        scan_now(trader, 1)
+        self.assertIn("AAA", trader.positions)
