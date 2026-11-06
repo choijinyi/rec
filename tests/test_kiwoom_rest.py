@@ -242,3 +242,18 @@ class UsQuoteFallbackTest(unittest.TestCase):
         client.top_stocks("volume")
         self.assertNotIn("SOXL", client._exchanges)     # 오염 안 됨
         self.assertEqual(client._exchanges["NVDA"], "ND")
+
+
+class RateLimitTest(unittest.TestCase):
+    def test_consecutive_requests_are_spaced(self):
+        import time as _time
+
+        from autotrader import kiwoom_rest as kr
+
+        kr._last_request_at = 0.0
+        start = _time.monotonic()
+        kr._rate_limit_wait()
+        kr._rate_limit_wait()
+        kr._rate_limit_wait()
+        elapsed = _time.monotonic() - start
+        self.assertGreaterEqual(elapsed, 2 * kr._MIN_REQUEST_INTERVAL * 0.9)

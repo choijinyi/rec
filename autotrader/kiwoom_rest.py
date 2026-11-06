@@ -15,6 +15,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -85,7 +86,24 @@ def _decode_json(raw: bytes, url: str) -> dict:
         ) from None
 
 
+# 요청 간 최소 간격: 포지션 감시(종목 수만큼 연속 조회)와 백그라운드 탐색이
+# 겹칠 때 순간 폭주로 서버가 1632(처리 중 오류)를 내는 것을 막는다
+_RATE_LOCK = threading.Lock()
+_MIN_REQUEST_INTERVAL = 0.25
+_last_request_at = 0.0
+
+
+def _rate_limit_wait() -> None:
+    global _last_request_at
+    with _RATE_LOCK:
+        wait = _MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
 def _http_post(url: str, headers: dict, body: dict) -> dict:
+    _rate_limit_wait()
     import urllib.error
 
     data = json.dumps(body).encode("utf-8")
