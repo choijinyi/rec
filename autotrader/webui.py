@@ -368,8 +368,8 @@ async function refresh(){
         "</td><td>"+Number(h.now).toLocaleString(undefined,{maximumFractionDigits:2})+
         "</td><td class='"+(h.pl_rt>=0?"pos":"neg")+"'>"+Number(h.pl_rt).toFixed(2)+
         "%</td><td>"+(h.managed?"관리 중":
-        "<button onclick=\"adopt('"+h.code+"','manage')\">관리 편입</button> "+
-        "<button class='danger' onclick=\"adopt('"+h.code+"','sell')\">즉시 매도</button>")+
+        "<button data-c='"+h.code+"' data-m='manage' onclick='adopt(this.dataset.c,this.dataset.m)'>관리 편입</button> "+
+        "<button class='danger' data-c='"+h.code+"' data-m='sell' onclick='adopt(this.dataset.c,this.dataset.m)'>즉시 매도</button>")+
         "</td></tr>").join("");
     }
     drawChart(s.prices,s.chart_code);
