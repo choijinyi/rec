@@ -166,3 +166,79 @@ class KrRankingAndNxtOrderTest(unittest.TestCase):
         with self.assertRaises(KiwoomRestError):
             self._client().send_market_order("", "005930", "buy", 1,
                                              kr_exchange="NXT")
+
+
+class UsQuoteFallbackTest(unittest.TestCase):
+    """usa20100 서버 오류 시 거래소 재확인 → usa20101(10호가)로 대체."""
+
+    def _client(self, fail_20100=True, bad_cached_exchange=None):
+        self.calls = []
+
+        def transport(url, headers, body):
+            api_id = headers.get("api-id", "")
+            self.calls.append((api_id, dict(body)))
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            if api_id == "usa10098":
+                return {"return_code": 0, "list": [{"stex_tp": "ND"}]}
+            if api_id == "usa20100":
+                if fail_20100:
+                    return {"return_code": 7,
+                            "return_msg": "서비스를 처리하는 중에 오류 [1632]"}
+                return {"return_code": 0, "cur_prc": "48.53"}
+            if api_id == "usa20101":
+                return {"return_code": 0, "cur_prc": "48.60"}
+            raise AssertionError(api_id)
+
+        from autotrader.kiwoom_rest import KiwoomRestClient
+        client = KiwoomRestClient("A", "S", market="us", transport=transport)
+        if bad_cached_exchange:
+            client._exchanges["SOXL"] = bad_cached_exchange
+        return client
+
+    def test_falls_back_to_bid_quote(self):
+        client = self._client(fail_20100=True)
+        self.assertEqual(client.current_price("SOXL"), 48.60)
+        ids = [c[0] for c in self.calls]
+        self.assertIn("usa20101", ids)
+
+    def test_prefers_bid_quote_after_fallback(self):
+        client = self._client(fail_20100=True)
+        client.current_price("SOXL")
+        n_20100 = sum(1 for c in self.calls if c[0] == "usa20100")
+        client.current_price("SOXL")      # 2분간 usa20101 우선
+        self.assertEqual(sum(1 for c in self.calls if c[0] == "usa20100"),
+                         n_20100)         # usa20100 추가 호출 없음
+        self.assertEqual(self.calls[-1][0], "usa20101")
+
+    def test_bad_cached_exchange_is_refreshed(self):
+        client = self._client(fail_20100=True, bad_cached_exchange="XX")
+        client.current_price("SOXL")
+        resolves = [c for c in self.calls if c[0] == "usa10098"]
+        self.assertTrue(resolves)                       # 거래소 재확인
+        self.assertEqual(client._exchanges["SOXL"], "ND")
+
+    def test_no_fallback_when_primary_works(self):
+        client = self._client(fail_20100=False)
+        self.assertEqual(client.current_price("SOXL"), 48.53)
+        ids = [c[0] for c in self.calls]
+        self.assertNotIn("usa20101", ids)
+
+    def test_ranking_ignores_unknown_exchange_format(self):
+        def transport(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            if "/api/us/rkinfo" in url:
+                return {"return_code": 0, "result_list": [
+                    {"stk_cd": "SOXL", "cur_prc": "48", "flu_rt": "2",
+                     "trde_qty": "100", "stex_tp": "2"},      # 비표준 형식
+                    {"stk_cd": "NVDA", "cur_prc": "180", "flu_rt": "1",
+                     "trde_qty": "90", "stex_tp": "ND"},
+                ]}
+            raise AssertionError(url)
+
+        from autotrader.kiwoom_rest import KiwoomRestClient
+        client = KiwoomRestClient("A", "S", market="us", transport=transport)
+        client.top_stocks("volume")
+        self.assertNotIn("SOXL", client._exchanges)     # 오염 안 됨
+        self.assertEqual(client._exchanges["NVDA"], "ND")
