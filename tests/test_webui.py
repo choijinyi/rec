@@ -136,3 +136,29 @@ class HttpRoutingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdoptEndpointTest(unittest.TestCase):
+    def test_adopt_requires_running_trader(self):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = make_state(tmp.name)
+        self.assertIn("error", state.adopt("ONCO", "manage"))
+
+    def test_adopt_queues_request(self):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = make_state(tmp.name)
+        state.start(market="us", target_pct="1.5", max_positions="2",
+                    cash="1000")
+        self.assertEqual(state.adopt("onco", "manage"), {"ok": True})
+        self.assertIn(("ONCO", "manage"), state.trader._requests
+                      or [("ONCO", "manage")])
+        self.assertIn("error", state.adopt("ONCO", "bogus"))
+        self.assertTrue(state.trader.state_path.endswith(
+            "autotrader_state_us.json"))
+        state.stop()

@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -135,6 +137,12 @@ class ScalpConfig:
     us_extended: bool = True      # 미국 프리마켓·애프터마켓 매매
     kr_extended: bool = True      # 국내 장전·장후(NXT) 매매
     min_price: float | None = None  # None이면 미국 $5 / 국내 1,000원
+    # 거래대금(가격×당일 거래량) 하한 — 저유동성 종목은 지정가 매도가 안 받아져
+    # 손절이 불가능해지므로 후보에서 뺀다. None이면 미국 $3M / 국내 30억 원, 0이면 끔
+    min_dollar_volume: float | None = None
+    fill_timeout_sec: float = 45.0  # 지정가 주문이 이 시간 안에 체결되지 않으면 취소·재주문
+    chase_step_pct: float = 0.3     # 추격 매도 회차마다 현재가 대비 낮추는 폭(%)
+    chase_max_pct: float = 2.0      # 추격 매도 최대 할인 폭(%)
 
 
 @dataclass
@@ -145,6 +153,32 @@ class Position:
     entry_time: dt.datetime
     last_price: float = 0.0
     last_quote_time: dt.datetime | None = None   # 마지막으로 시세를 받은 시각
+    # 지정가 주문 체결 확인 (미국주식): 체결이 확인되기 전에는 포지션을
+    # 장부에서 지우지 않는다 — 매도 주문만 내고 체결을 가정하면, 미체결 시
+    # 아무도 감시하지 않는 '유령 보유'가 생긴다
+    entry_pending: bool = False
+    entry_order: str = ""
+    entry_sent_at: dt.datetime | None = None
+    exit_pending: bool = False
+    exit_reason: str = ""
+    exit_order: str = ""
+    exit_sent_at: dt.datetime | None = None
+    exit_price: float = 0.0
+    exit_attempts: int = 0
+    exit_needs_resend: bool = False
+    orig_qty: int = 0
+    partial_pnl: float = 0.0
+    adopted: bool = False        # 계좌 기존 보유를 사용자가 편입한 포지션
+    # 이 포지션과 무관하게 계좌에 원래 있던 수량 (체결 검증용, 모르면 None)
+    baseline_qty: int | None = None
+    exit_unconfirmed: int = 0    # 주문은 사라졌는데 잔고가 안 줄어든 확인 횟수
+
+    def state(self) -> str:
+        if self.entry_pending:
+            return "매수 체결 확인 중"
+        if self.exit_pending:
+            return f"{self.exit_reason} 매도 체결 대기({self.exit_attempts}차)"
+        return "편입 보유" if self.adopted else "보유"
 
     def pct(self, price: float | None = None) -> float:
         p = price if price is not None else self.last_price
@@ -174,7 +208,8 @@ class Scalper:
                  is_simulation: bool = True,
                  clock: Callable[[], dt.datetime] = dt.datetime.now,
                  utc_clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 state_path: str | None = None):
         if not is_simulation and not config.allow_real:
             raise PermissionError(
                 "실전투자 접속이 감지되었다. 모의투자로 검증하거나 allow_real을 "
@@ -210,6 +245,15 @@ class Scalper:
         self._rescan_asap = False
         self._no_candidates = False
         self._running = False
+        # 미국주식은 지정가라 체결을 미체결 조회로 확인한다
+        self._verify = (config.market == "us"
+                        and hasattr(api, "us_open_orders")
+                        and hasattr(api, "cancel_order"))
+        self.state_path = state_path
+        self.holdings: dict[str, dict] = {}     # 실계좌 보유 (잔고 동기화 시 갱신)
+        self._requests: list[tuple[str, str]] = []   # UI의 편입/청산 요청
+        self._req_lock = threading.Lock()
+        self._entry_pause_until: dt.datetime | None = None
 
     # ── 상태 조회 (UI 공용) ────────────────────────────────
     @property
@@ -248,9 +292,13 @@ class Scalper:
     def _kr_route(self) -> str:
         return "KRX" if kr_session(self.clock(), False) == "정규장" else "NXT"
 
-    def _order(self, code: str, side: str, quantity: int) -> None:
-        self.api.send_market_order("", code, side, quantity,
-                                   kr_exchange=self._kr_route())
+    def _order(self, code: str, side: str, quantity: int,
+               limit_price: float | None = None) -> str:
+        kwargs = {"kr_exchange": self._kr_route()}
+        if limit_price is not None:
+            kwargs["limit_price"] = limit_price
+        result = self.api.send_market_order("", code, side, quantity, **kwargs)
+        return result if isinstance(result, str) else ""
 
     # ── 포지션 관리 ───────────────────────────────────────
     def _per_slot_budget(self) -> float:
@@ -265,35 +313,241 @@ class Scalper:
         if quantity < 1:
             self._log(f"{code} 매수 건너뜀: 1주 금액({price:,.2f})이 슬롯 예산보다 크다")
             return False
-        self._order(code, "buy", quantity)
-        self.positions[code] = Position(code, quantity, price, self.clock(),
-                                        last_price=price,
-                                        last_quote_time=self.clock())
+        ord_no = self._order(code, "buy", quantity)
+        now = self.clock()
+        pos = Position(code, quantity, price, now, last_price=price,
+                       last_quote_time=now, orig_qty=quantity)
+        if self._verify:
+            pos.entry_pending = True
+            pos.entry_order = ord_no
+            pos.entry_sent_at = now
+        self.positions[code] = pos
         self.cash -= quantity * price
-        self._log(f"매수: {code} {quantity}주 @{price:,.2f} "
-                  f"(목표 +{self.config.target_pct}% / 손절 -{self.config.stop_pct}%)")
+        self._log(f"매수{' 주문' if self._verify else ''}: {code} {quantity}주 "
+                  f"@{price:,.2f} (목표 +{self.config.target_pct}% / "
+                  f"손절 -{self.config.stop_pct}%)")
+        self._save_state()
         return True
 
     def _close(self, pos: Position, price: float, reason: str) -> None:
-        self._order(pos.code, "sell", pos.quantity)
-        pnl = (price - pos.entry_price) * pos.quantity
-        self.cash += pos.quantity * price
-        self.trades.append(Trade(pos.code, pos.quantity, pos.entry_price,
-                                 price, pnl, pos.pct(price), reason,
-                                 self.clock()))
-        del self.positions[pos.code]
+        """청산 주문. 미국(지정가)은 체결이 확인될 때까지 포지션을 유지한다."""
+        if not self._verify:
+            self._order(pos.code, "sell", pos.quantity)
+            self._finalize(pos, price, reason)
+            return
+        ord_no = self._order(pos.code, "sell", pos.quantity, limit_price=price)
+        pos.exit_pending = True
+        pos.exit_reason = reason
+        pos.exit_order = ord_no
+        pos.exit_sent_at = self.clock()
+        pos.exit_price = price
+        pos.exit_attempts = 1
+        pos.exit_needs_resend = False
+        self._log(f"{reason} 매도 주문: {pos.code} {pos.quantity}주 @{price:,.2f} "
+                  f"({pos.pct(price):+.2f}%) — 체결 확인 중")
+
+    def _finalize(self, pos: Position, price: float, reason: str) -> None:
+        """체결이 확인된 청산을 장부에 반영한다."""
+        pnl = pos.partial_pnl + (price - pos.entry_price) * pos.quantity
+        if not pos.adopted:     # 편입분은 프로그램 현금으로 산 것이 아니다
+            self.cash += pos.quantity * price
+        qty = max(pos.orig_qty, pos.quantity)
+        self.trades.append(Trade(pos.code, qty, pos.entry_price, price, pnl,
+                                 pos.pct(price), reason, self.clock()))
+        self.positions.pop(pos.code, None)
         # 익절한 종목은 짧게 쉬고 재진입을 허용해 매매가 계속 이어지게 한다
         minutes = (self.config.win_cooldown_min if pnl > 0
                    else self.config.cooldown_min)
         self._cooldown[pos.code] = self.clock() + dt.timedelta(minutes=minutes)
         self._rescan_asap = True   # 슬롯이 비었으니 즉시 재탐색
-        self._log(f"{reason}: {pos.code} {pos.quantity}주 @{price:,.2f} "
+        self._log(f"{reason}: {pos.code} {qty}주 @{price:,.2f} "
                   f"({pos.pct(price):+.2f}%, 손익 {pnl:+,.2f}, "
-                  f"누적 {self.realized_pnl:+,.2f})")
+                  f"누적 {self.realized_pnl:+,.2f})"
+                  f"{' — 체결 확인' if self._verify else ''}")
+        self._save_state()
+
+    # ── 지정가 체결 확인 (미국주식) ───────────────────────
+    @staticmethod
+    def _norm_no(no: str) -> str:
+        return str(no or "").strip().lstrip("0")
+
+    def _find_order(self, orders: list[dict], code: str, ord_no: str):
+        if ord_no:
+            key = self._norm_no(ord_no)
+            for o in orders:
+                if self._norm_no(o.get("ord_no")) == key:
+                    return o
+            return None
+        return next((o for o in orders if o.get("code") == code), None)
+
+    @staticmethod
+    def _remaining(order: dict, qty: int) -> int:
+        remaining = int(order.get("remaining") or 0)
+        if remaining <= 0:
+            remaining = qty - int(order.get("filled") or 0)
+        return max(0, min(qty, remaining))
+
+    def _actual_qty(self, code: str) -> int | None:
+        if not hasattr(self.api, "us_balances"):
+            return None
+        try:
+            balances = self.api.us_balances()
+        except Exception as e:
+            logger.warning("잔고 조회 실패(체결 검증 보류): %s", e)
+            return None
+        self.holdings = balances
+        return int(balances.get(code, {}).get("qty") or 0)
+
+    def _check_pending(self) -> None:
+        pending = [p for p in self.positions.values()
+                   if p.entry_pending or p.exit_pending]
+        if not pending:
+            return
+        try:
+            orders = self.api.us_open_orders()
+        except Exception as e:
+            self.last_error = f"미체결 조회 실패: {e}"
+            logger.warning("미체결 조회 실패(다음 주기에 재확인): %s", e)
+            return
+        now = self.clock()
+        for pos in pending:
+            try:
+                if pos.entry_pending:
+                    self._check_entry(pos, orders, now)
+                else:
+                    self._check_exit(pos, orders, now)
+            except Exception as e:
+                self.last_error = f"{pos.code} 체결 확인 오류: {e}"
+                logger.warning("%s 체결 확인 오류: %s", pos.code, e)
+
+    def _check_entry(self, pos: Position, orders: list[dict],
+                     now: dt.datetime) -> None:
+        order = self._find_order(orders, pos.code, pos.entry_order)
+        if order is None:
+            pos.entry_pending = False
+            pos.orig_qty = pos.quantity
+            actual = self._actual_qty(pos.code)
+            if actual is not None:
+                pos.baseline_qty = max(0, actual - pos.quantity)
+            self._log(f"매수 체결 확인: {pos.code} {pos.quantity}주")
+            self._save_state()
+            return
+        if (now - pos.entry_sent_at).total_seconds() < self.config.fill_timeout_sec:
+            return
+        try:
+            self.api.cancel_order(order["ord_no"], pos.code)
+        except Exception as e:   # 그사이 체결됐을 수 있다 — 다음 주기에 재확인
+            logger.warning("%s 매수 미체결 취소 실패: %s", pos.code, e)
+            return
+        remaining = self._remaining(order, pos.quantity)
+        filled = pos.quantity - remaining
+        self.cash += remaining * pos.entry_price
+        if filled <= 0:
+            self.positions.pop(pos.code, None)
+            self._cooldown[pos.code] = now + dt.timedelta(minutes=10)
+            self._rescan_asap = True
+            self._log(f"매수 미체결 취소: {pos.code} — 체결 0주, 다음 후보로 교체")
+        else:
+            pos.quantity = filled
+            pos.orig_qty = filled
+            pos.entry_pending = False
+            self._log(f"매수 일부 체결: {pos.code} {filled}주 체결, 잔량 {remaining}주 취소")
+        self._save_state()
+
+    def _check_exit(self, pos: Position, orders: list[dict],
+                    now: dt.datetime) -> None:
+        if pos.exit_needs_resend:
+            self._resend_exit(pos, now)
+            return
+        order = self._find_order(orders, pos.code, pos.exit_order)
+        if order is None:          # 미체결 목록에서 사라짐 — 체결 또는 소멸
+            self._confirm_exit_by_balance(pos, now)
+            return
+        if (now - pos.exit_sent_at).total_seconds() < self.config.fill_timeout_sec:
+            return
+        try:
+            self.api.cancel_order(order["ord_no"], pos.code)
+        except Exception as e:   # 그사이 체결됐을 수 있다 — 다음 주기에 재확인
+            logger.warning("%s 매도 미체결 취소 실패: %s", pos.code, e)
+            return
+        remaining = self._remaining(order, pos.quantity)
+        filled = pos.quantity - remaining
+        if remaining <= 0:
+            self._finalize(pos, pos.exit_price, pos.exit_reason)
+            return
+        if filled > 0:
+            pos.partial_pnl += (pos.exit_price - pos.entry_price) * filled
+            if not pos.adopted:
+                self.cash += filled * pos.exit_price
+            pos.quantity = remaining
+        pos.exit_needs_resend = True
+        self._resend_exit(pos, now)
+
+    def _confirm_exit_by_balance(self, pos: Position, now: dt.datetime) -> None:
+        """주문이 사라진 뒤 실계좌 보유로 실제 매도 여부를 확인한다.
+
+        지정가 주문은 장 마감 등으로 체결 없이 소멸할 수 있어, 사라졌다고
+        체결로 단정하면 '팔았다고 믿는 보유'가 다시 생긴다. 잔고 반영이
+        늦을 수 있으므로 안 팔린 것으로 보여도 두 번 연속 확인한 뒤에만
+        재주문한다.
+        """
+        if pos.baseline_qty is None:
+            self._finalize(pos, pos.exit_price, pos.exit_reason)
+            return
+        actual = self._actual_qty(pos.code)
+        if actual is None:
+            return                              # 잔고 조회 실패 — 다음 주기에 재확인
+        unsold = max(0, min(pos.quantity, actual - pos.baseline_qty))
+        if unsold == 0:
+            self._finalize(pos, pos.exit_price, pos.exit_reason)
+            return
+        pos.exit_unconfirmed += 1
+        if pos.exit_unconfirmed < 2:
+            return
+        pos.exit_unconfirmed = 0
+        sold = pos.quantity - unsold
+        if sold > 0:
+            pos.partial_pnl += (pos.exit_price - pos.entry_price) * sold
+            if not pos.adopted:
+                self.cash += sold * pos.exit_price
+            pos.quantity = unsold
+        self._log(f"매도 주문이 체결 없이 사라짐: {pos.code} {unsold}주 미매도 확인 "
+                  f"→ 재주문")
+        pos.exit_needs_resend = True
+        self._resend_exit(pos, now)
+
+    def _resend_exit(self, pos: Position, now: dt.datetime) -> None:
+        """미체결 매도를 현재가보다 조금씩 낮춰 다시 낸다 (손절은 무조건 나가야 한다)."""
+        try:
+            price = self.api.current_price(pos.code)
+            pos.last_price = price
+        except Exception:
+            price = pos.last_price or pos.exit_price
+        attempt = pos.exit_attempts + 1
+        discount = min(self.config.chase_step_pct * (attempt - 1),
+                       self.config.chase_max_pct)
+        limit = round(price * (1 - discount / 100), 2)
+        try:
+            ord_no = self._order(pos.code, "sell", pos.quantity, limit_price=limit)
+        except Exception as e:
+            self.last_error = f"{pos.code} 추격 매도 실패: {e}"
+            logger.warning("%s 추격 매도 실패(다음 주기에 재시도): %s", pos.code, e)
+            return
+        pos.exit_attempts = attempt
+        pos.exit_order = ord_no
+        pos.exit_sent_at = now
+        pos.exit_price = limit
+        pos.exit_needs_resend = False
+        self._log(f"매도 미체결 → {attempt}차 추격 매도: {pos.code} {pos.quantity}주 "
+                  f"@{limit:,.2f} (현재가 대비 -{discount:.1f}%)")
 
     def _monitor_positions(self) -> None:
+        if self._verify:
+            self._check_pending()
         for code in list(self.positions):
-            pos = self.positions[code]
+            pos = self.positions.get(code)
+            if pos is None or pos.entry_pending or pos.exit_pending:
+                continue
             try:
                 price = self.api.current_price(code)
             except Exception as e:   # 한 종목의 시세 오류가 전체를 멈추지 않게
@@ -336,6 +590,11 @@ class Scalper:
             return self.config.min_price
         return 5.0 if self.config.market == "us" else 1000.0
 
+    def _min_dollar_volume(self) -> float:
+        if self.config.min_dollar_volume is not None:
+            return self.config.min_dollar_volume
+        return 3_000_000.0 if self.config.market == "us" else 3_000_000_000.0
+
     @staticmethod
     def _row_float(row: dict, key: str) -> float:
         try:
@@ -360,12 +619,17 @@ class Scalper:
                     rows.append(row)
         now = self.clock()
         min_price = self._min_price()
+        min_dv = self._min_dollar_volume()
 
         def ok(row: dict) -> bool:
             code = row["code"]
             price = abs(self._row_float(row, "price"))
             if 0 < price < min_price:
                 return False                      # 초저가 잡주 배제
+            if min_dv > 0:                        # 저유동성 배제(손절 체결 보장)
+                volume = abs(self._row_float(row, "volume"))
+                if volume <= 0 or price * volume < min_dv:
+                    return False
             if self._row_float(row, "change_pct") <= 0:
                 return False                      # 상승 모멘텀 종목만
             if code in self.positions:
@@ -454,6 +718,13 @@ class Scalper:
             except Exception as e:
                 message = str(e)
                 self.last_error = f"{code} 매수 오류: {message}"
+                if "증거금" in message:
+                    # 계좌 전체의 매수 여력 문제(미체결 주문·장부와 실제 차이) —
+                    # 종목을 제외하지 않고 신규 매수만 잠시 멈춘다
+                    self._entry_pause_until = self.clock() + dt.timedelta(minutes=3)
+                    self._log(f"매수 보류({code}): 계좌 매수가능 금액 부족 — "
+                              f"3분간 신규 매수 대기 (종목 제외 안 함)")
+                    break
                 # 거래 요건 미달(레버리지 ETP 예탁금 등)·매수 불가 종목은
                 # 당일 제외하고, 그 외 실패도 1시간은 다시 시도하지 않는다
                 hard = any(k in message for k in ("불가", "예탁금", "미만"))
@@ -466,6 +737,8 @@ class Scalper:
 
     # ── 일일 안전장치 ─────────────────────────────────────
     def _entries_allowed(self) -> bool:
+        if self._entry_pause_until and self.clock() < self._entry_pause_until:
+            return False
         limit = -self.config.total_cash * self.config.daily_loss_pct / 100
         if self.realized_pnl <= limit:
             if self.halt_reason != "손실 한도":
@@ -481,10 +754,115 @@ class Scalper:
             return False
         return True
 
+    # ── 계좌 보유 편입 / 수동 청산 (UI 요청) ────────────────
+    def request(self, code: str, mode: str) -> None:
+        """mode: manage(편입 후 익절·손절 규칙 적용) | sell(즉시 전량 매도)."""
+        with self._req_lock:
+            self._requests.append((code.strip().upper(), mode))
+
+    def _process_requests(self) -> None:
+        with self._req_lock:
+            requests, self._requests = self._requests, []
+        for code, mode in requests:
+            try:
+                self._adopt(code, mode)
+            except Exception as e:
+                self.last_error = f"{code} 편입/청산 실패: {e}"
+                self._log(f"편입/청산 실패({code}): {str(e)[:80]}")
+
+    def _adopt(self, code: str, mode: str) -> None:
+        pos = self.positions.get(code)
+        if pos is not None:
+            if mode == "sell" and not (pos.entry_pending or pos.exit_pending):
+                price = pos.last_price or self.api.current_price(code)
+                self._close(pos, price, "수동 청산")
+            return
+        holding = self.holdings.get(code)
+        if holding is None and hasattr(self.api, "us_balances"):
+            self.holdings = self.api.us_balances()
+            holding = self.holdings.get(code)
+        qty = int((holding or {}).get("sellable") or (holding or {}).get("qty") or 0)
+        if qty <= 0:
+            self._log(f"편입 불가({code}): 계좌에 매도 가능한 수량이 없다")
+            return
+        try:
+            price = self.api.current_price(code)
+        except Exception:
+            price = float(holding.get("now_price") or 0)
+        avg = float(holding.get("avg_price") or 0) or price
+        now = self.clock()
+        pos = Position(code, qty, avg, now, last_price=price,
+                       last_quote_time=now, orig_qty=qty, adopted=True,
+                       baseline_qty=max(0, int(holding.get("qty") or qty) - qty))
+        self.positions[code] = pos
+        self._log(f"계좌 보유 편입: {code} {qty}주 (매입단가 {avg:,.2f}, "
+                  f"현재 {pos.pct(price):+.2f}%) — 익절·손절 규칙 적용")
+        if mode == "sell":
+            self._close(pos, price, "수동 청산")
+        self._save_state()
+
+    # ── 상태 저장 / 복원 (재시작해도 자기 포지션을 잃지 않는다) ──
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        data = {"market": self.config.market,
+                "saved_at": self.clock().isoformat(),
+                "positions": [
+                    {"code": p.code, "quantity": p.quantity,
+                     "entry_price": p.entry_price,
+                     "entry_time": p.entry_time.isoformat(),
+                     "adopted": p.adopted}
+                    for p in self.positions.values()]}
+        try:
+            tmp = f"{self.state_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            logger.warning("상태 저장 실패: %s", e)
+
+    def restore_state(self) -> None:
+        """이전 실행이 남긴 포지션을 실계좌 잔고와 대조해 복원한다 (미국주식)."""
+        if (not self.state_path or not os.path.exists(self.state_path)
+                or self.config.market != "us"
+                or not hasattr(self.api, "us_balances")):
+            return
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("market") != self.config.market:
+                return
+            balances = self.api.us_balances()
+        except Exception as e:
+            logger.warning("상태 복원 실패: %s", e)
+            return
+        self.holdings = balances
+        for item in data.get("positions", []):
+            code = item.get("code", "")
+            actual = int(balances.get(code, {}).get("qty") or 0)
+            qty = min(int(item.get("quantity", 0)), actual)
+            if not code or qty <= 0 or code in self.positions:
+                continue
+            try:
+                entry_time = dt.datetime.fromisoformat(item["entry_time"])
+            except (KeyError, ValueError):
+                entry_time = self.clock()
+            pos = Position(code, qty, float(item.get("entry_price", 0)),
+                           entry_time, orig_qty=qty,
+                           adopted=bool(item.get("adopted")),
+                           baseline_qty=max(0, actual - qty))
+            self.positions[code] = pos
+            if not pos.adopted:
+                self.cash -= qty * pos.entry_price
+            self._log(f"이전 실행 포지션 복원: {code} {qty}주 "
+                      f"(매입단가 {pos.entry_price:,.2f}) — 익절·손절 감시 재개")
+        self._save_state()
+
     # ── 매매 루프 ─────────────────────────────────────────
     def step(self) -> None:
         if self.session() == "장외":
             return
+        self._process_requests()
         self._monitor_positions()
         slots = self.config.max_positions - len(self.positions)
         if slots > 0 and self._entries_allowed():
@@ -507,8 +885,11 @@ class Scalper:
         except Exception as e:
             logger.warning("잔고 동기화 실패(다음 주기에 재시도): %s", e)
             return
+        self.holdings = balances
         for code in list(self.positions):
             pos = self.positions[code]
+            if pos.entry_pending or pos.exit_pending or pos.adopted:
+                continue
             actual = balances.get(code, {}).get("qty", pos.quantity)
             if actual >= pos.quantity:
                 continue   # 기존 보유분(초과)은 이 프로그램이 건드리지 않는다
@@ -521,6 +902,7 @@ class Scalper:
                 del self.positions[code]
             else:
                 pos.quantity = actual
+            self._save_state()
 
     def run(self) -> None:
         self._running = True
@@ -528,6 +910,10 @@ class Scalper:
         self._log(f"AI 단타 시작: {'미국' if cfg.market == 'us' else '국내'} / "
                   f"목표 +{cfg.target_pct}% · 손절 -{cfg.stop_pct}% / "
                   f"동시 {cfg.max_positions}종목 / 총 {cfg.total_cash:,.0f}")
+        try:
+            self.restore_state()
+        except Exception as e:
+            logger.warning("상태 복원 중 오류: %s", e)
         last_reconcile = 0.0
         try:
             while self._running:
