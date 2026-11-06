@@ -120,7 +120,8 @@ class ScalpConfig:
     total_cash: float = 1_000_000
     poll_interval: float = 3.0
     scan_interval: float = 120.0  # 후보 재탐색 주기(초)
-    cooldown_min: float = 30.0    # 같은 종목 재매수 대기(분)
+    cooldown_min: float = 30.0    # 손절한 종목 재매수 대기(분)
+    win_cooldown_min: float = 5.0  # 익절한 종목 재매수 대기(분) — 짧게 두어 반복 매매
     stale_min: float = 60.0       # 이 시간(분) 안에 익절/손절 미도달 시 교체
     daily_loss_pct: float = 6.0   # 당일 누적 손실이 자본의 이 % 도달 시 신규 매수 중단
     max_trades_per_day: int = 40  # 당일 최대 청산 횟수
@@ -200,6 +201,8 @@ class Scalper:
         self._scan_thread: threading.Thread | None = None
         self._scan_result: tuple[list[str], str] | None = None
         self._last_scan = 0.0
+        self._rescan_asap = False
+        self._no_candidates = False
         self._running = False
 
     # ── 상태 조회 (UI 공용) ────────────────────────────────
@@ -269,8 +272,11 @@ class Scalper:
                                  price, pnl, pos.pct(price), reason,
                                  self.clock()))
         del self.positions[pos.code]
-        self._cooldown[pos.code] = self.clock() + dt.timedelta(
-            minutes=self.config.cooldown_min)
+        # 익절한 종목은 짧게 쉬고 재진입을 허용해 매매가 계속 이어지게 한다
+        minutes = (self.config.win_cooldown_min if pnl > 0
+                   else self.config.cooldown_min)
+        self._cooldown[pos.code] = self.clock() + dt.timedelta(minutes=minutes)
+        self._rescan_asap = True   # 슬롯이 비었으니 즉시 재탐색
         self._log(f"{reason}: {pos.code} {pos.quantity}주 @{price:,.2f} "
                   f"({pos.pct(price):+.2f}%, 손익 {pnl:+,.2f}, "
                   f"누적 {self.realized_pnl:+,.2f})")
@@ -350,7 +356,13 @@ class Scalper:
         try:
             rows = self._candidates()
             if not rows:
+                if not self._no_candidates:
+                    self._no_candidates = True
+                    self._log("탐색: 매수 가능한 후보가 없다(필터·쿨다운 제외) "
+                              "— 30초 간격으로 재탐색한다")
+                self._retry_scan_soon()
                 return
+            self._no_candidates = False
             ranked = sorted(rows, key=lambda r: self._row_float(r, "change_pct"),
                             reverse=True)
             codes: list[str] = []
@@ -376,11 +388,17 @@ class Scalper:
         finally:
             self._scan_thread = None
 
+    def _retry_scan_soon(self, seconds: float = 30.0) -> None:
+        self._last_scan = time.monotonic() - self.config.scan_interval + seconds
+
     def _maybe_scan(self, slots: int) -> None:
         if slots < 1 or self._scan_thread is not None:
             return
-        if time.monotonic() - self._last_scan < self.config.scan_interval:
+        due = (self._rescan_asap
+               or time.monotonic() - self._last_scan >= self.config.scan_interval)
+        if not due:
             return
+        self._rescan_asap = False
         self._last_scan = time.monotonic()
         thread = threading.Thread(target=self._scan_worker, args=(slots,),
                                   daemon=True)
@@ -414,6 +432,8 @@ class Scalper:
                 self._cooldown[code] = self.clock() + dt.timedelta(hours=hours)
                 self._log(f"매수 실패({code}): {message[:90]}"
                           f" → {'당일' if hard else '1시간'} 제외, 다음 후보로 교체")
+        if codes and filled == 0:
+            self._retry_scan_soon()   # 전부 거부되면 2분을 기다리지 않고 재탐색
 
     # ── 일일 안전장치 ─────────────────────────────────────
     def _entries_allowed(self) -> bool:
