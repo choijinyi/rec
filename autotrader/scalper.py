@@ -84,9 +84,27 @@ def kr_session(now: dt.datetime, extended: bool = True) -> str:
     return "장외"
 
 
-def us_session(utc_now: dt.datetime, day_session: bool = True) -> str:
+def _us_extended_session(utc_now: dt.datetime) -> str:
+    """미국 프리마켓(ET 04:00~09:30) / 애프터마켓(ET 16:00~20:00) 여부."""
+    offset = -4 if _us_dst_active(utc_now) else -5
+    et = utc_now + dt.timedelta(hours=offset)
+    if et.weekday() >= 5:
+        return ""
+    if dt.time(4, 0) <= et.time() < US_OPEN:
+        return "프리마켓"
+    if US_CLOSE < et.time() <= dt.time(20, 0):
+        return "애프터마켓"
+    return ""
+
+
+def us_session(utc_now: dt.datetime, day_session: bool = True,
+               extended: bool = True) -> str:
     if in_us_market_hours(utc_now):
         return "정규장"
+    if extended:
+        label = _us_extended_session(utc_now)
+        if label:
+            return label
     if day_session and in_us_day_session(utc_now):
         return "주간거래"
     return "장외"
@@ -108,6 +126,7 @@ class ScalpConfig:
     max_trades_per_day: int = 40  # 당일 최대 청산 횟수
     allow_real: bool = False
     us_day_session: bool = True
+    us_extended: bool = True      # 미국 프리마켓·애프터마켓 매매
     kr_extended: bool = True      # 국내 장전·장후(NXT) 매매
     min_price: float | None = None  # None이면 미국 $5 / 국내 1,000원
 
@@ -203,7 +222,8 @@ class Scalper:
 
     def session(self) -> str:
         if self.config.market == "us":
-            return us_session(self.utc_clock(), self.config.us_day_session)
+            return us_session(self.utc_clock(), self.config.us_day_session,
+                              self.config.us_extended)
         return kr_session(self.clock(), self.config.kr_extended)
 
     def stop(self) -> None:
