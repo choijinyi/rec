@@ -31,6 +31,8 @@ _API_ORDER_KR = {"buy": ("/api/dostk/ordr", "kt10000"),
                  "sell": ("/api/dostk/ordr", "kt10001")}
 # 미국주식 (주문은 지정가 방식: ord_uv 필수)
 _API_PRICE_US = ("/api/us/mrkcond", "usa20100")
+# 현재가 10호가 — usa20100이 서버 오류(1632 등)를 낼 때의 대체 시세원
+_API_PRICE_US_BID = ("/api/us/mrkcond", "usa20101")
 _API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
                  "sell": ("/api/us/ordr", "ust20001")}
 # 미국주식 현재가 응답에서 시도할 필드 후보
@@ -134,7 +136,8 @@ class KiwoomRestClient:
         self._transport = transport
         self._token: str | None = None
         self._token_expires_at = 0.0
-        self._last_prices: dict[str, float] = {}  # 종목별 직전 시세 (미국 지정가 주문용)
+        self._last_prices: dict[str, float] = {}
+        self._prefer_bid_until = 0.0   # usa20101을 우선 쓰는 기한(monotonic)  # 종목별 직전 시세 (미국 지정가 주문용)
         self._exchanges: dict[str, str] = {}      # 종목별 거래소구분 캐시 (NA/ND/NY)
 
     # ── 인증 ────────────────────────────────────────────────
@@ -203,18 +206,47 @@ class KiwoomRestClient:
         self._exchanges[code] = ex
         return ex
 
+    def _us_price_once(self, code: str, api: tuple, exchange: str) -> float:
+        res = self._call(api[0], api[1], {"stex_tp": exchange, "stk_cd": code})
+        for key in _US_PRICE_KEYS:
+            if res.get(key) not in (None, ""):
+                return self._parse_price(res[key])
+        raise KiwoomRestError(
+            f"미국주식 현재가 필드를 찾지 못했다. 응답 키: {sorted(res.keys())}")
+
+    def _us_price(self, code: str) -> float:
+        """usa20100 실패 시 거래소 구분 재확인 → usa20101(10호가)로 대체한다.
+
+        대체 조회가 성공하면 2분간 usa20101을 우선 사용해, 서버 오류가
+        이어지는 동안 실패 호출을 반복하지 않는다.
+        """
+        primary, secondary = _API_PRICE_US, _API_PRICE_US_BID
+        if time.monotonic() < self._prefer_bid_until:
+            primary, secondary = secondary, primary
+        exchange = self.resolve_exchange(code)
+        try:
+            return self._us_price_once(code, primary, exchange)
+        except KiwoomRestError as first_err:
+            # 순위 응답이 심어 둔 거래소 구분이 틀렸을 수 있으니 새로 확인한다
+            self._exchanges.pop(code, None)
+            fresh = self.resolve_exchange(code)
+            try:
+                price = self._us_price_once(code, secondary, fresh)
+            except KiwoomRestError:
+                if fresh != exchange:
+                    try:
+                        return self._us_price_once(code, primary, fresh)
+                    except KiwoomRestError:
+                        pass
+                raise first_err
+            if secondary is _API_PRICE_US_BID:
+                self._prefer_bid_until = time.monotonic() + 120
+                logger.info("%s 시세를 10호가(usa20101)로 대체 조회한다", code)
+            return price
+
     def current_price(self, code: str) -> float:
         if self.market == "us":
-            res = self._call(_API_PRICE_US[0], _API_PRICE_US[1],
-                             {"stex_tp": self.resolve_exchange(code),
-                              "stk_cd": code})
-            for key in _US_PRICE_KEYS:
-                if res.get(key) not in (None, ""):
-                    price = self._parse_price(res[key])
-                    break
-            else:
-                raise KiwoomRestError(
-                    f"미국주식 현재가 필드를 찾지 못했다. 응답 키: {sorted(res.keys())}")
+            price = self._us_price(code)
         else:
             res = self._call(_API_PRICE_KR[0], _API_PRICE_KR[1], {"stk_cd": code})
             raw = res.get("cur_prc")
@@ -306,8 +338,9 @@ class KiwoomRestClient:
                 "volume": pick("trde_qty", "now_trde_qty", "acc_trde_qty"),
                 "exchange": pick("stex_tp"),
             }
-            # 순위 응답이 알려준 거래소를 캐시해 두면 시세·주문에 그대로 쓴다
-            if item["code"] and item["exchange"]:
+            # 순위 응답이 알려준 거래소를 캐시해 두면 시세·주문에 그대로 쓴다.
+            # 문서화된 값(NA/ND/NY) 외의 형식은 캐시를 오염시키므로 버린다
+            if item["code"] and item["exchange"] in ("NA", "ND", "NY"):
                 self._exchanges[item["code"]] = item["exchange"]
             out.append(item)
         return out
