@@ -257,3 +257,41 @@ class RateLimitTest(unittest.TestCase):
         kr._rate_limit_wait()
         elapsed = _time.monotonic() - start
         self.assertGreaterEqual(elapsed, 2 * kr._MIN_REQUEST_INTERVAL * 0.9)
+
+
+class UsTickFallbackTest(unittest.TestCase):
+    """mrkcond(20100·20101)가 통째로 죽어도 틱차트(usa06010)로 시세를 받는다."""
+
+    def _client(self):
+        self.calls = []
+
+        def transport(url, headers, body):
+            api_id = headers.get("api-id", "")
+            self.calls.append(api_id)
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            if api_id == "usa10098":
+                return {"return_code": 0, "list": [{"stex_tp": "ND"}]}
+            if api_id in ("usa20100", "usa20101"):
+                return {"return_code": 7, "return_msg": "오류 [1632]"}
+            if api_id == "usa06010":
+                return {"return_code": 0, "result_list": [
+                    {"cur_prc": "48.70", "cntr_tm": "235900"}]}
+            raise AssertionError(api_id)
+
+        from autotrader.kiwoom_rest import KiwoomRestClient
+        return KiwoomRestClient("A", "S", market="us", transport=transport)
+
+    def test_tick_chart_serves_price(self):
+        client = self._client()
+        self.assertEqual(client.current_price("SOXL"), 48.70)
+        self.assertIn("usa06010", self.calls)
+
+    def test_tick_preferred_after_success(self):
+        client = self._client()
+        client.current_price("SOXL")
+        before = sum(1 for c in self.calls if c in ("usa20100", "usa20101"))
+        client.current_price("SOXL")        # 2분간 틱차트 우선
+        after = sum(1 for c in self.calls if c in ("usa20100", "usa20101"))
+        self.assertEqual(before, after)     # mrkcond 재시도 없음
+        self.assertEqual(self.calls[-1], "usa06010")
