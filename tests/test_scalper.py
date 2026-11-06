@@ -52,7 +52,7 @@ def make_trader(price_seqs=None, ranking=None, selector=None, **cfg_kw):
     api = FakeAPI(price_seqs, ranking if ranking is not None else list(ROWS))
     trader = Scalper(api=api, config=ScalpConfig(**defaults),
                      selector=selector, is_simulation=True, clock=clock)
-    trader._last_scan = time.monotonic()   # 테스트에서는 스캔을 수동으로 돌린다
+    trader._maybe_scan = lambda *a, **k: None   # 테스트는 scan_now로 수동 구동
     trader._clock_state = clock_state
     return trader, api
 
@@ -243,7 +243,7 @@ class ReconcileTest(unittest.TestCase):
             is_simulation=True,
             utc_clock=lambda: datetime(2025, 10, 6, 14, 0, tzinfo=timezone.utc),
         )
-        trader._last_scan = time.monotonic()
+        trader._maybe_scan = lambda *a, **k: None
         trader._scan_worker(1)
         trader.step()
         self.assertEqual(trader.positions["AAPL"].quantity, 10)
@@ -342,7 +342,7 @@ class PreexistingHoldingsTest(unittest.TestCase):
             is_simulation=True,
             utc_clock=lambda: datetime(2025, 10, 6, 14, 0, tzinfo=timezone.utc),
         )
-        trader._last_scan = time.monotonic()
+        trader._maybe_scan = lambda *a, **k: None
         trader._scan_worker(1)
         trader.step()
         self.assertEqual(trader.positions["SOXL"].quantity, 14)  # 700//48
@@ -356,3 +356,76 @@ class PreexistingHoldingsTest(unittest.TestCase):
         trader.step()
         sells = [o for o in api.orders if o[1] == "sell"]
         self.assertEqual(sells[-1][2], 14)
+
+
+class ContinuousTradingTest(unittest.TestCase):
+    """청산 후 매매가 끊기지 않고 이어지는지."""
+
+    def _enter_and_close(self, prices, **cfg_kw):
+        trader, api = make_trader(price_seqs={"AAA": prices},
+                                  selector=lambda r, n: (["AAA"], ""),
+                                  max_positions=1, total_cash=1_000_000,
+                                  **cfg_kw)
+        scan_now(trader, 1)
+        trader.step()            # 청산
+        return trader, api
+
+    def test_win_gets_short_cooldown_and_immediate_rescan(self):
+        trader, api = self._enter_and_close([10_000, 10_200])   # 익절
+        self.assertTrue(trader._rescan_asap)                     # 즉시 재탐색
+        wait = (trader._cooldown["AAA"] - trader.clock()).total_seconds()
+        self.assertLessEqual(wait, 10 * 60)                      # 익절은 짧은 쿨다운
+        self.assertGreater(wait, 0)
+
+    def test_loss_keeps_long_cooldown(self):
+        trader, api = self._enter_and_close([10_000, 9_600])     # 손절
+        wait = (trader._cooldown["AAA"] - trader.clock()).total_seconds()
+        self.assertGreaterEqual(wait, 25 * 60)
+
+    def test_rescan_asap_bypasses_interval(self):
+        trader, api = make_trader()
+        # 원래 _maybe_scan 로직으로 검사하되 스레드 대신 기록만 한다
+        spawned = []
+        trader._maybe_scan = Scalper._maybe_scan.__get__(trader)
+        import threading as _th
+        orig = _th.Thread
+
+        class Rec(orig):
+            def start(self2):
+                spawned.append(True)
+
+        _th.Thread = Rec
+        try:
+            trader._last_scan = time.monotonic()   # 주기 미도달
+            trader._maybe_scan(1)
+            self.assertEqual(spawned, [])
+            trader._rescan_asap = True
+            trader._maybe_scan(1)
+            self.assertEqual(spawned, [True])      # 플래그로 즉시 탐색
+        finally:
+            _th.Thread = orig
+
+    def test_no_candidates_logged_once_and_retried_soon(self):
+        falling = [{"code": "AAA", "price": "10000", "change_pct": "-2.0"}]
+        trader, api = make_trader(ranking=falling, scan_interval=120.0)
+        trader._scan_worker(1)
+        trader._scan_worker(1)
+        logs = [e for e in trader.events if "후보가 없다" in e]
+        self.assertEqual(len(logs), 1)             # 상태 전환 시 1회만 기록
+        # 다음 탐색이 30초 안에 가능하도록 당겨졌는지
+        self.assertGreaterEqual(time.monotonic() - trader._last_scan,
+                                trader.config.scan_interval - 31)
+
+    def test_all_rejected_retries_soon(self):
+        trader, api = make_trader(selector=lambda r, n: (["AAA"], ""),
+                                  max_positions=1, scan_interval=120.0)
+        trader._last_scan = time.monotonic()
+
+        def reject(account_no, code, side, qty, kr_exchange="KRX"):
+            raise RuntimeError("매수 불가")
+
+        api.send_market_order = reject
+        scan_now(trader, 1)
+        self.assertEqual(trader.positions, {})
+        self.assertGreaterEqual(time.monotonic() - trader._last_scan,
+                                trader.config.scan_interval - 31)
