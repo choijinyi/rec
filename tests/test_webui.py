@@ -162,3 +162,25 @@ class AdoptEndpointTest(unittest.TestCase):
         self.assertTrue(state.trader.state_path.endswith(
             "autotrader_state_us.json"))
         state.stop()
+
+
+class DashboardScriptSyntaxTest(unittest.TestCase):
+    """대시보드 자바스크립트에 문법 오류가 있으면 모든 버튼이 죽는다."""
+
+    def test_page_script_parses(self):
+        import shutil
+        import subprocess
+        import tempfile
+
+        from autotrader.webui import PAGE
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node가 없어 JS 문법 검사를 건너뛴다")
+        script = PAGE.split("<script>")[1].split("</script>")[0]
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(script)
+        proc = subprocess.run([node, "--check", f.name],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
