@@ -1,4 +1,4 @@
-"""분할매매 웹 UI 테스트 (키움 API는 가짜로 대체)."""
+"""AI 단타 웹 UI 테스트 (키움 API·분석기는 가짜로 대체)."""
 
 import json
 import threading
@@ -16,15 +16,19 @@ class FakeClient:
     def current_price(self, code):
         return 10_000.0
 
-    def send_market_order(self, account_no, code, side, quantity):
+    def send_market_order(self, account_no, code, side, quantity,
+                          kr_exchange="KRX"):
         pass
 
+    def top_stocks(self, criteria="volume", limit=10):
+        return []
 
-def make_state(tmpdir, mode="mock"):
+
+def make_state(tmpdir, mode="mock", claude=""):
     from pathlib import Path
 
     cfg = Path(tmpdir) / "config.ini"
-    cfg.write_text(f"[kiwoom]\nappkey=A\nsecretkey=B\nmode={mode}\n",
+    cfg.write_text(f"[kiwoom]\nappkey=A\nsecretkey=B\nmode={mode}\n{claude}",
                    encoding="utf-8")
     state = AppState(str(cfg))
     state.client_factory = FakeClient
@@ -39,34 +43,30 @@ class StartStopTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.state = make_state(tmp.name)
 
-    def test_start_builds_split_trader(self):
-        r = self.state.start(market="kr", code="005930", buy_price="68000", sell_price="72000",
-                             step_pct="3", buy_splits="4", sell_splits="2",
-                             cash="1000000")
+    def test_start_builds_scalper_with_selector(self):
+        r = self.state.start(market="kr", target_pct="2", max_positions="3",
+                             cash="500000")
         self.assertEqual(r, {"ok": True})
         trader = self.state.trader
-        self.assertEqual(trader.config.code, "005930")
-        self.assertEqual(trader.config.buy_start_price, 68000.0)
-        self.assertEqual(trader.config.sell_start_price, 72000.0)
-        self.assertEqual(len(trader.buy_levels), 4)
-        self.assertEqual(len(trader.sell_levels), 2)
+        self.assertEqual(trader.config.target_pct, 2.0)
+        self.assertEqual(trader.config.stop_pct, 3.0)   # 손절 -3% 고정
+        self.assertEqual(trader.config.max_positions, 3)
+        self.assertIsNotNone(trader.selector)           # AI 선정 연결
         self.state.stop()
 
     def test_invalid_number_returns_error(self):
-        r = self.state.start(market="kr", code="005930", buy_price="abc", sell_price="72000",
-                             step_pct="3", buy_splits="3", sell_splits="3",
-                             cash="1000000")
-        self.assertIn("매수 시작 금액", r["error"])
+        r = self.state.start(market="kr", target_pct="abc", max_positions="2",
+                             cash="500000")
+        self.assertIn("목표 수익", r["error"])
         self.assertIsNone(self.state.trader)
 
-    def test_status_exposes_levels(self):
-        self.state.start(market="kr", code="005930", buy_price="10000", sell_price="10500",
-                         step_pct="5", buy_splits="2", sell_splits="1",
-                         cash="1000000")
+    def test_status_shape(self):
+        self.state.start(market="kr", target_pct="1.5", max_positions="2",
+                         cash="500000")
         s = self.state.status()
-        self.assertEqual(len(s["levels"]), 3)
-        self.assertEqual(s["levels"][0]["price"], 10000.0)
-        self.assertEqual(s["levels"][0]["side"], "buy")
+        for key in ("session", "positions", "trades", "wins", "losses",
+                    "selection_note", "halt_reason"):
+            self.assertIn(key, s)
         self.state.stop()
 
     def test_stop_without_start(self):
@@ -80,14 +80,12 @@ class RealModeConfirmTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         state = make_state(tmp.name, mode="real")
-        r = state.start(market="kr", code="005930", buy_price="10000", sell_price="10500",
-                        step_pct="5", buy_splits="2", sell_splits="2",
-                        cash="1000000", confirm="")
+        r = state.start(market="kr", target_pct="1.5", max_positions="2",
+                        cash="500000", confirm="")
         self.assertTrue(r.get("need_confirm"))
         self.assertIsNone(state.trader)
-        r = state.start(market="kr", code="005930", buy_price="10000", sell_price="10500",
-                        step_pct="5", buy_splits="2", sell_splits="2",
-                        cash="1000000", confirm="YES")
+        r = state.start(market="kr", target_pct="1.5", max_positions="2",
+                        cash="500000", confirm="YES")
         self.assertEqual(r, {"ok": True})
         self.assertTrue(state.trader.config.allow_real)
         state.stop()
@@ -121,7 +119,7 @@ class HttpRoutingTest(unittest.TestCase):
     def test_index_serves_dashboard(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/") as r:
             body = r.read()
-        self.assertIn("분할매매".encode(), body)
+        self.assertIn("AI 단타".encode(), body)
 
     def test_status_endpoint(self):
         with urllib.request.urlopen(
@@ -130,10 +128,8 @@ class HttpRoutingTest(unittest.TestCase):
         self.assertEqual(data["config_mode"], "mock")
 
     def test_start_and_stop_roundtrip(self):
-        r = self._post("/api/start", {
-            "market": "kr", "code": "005930", "buy_price": "10000", "sell_price": "10500",
-            "step_pct": "5", "buy_splits": "2", "sell_splits": "2",
-            "cash": "1000000"})
+        r = self._post("/api/start", {"market": "kr", "target_pct": "1.5",
+                                      "max_positions": "2", "cash": "500000"})
         self.assertEqual(r, {"ok": True})
         self.assertEqual(self._post("/api/stop", {}), {"ok": True})
 

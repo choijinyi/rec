@@ -76,6 +76,12 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo mode = mock
         echo ; 미국주식 주간거래^(한국 낮 시간^) 매매 허용. 끄려면 false
         echo us_day_session = true
+        echo.
+        echo [claude]
+        echo ; AI 종목 선정 방식. auto = 키가 있으면 API, 없으면 Claude Code 구독 로그인
+        echo backend = auto
+        echo ; API 방식을 쓸 때만 입력. 구독 로그인 사용 시 비워 두세요.
+        echo api_key =
     )
 )
 echo    완료
@@ -100,8 +106,8 @@ echo  =====================================================
 echo    설치가 끝났습니다!
 echo.
 echo    바탕화면의 "AutoTrader 실행"을 더블클릭하면 브라우저에
-echo    분할매매 대시보드가 열립니다. 종목, 기준 가격, 분할 %%,
-echo    분할 횟수, 총 투입 금액을 입력하고 시작을 누르면 됩니다.
+echo    AI 단타 대시보드가 열립니다. 목표 수익 %%와 총 투입 금액을
+echo    입력하고 시작을 누르면 AI가 종목을 골라 매매를 반복합니다.
 echo.
 echo    [준비 - 최초 1회, 잠시 후 열리는 config.ini에 입력]
 echo      openapi.kiwoom.com : 키움 REST API 신청 후

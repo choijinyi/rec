@@ -1,7 +1,7 @@
 """명령행 인터페이스.
 
 사용 예:
-    python -m autotrader ui              # 분할매매 대시보드 (브라우저)
+    python -m autotrader ui              # AI 단타 대시보드 (브라우저)
     python -m autotrader ui --port 8899 --no-browser
 """
 
@@ -13,7 +13,7 @@ import logging
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autotrader",
-                                     description="분할매매 자동 집행 프로그램")
+                                     description="AI 단타 자동매매 프로그램")
     sub = parser.add_subparsers(dest="command", required=True)
 
     ui = sub.add_parser("ui", help="브라우저 대시보드 실행")
