@@ -254,3 +254,33 @@ class ReconcileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsExtendedSessionTest(unittest.TestCase):
+    """미국 프리마켓/애프터마켓 (2026-11-06은 겨울 시간: ET = UTC-5)."""
+
+    def test_premarket_and_afterhours(self):
+        utc = timezone.utc
+        # ET 07:53 (프리마켓 04:00~09:30)
+        self.assertEqual(us_session(datetime(2026, 11, 6, 12, 53, tzinfo=utc)),
+                         "프리마켓")
+        # ET 17:00 (애프터마켓 16:00~20:00)
+        self.assertEqual(us_session(datetime(2026, 11, 6, 22, 0, tzinfo=utc)),
+                         "애프터마켓")
+        # ET 금요일 19:00 = 한국 토요일 새벽 — ET 요일 기준으로 매매 가능
+        self.assertEqual(us_session(datetime(2026, 11, 7, 0, 0, tzinfo=utc)),
+                         "애프터마켓")
+        # ET 21:00 — 애프터마켓 종료 후
+        self.assertEqual(us_session(datetime(2026, 11, 7, 2, 0, tzinfo=utc)),
+                         "장외")
+
+    def test_extended_off_reads_closed(self):
+        utc = timezone.utc
+        self.assertEqual(
+            us_session(datetime(2026, 11, 6, 12, 53, tzinfo=utc),
+                       extended=False), "장외")
+
+    def test_regular_session_takes_priority(self):
+        utc = timezone.utc
+        self.assertEqual(us_session(datetime(2026, 11, 6, 15, 0, tzinfo=utc)),
+                         "정규장")   # ET 10:00
