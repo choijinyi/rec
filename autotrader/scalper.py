@@ -351,6 +351,8 @@ class Scalper:
             rows = self._candidates()
             if not rows:
                 return
+            ranked = sorted(rows, key=lambda r: self._row_float(r, "change_pct"),
+                            reverse=True)
             codes: list[str] = []
             note = ""
             if self.selector is not None:
@@ -360,11 +362,13 @@ class Scalper:
                     codes = [c for c in picked if c in valid][:slots]
                 except Exception as e:
                     logger.warning("AI 선정 실패, 모멘텀 상위로 대체: %s", e)
+                    note = f"AI 선정 불가({str(e)[:80]}) — 등락률 모멘텀 상위로 자동 대체"
             if not codes:   # AI 실패/무효 → 등락률 모멘텀 상위로 대체
-                ranked = sorted(rows, key=lambda r: self._row_float(r, "change_pct"),
-                                reverse=True)
                 codes = [r["code"] for r in ranked[:slots]]
                 note = note or "AI 선정 불가 — 등락률 모멘텀 상위로 자동 대체"
+            # 주문이 거부된 종목을 즉시 대체할 수 있게 예비 후보를 뒤에 붙인다
+            backup = [r["code"] for r in ranked if r["code"] not in codes]
+            codes = (codes + backup)[: slots + 3]
             with self._scan_lock:
                 self._scan_result = (codes, note)
         except Exception as e:
@@ -391,16 +395,25 @@ class Scalper:
         codes, note = result
         if note:
             self.selection_note = note
-        for code in codes[:slots]:
+        filled = 0
+        for code in codes:
+            if filled >= slots:
+                break
             if code in self.positions:
                 continue
             try:
-                self._buy(code)
+                if self._buy(code):
+                    filled += 1
             except Exception as e:
-                self.last_error = f"{code} 매수 오류: {e}"
-                logger.warning("%s 매수 실패: %s", code, e)
-                if "불가" in str(e):   # 매수 불가 종목은 당분간 제외
-                    self._cooldown[code] = self.clock() + dt.timedelta(hours=4)
+                message = str(e)
+                self.last_error = f"{code} 매수 오류: {message}"
+                # 거래 요건 미달(레버리지 ETP 예탁금 등)·매수 불가 종목은
+                # 당일 제외하고, 그 외 실패도 1시간은 다시 시도하지 않는다
+                hard = any(k in message for k in ("불가", "예탁금", "미만"))
+                hours = 24 if hard else 1
+                self._cooldown[code] = self.clock() + dt.timedelta(hours=hours)
+                self._log(f"매수 실패({code}): {message[:90]}"
+                          f" → {'당일' if hard else '1시간'} 제외, 다음 후보로 교체")
 
     # ── 일일 안전장치 ─────────────────────────────────────
     def _entries_allowed(self) -> bool:
