@@ -312,7 +312,8 @@ class KiwoomRestClient:
         return price
 
     def send_market_order(self, account_no: str, code: str, side: str,
-                          quantity: int, kr_exchange: str = "KRX") -> None:
+                          quantity: int, kr_exchange: str = "KRX",
+                          limit_price: float | None = None) -> str:
         """시장가(근사) 주문. kr_exchange: KRX(정규장) | NXT(장전·장후 대체거래소).
 
         NXT로 보낼 때는 시장가 대신 직전 시세 지정가로 집행한다.
@@ -325,7 +326,7 @@ class KiwoomRestClient:
             except Exception as e:
                 logger.warning("%s 미체결 취소 중 오류(주문은 계속 진행): %s", code, e)
             # 미국주식은 시장가 코드가 없어 해당 종목의 직전 시세 지정가로 집행한다
-            last = self._last_prices.get(code)
+            last = limit_price or self._last_prices.get(code)
             if last is None:
                 raise KiwoomRestError(f"{code}의 직전 시세가 없어 주문 단가를 정할 수 없다")
             path, api_id = _API_ORDER_US[side]
@@ -357,8 +358,10 @@ class KiwoomRestClient:
                 "cond_uv": "",
             }
         res = self._call(path, api_id, body)
+        ord_no = str(res.get("ord_no", "")).strip()
         logger.info("주문 전송: [%s] %s %s %d주 (주문번호=%s)",
-                    self.market, code, side, quantity, res.get("ord_no", "?"))
+                    self.market, code, side, quantity, ord_no or "?")
+        return ord_no
 
     def top_stocks(self, criteria: str = "volume", limit: int = 10) -> list[dict]:
         """순위 상위 종목 목록(추천 후보). criteria: volume(거래량) | change(등락률)."""
@@ -414,8 +417,17 @@ class KiwoomRestClient:
         for row in res.get("result_list") or []:
             code = str(row.get("stk_cd", "")).strip()
             if code:
+                def num(key):
+                    try:
+                        return self._parse_price(row.get(key) or 0)
+                    except (TypeError, ValueError):
+                        return 0.0
                 out[code] = {"qty": self._to_int(row.get("poss_qty")),
-                             "sellable": self._to_int(row.get("sell_alowq"))}
+                             "sellable": self._to_int(row.get("sell_alowq")),
+                             "avg_price": num("frgn_stk_book_uv"),
+                             "now_price": num("now_pric"),
+                             "pl_rt": num("pl_rt"),
+                             "name": str(row.get("frgn_stk_nm", "")).strip()}
         return out
 
     def us_open_orders(self, code: str = "") -> list[dict]:
@@ -424,16 +436,30 @@ class KiwoomRestClient:
         종목을 지정해 조회하면 stex_tp가 필수라 1517 오류가 나므로,
         항상 전체를 조회한 뒤 파이썬에서 종목을 걸러낸다.
         """
-        res = self._call("/api/us/acnt", "ust21050",
-                         {"ord_dt": "", "slby_tp": "0", "stex_tp": "",
-                          "stk_cd": ""})
+        try:
+            res = self._call("/api/us/acnt", "ust21050",
+                             {"ord_dt": "", "slby_tp": "0", "stex_tp": "",
+                              "stk_cd": ""})
+        except KiwoomRestError as e:
+            if "571758" in str(e) or "미체결내역이 없" in str(e):
+                return []          # 미체결이 없다는 정상 응답
+            raise
         out = []
         for row in res.get("result_list") or []:
             ord_no = str(row.get("ord_no", "")).strip()
             row_code = str(row.get("stk_cd", "")).strip()
             if ord_no and (not code or row_code == code):
-                out.append({"ord_no": ord_no, "code": row_code})
+                out.append({"ord_no": ord_no, "code": row_code,
+                            "remaining": self._to_int(row.get("ord_remnq")),
+                            "filled": self._to_int(row.get("cntr_qty")),
+                            "side": str(row.get("slby_tp", "")).strip()})
         return out
+
+    def cancel_order(self, ord_no: str, code: str) -> None:
+        """미체결 주문 1건 취소(ust20003)."""
+        self._call("/api/us/ordr", "ust20003",
+                   {"orig_ord_no": ord_no,
+                    "stex_tp": self.resolve_exchange(code), "stk_cd": code})
 
     def cancel_open_orders(self, code: str) -> int:
         """해당 종목의 미체결 주문을 전부 취소(ust20003)한다. 취소 건수 반환."""

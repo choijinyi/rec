@@ -295,3 +295,35 @@ class UsTickFallbackTest(unittest.TestCase):
         after = sum(1 for c in self.calls if c in ("usa20100", "usa20101"))
         self.assertEqual(before, after)     # mrkcond 재시도 없음
         self.assertEqual(self.calls[-1], "usa06010")
+
+
+class OpenOrdersEmptyTest(unittest.TestCase):
+    def test_571758_means_no_open_orders(self):
+        def transport(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            return {"return_code": 20,
+                    "return_msg": "[2000](571758:해당 계좌의미체결내역이 없습니다.)"}
+
+        from autotrader.kiwoom_rest import KiwoomRestClient
+        client = KiwoomRestClient("A", "S", market="us", transport=transport)
+        self.assertEqual(client.us_open_orders(), [])
+
+    def test_order_returns_order_number(self):
+        def transport(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            if headers.get("api-id") == "usa10098":
+                return {"return_code": 0, "list": [{"stex_tp": "ND"}]}
+            if headers.get("api-id") == "ust21050":
+                return {"return_code": 20, "return_msg": "571758 미체결내역이 없"}
+            if headers.get("api-id") == "ust20001":
+                self.body = body
+                return {"return_code": 0, "ord_no": "000045102"}
+            raise AssertionError(headers.get("api-id"))
+
+        from autotrader.kiwoom_rest import KiwoomRestClient
+        client = KiwoomRestClient("A", "S", market="us", transport=transport)
+        no = client.send_market_order("", "ONCO", "sell", 193, limit_price=7.31)
+        self.assertEqual(no, "000045102")
+        self.assertEqual(self.body["ord_uv"], "7.31")

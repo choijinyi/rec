@@ -4,3 +4,5 @@ __pycache__/
 data/*.csv
 .env
 config.ini
+autotrader_state_*.json
+autotrader_state_*.json.tmp

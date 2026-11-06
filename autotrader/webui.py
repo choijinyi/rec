@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .analysis import ClaudeAnalyst, ClaudeCodeAnalyst
@@ -114,8 +115,11 @@ class AppState:
                     return analyst.select_symbols(
                         market, rows, num, criteria_label="당일 거래량·등락률 상위")
 
+                # 프로그램이 산 포지션을 재시작 후에도 이어서 관리하기 위한 상태 파일
+                state_path = str(Path(self.config_path).resolve()
+                                 .with_name(f"autotrader_state_{market}.json"))
                 trader = Scalper(api=api, config=scalp_cfg, selector=selector,
-                                 is_simulation=mock)
+                                 is_simulation=mock, state_path=state_path)
             except (ValueError, PermissionError) as e:
                 return {"error": str(e)}
 
@@ -144,6 +148,18 @@ class AppState:
             self.trader.stop()
             return {"ok": True}
 
+    def adopt(self, code: str, mode: str) -> dict:
+        """계좌 보유 종목을 관리 대상으로 편입(manage)하거나 즉시 매도(sell)한다."""
+        if not (self.trader and self.thread and self.thread.is_alive()):
+            return {"error": "먼저 시작해야 한다 (장중에 처리된다)."}
+        if mode not in ("manage", "sell"):
+            return {"error": f"알 수 없는 요청: {mode}"}
+        code = (code or "").strip().upper()
+        if not code:
+            return {"error": "종목코드가 비어 있다."}
+        self.trader.request(code, mode)
+        return {"ok": True}
+
     # ── 상태 조회 ──────────────────────────────────────────
     def status(self) -> dict:
         mode = "mock"
@@ -161,7 +177,7 @@ class AppState:
             "prices": [], "events": [], "positions": [], "trades": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "wins": 0, "losses": 0, "session": "", "halt_reason": "",
-            "selection_note": "", "chart_code": "",
+            "selection_note": "", "chart_code": "", "holdings": [],
         }
         trader = self.trader
         if trader:
@@ -179,8 +195,18 @@ class AppState:
                 {"code": p.code, "qty": p.quantity,
                  "entry": p.entry_price, "last": p.last_price,
                  "pct": round(p.pct(), 2),
-                 "held_min": round((now - p.entry_time).total_seconds() / 60)}
-                for p in trader.positions.values()
+                 "held_min": round((now - p.entry_time).total_seconds() / 60),
+                 "state": p.state()}
+                for p in list(trader.positions.values())
+            ]
+            managed = set(trader.positions)
+            out["holdings"] = [
+                {"code": code, "qty": h.get("qty", 0),
+                 "sellable": h.get("sellable", 0),
+                 "avg": h.get("avg_price", 0), "now": h.get("now_price", 0),
+                 "pl_rt": h.get("pl_rt", 0), "managed": code in managed}
+                for code, h in sorted(trader.holdings.items())
+                if h.get("qty", 0) > 0
             ]
             out["trades"] = [
                 f"{t.closed_at.strftime('%H:%M:%S')} {t.reason} {t.code} "
@@ -261,8 +287,14 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 
 <div class="panel"><h2>보유 포지션</h2>
   <table><thead><tr><th>종목</th><th>수량</th><th>진입가</th><th>현재가</th>
-  <th>수익률</th><th>보유(분)</th></tr></thead>
-  <tbody id="positions"><tr><td colspan="6">없음</td></tr></tbody></table>
+  <th>수익률</th><th>보유(분)</th><th>상태</th></tr></thead>
+  <tbody id="positions"><tr><td colspan="7">없음</td></tr></tbody></table>
+</div>
+
+<div class="panel"><h2>실계좌 보유 종목 <span class="fixed">(1분마다 동기화 · 프로그램 밖의 보유는 손대지 않습니다)</span></h2>
+  <table><thead><tr><th>종목</th><th>보유</th><th>매입단가</th><th>현재가</th>
+  <th>손익률</th><th>처리</th></tr></thead>
+  <tbody id="holdings"><tr><td colspan="6">시작 후 1분 안에 표시됩니다 (미국주식)</td></tr></tbody></table>
 </div>
 
 <div id="chartWrap"><canvas id="chart" width="1040" height="200"></canvas></div>
@@ -285,6 +317,13 @@ async function start(){
     target_pct:$("target").value.trim(),max_positions:$("maxpos").value.trim(),
     cash:$("cash").value.trim(),confirm:$("confirm").value.trim()});
   $("msg").textContent=r.error||"AI 단타 시작 - 장중에 종목을 자동 선정해 매매합니다";
+}
+async function adopt(code,mode){
+  const msg=mode==="sell"?code+" 보유 수량 전부를 지금 매도합니다. 진행할까요?"
+    :code+"을(를) 관리 대상으로 편입합니다. 익절 +목표%·손절 -3% 규칙이 즉시 적용되어, 이미 -3% 아래면 바로 손절 매도됩니다. 진행할까요?";
+  if(!confirm(msg))return;
+  const r=await api("/api/adopt",{code:code,mode:mode});
+  $("msg").textContent=r.error||(code+" 요청 접수 — 다음 주기(3초 내)에 처리됩니다");
 }
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
 function drawChart(prices,code){
@@ -321,8 +360,18 @@ async function refresh(){
         p.entry.toLocaleString(undefined,{maximumFractionDigits:2})+"</td><td>"+
         (p.last?p.last.toLocaleString(undefined,{maximumFractionDigits:2}):"-")+
         "</td><td class='"+(p.pct>=0?"pos":"neg")+"'>"+p.pct.toFixed(2)+"%</td><td>"+
-        p.held_min+"</td></tr>").join("")
-      :"<tr><td colspan='6'>없음</td></tr>";
+        p.held_min+"</td><td>"+(p.state||"")+"</td></tr>").join("")
+      :"<tr><td colspan='7'>없음</td></tr>";
+    if(s.holdings&&s.holdings.length){
+      $("holdings").innerHTML=s.holdings.map(h=>"<tr><td>"+h.code+"</td><td>"+h.qty+
+        "</td><td>"+Number(h.avg).toLocaleString(undefined,{maximumFractionDigits:2})+
+        "</td><td>"+Number(h.now).toLocaleString(undefined,{maximumFractionDigits:2})+
+        "</td><td class='"+(h.pl_rt>=0?"pos":"neg")+"'>"+Number(h.pl_rt).toFixed(2)+
+        "%</td><td>"+(h.managed?"관리 중":
+        "<button onclick=\"adopt('"+h.code+"','manage')\">관리 편입</button> "+
+        "<button class='danger' onclick=\"adopt('"+h.code+"','sell')\">즉시 매도</button>")+
+        "</td></tr>").join("");
+    }
     drawChart(s.prices,s.chart_code);
     $("log").innerHTML=[...s.trades,...s.events].slice(-15).reverse()
       .map(e=>"<li>"+e+"</li>").join("")||"<li>기록 없음</li>";
@@ -380,6 +429,9 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             elif self.path == "/api/stop":
                 self._send(self.state.stop())
+            elif self.path == "/api/adopt":
+                self._send(self.state.adopt(body.get("code", ""),
+                                            body.get("mode", "")))
             else:
                 self._send({"error": "not found"}, 404)
         except Exception as e:  # 어떤 오류든 콘솔 스택 대신 화면에 안내한다
