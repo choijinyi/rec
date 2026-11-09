@@ -116,6 +116,34 @@ def us_session(utc_now: dt.datetime, day_session: bool = True,
     return "장외"
 
 
+def kr_session_end(now: dt.datetime, extended: bool = True) -> dt.datetime | None:
+    """지금 국내 장(장전/정규장/장후)이 끝나는 시각. 장외면 None."""
+    end = {"장전": KR_REG_OPEN, "정규장": KR_REG_CLOSE,
+           "장후": KR_EXT_CLOSE}.get(kr_session(now, extended))
+    if end is None:
+        return None
+    return now.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+
+
+def us_session_end(utc_now: dt.datetime, day_session: bool = True,
+                   extended: bool = True) -> dt.datetime | None:
+    """지금 미국 장(주간거래/프리마켓/정규장/애프터마켓)이 끝나는 UTC 시각."""
+    label = us_session(utc_now, day_session, extended)
+    if label == "장외":
+        return None
+    if label == "주간거래":
+        kst = utc_now + dt.timedelta(hours=9)
+        end_hour = 17 if _us_dst_active(utc_now) else 18
+        end_kst = kst.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+        return end_kst - dt.timedelta(hours=9)
+    offset = -4 if _us_dst_active(utc_now) else -5
+    et = utc_now + dt.timedelta(hours=offset)
+    end = {"프리마켓": US_OPEN, "정규장": US_CLOSE,
+           "애프터마켓": dt.time(20, 0)}[label]
+    end_et = et.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
+    return end_et - dt.timedelta(hours=offset)
+
+
 # ── 설정과 상태 ───────────────────────────────────────────
 @dataclass
 class ScalpConfig:
@@ -137,9 +165,16 @@ class ScalpConfig:
     us_extended: bool = True      # 미국 프리마켓·애프터마켓 매매
     kr_extended: bool = True      # 국내 장전·장후(NXT) 매매
     min_price: float | None = None  # None이면 미국 $5 / 국내 1,000원
-    # 거래대금(가격×당일 거래량) 하한 — 저유동성 종목은 지정가 매도가 안 받아져
-    # 손절이 불가능해지므로 후보에서 뺀다. None이면 미국 $3M / 국내 30억 원, 0이면 끔
+    # 유동성 하한 — 저유동성 종목은 매도가 안 받아져 손절이 불가능해지므로
+    # 후보에서 뺀다. 거래대금(가격×당일 거래량)은 None이면 미국 $10M / 국내
+    # 100억 원, 거래량은 None이면 미국 50만 주 / 국내 30만 주. 거래대금을 0으로
+    # 두면 유동성 필터 전체를 끈다
     min_dollar_volume: float | None = None
+    min_volume: float | None = None
+    # 장 마감 가드 — 각 장이 끝나기 이 시간(분) 전부터 신규 매수를 멈추고,
+    # 그 시점에 남은 보유는 전량 정리한다 (마감 직전 매수로 물리는 것 방지)
+    entry_cutoff_min: float = 60.0
+    flatten_min: float = 60.0
     fill_timeout_sec: float = 45.0  # 지정가 주문이 이 시간 안에 체결되지 않으면 취소·재주문
     chase_step_pct: float = 0.3     # 추격 매도 회차마다 현재가 대비 낮추는 폭(%)
     chase_max_pct: float = 2.0      # 추격 매도 최대 할인 폭(%)
@@ -254,6 +289,7 @@ class Scalper:
         self._requests: list[tuple[str, str]] = []   # UI의 편입/청산 요청
         self._req_lock = threading.Lock()
         self._entry_pause_until: dt.datetime | None = None
+        self._flatten_notice_for = None   # 마감 정리를 알린 장 (중복 로그 방지)
 
     # ── 상태 조회 (UI 공용) ────────────────────────────────
     @property
@@ -278,6 +314,19 @@ class Scalper:
             return us_session(self.utc_clock(), self.config.us_day_session,
                               self.config.us_extended)
         return kr_session(self.clock(), self.config.kr_extended)
+
+    def minutes_to_close(self) -> float | None:
+        """지금 장이 끝날 때까지 남은 분. 장외면 None."""
+        if self.config.market == "us":
+            now = self.utc_clock()
+            end = us_session_end(now, self.config.us_day_session,
+                                 self.config.us_extended)
+        else:
+            now = self.clock()
+            end = kr_session_end(now, self.config.kr_extended)
+        if end is None:
+            return None
+        return (end - now).total_seconds() / 60
 
     def stop(self) -> None:
         self._running = False
@@ -593,7 +642,12 @@ class Scalper:
     def _min_dollar_volume(self) -> float:
         if self.config.min_dollar_volume is not None:
             return self.config.min_dollar_volume
-        return 3_000_000.0 if self.config.market == "us" else 3_000_000_000.0
+        return 10_000_000.0 if self.config.market == "us" else 10_000_000_000.0
+
+    def _min_volume(self) -> float:
+        if self.config.min_volume is not None:
+            return self.config.min_volume
+        return 500_000.0 if self.config.market == "us" else 300_000.0
 
     @staticmethod
     def _row_float(row: dict, key: str) -> float:
@@ -620,6 +674,7 @@ class Scalper:
         now = self.clock()
         min_price = self._min_price()
         min_dv = self._min_dollar_volume()
+        min_vol = self._min_volume()
 
         def ok(row: dict) -> bool:
             code = row["code"]
@@ -628,7 +683,7 @@ class Scalper:
                 return False                      # 초저가 잡주 배제
             if min_dv > 0:                        # 저유동성 배제(손절 체결 보장)
                 volume = abs(self._row_float(row, "volume"))
-                if volume <= 0 or price * volume < min_dv:
+                if volume <= 0 or volume < min_vol or price * volume < min_dv:
                     return False
             if self._row_float(row, "change_pct") <= 0:
                 return False                      # 상승 모멘텀 종목만
@@ -739,6 +794,17 @@ class Scalper:
     def _entries_allowed(self) -> bool:
         if self._entry_pause_until and self.clock() < self._entry_pause_until:
             return False
+        left = self.minutes_to_close()
+        if left is not None and left <= self.config.entry_cutoff_min:
+            if self.halt_reason != "마감 1시간 전 매수 중단":
+                self.halt_reason = "마감 1시간 전 매수 중단"
+                self._log(f"{self.session()} 마감 {left:.0f}분 전 — 신규 매수를 "
+                          f"중단한다 (다음 장에 재개)")
+            with self._scan_lock:
+                self._scan_result = None   # 마감 전에 받아 둔 선정은 버린다
+            return False
+        if self.halt_reason == "마감 1시간 전 매수 중단":
+            self.halt_reason = ""          # 새 장이 열려 재개
         limit = -self.config.total_cash * self.config.daily_loss_pct / 100
         if self.realized_pnl <= limit:
             if self.halt_reason != "손실 한도":
@@ -858,12 +924,35 @@ class Scalper:
                       f"(매입단가 {pos.entry_price:,.2f}) — 익절·손절 감시 재개")
         self._save_state()
 
+    def _flatten_for_close(self, left: float) -> None:
+        """장 마감 1시간 전 시점에 남은 보유를 전량 정리한다 (손익 무관)."""
+        targets = [p for p in self.positions.values()
+                   if not (p.entry_pending or p.exit_pending)]
+        if not targets:
+            return
+        session = self.session()
+        if self._flatten_notice_for != session:
+            self._flatten_notice_for = session
+            self._log(f"{session} 마감 {left:.0f}분 전 — 보유 "
+                      f"{len(targets)}종목을 전량 정리한다")
+        for pos in targets:
+            try:
+                price = pos.last_price or self.api.current_price(pos.code)
+                self._close(pos, price, "장마감 정리")
+            except Exception as e:
+                self.last_error = f"{pos.code} 장마감 정리 실패: {e}"
+                logger.warning("%s 장마감 정리 실패(다음 주기에 재시도): %s",
+                               pos.code, e)
+
     # ── 매매 루프 ─────────────────────────────────────────
     def step(self) -> None:
         if self.session() == "장외":
             return
         self._process_requests()
         self._monitor_positions()
+        left = self.minutes_to_close()
+        if left is not None and left <= self.config.flatten_min:
+            self._flatten_for_close(left)
         slots = self.config.max_positions - len(self.positions)
         if slots > 0 and self._entries_allowed():
             self._consume_scan(slots)
