@@ -64,7 +64,8 @@ ROWS = [{"code": "AAA", "price": "10000", "change_pct": "5",
 def make(hour, minute=0, **kw):
     clock = {"now": datetime(2026, 11, 9, hour, minute)}   # 월요일
     cfg = dict(market="kr", max_positions=1, total_cash=1_000_000,
-               scan_interval=99999.0)
+               scan_interval=99999.0,
+               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0)
     cfg.update(kw)
     api = FakeAPI({"AAA": 10_000}, ROWS)
     trader = Scalper(api=api, config=ScalpConfig(**cfg),

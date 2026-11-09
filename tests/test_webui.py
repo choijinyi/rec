@@ -49,7 +49,8 @@ class StartStopTest(unittest.TestCase):
         self.assertEqual(r, {"ok": True})
         trader = self.state.trader
         self.assertEqual(trader.config.target_pct, 2.0)
-        self.assertEqual(trader.config.stop_pct, 3.0)   # 손절 -3% 고정
+        self.assertEqual(trader.config.stop_pct, 1.0)   # 기본 손절 -1%
+        self.assertTrue(trader.config.require_ai)        # 기본: AI 선정 필수
         self.assertEqual(trader.config.max_positions, 3)
         self.assertIsNotNone(trader.selector)           # AI 선정 연결
         self.state.stop()
@@ -184,3 +185,29 @@ class DashboardScriptSyntaxTest(unittest.TestCase):
         proc = subprocess.run([node, "--check", f.name],
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class DashboardWiringTest(unittest.TestCase):
+    def test_every_referenced_element_exists(self):
+        import re
+
+        from autotrader.webui import PAGE
+
+        html, script = PAGE.split("<script>")[0], PAGE.split("<script>")[1]
+        ids = set(re.findall(r'id="([A-Za-z0-9_]+)"', html))
+        for ref in set(re.findall(r'\$\("([A-Za-z0-9_]+)"\)', script)):
+            self.assertIn(ref, ids, f"스크립트가 없는 요소 #{ref}를 참조한다")
+
+    def test_start_passes_stop_and_ai_option(self):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = make_state(tmp.name)
+        r = state.start(market="kr", target_pct="2.5", max_positions="2",
+                        cash="500000", stop_pct="0.8", require_ai=False)
+        self.assertEqual(r, {"ok": True})
+        self.assertEqual(state.trader.config.stop_pct, 0.8)
+        self.assertEqual(state.trader.config.target_pct, 2.5)
+        self.assertFalse(state.trader.config.require_ai)
+        state.stop()

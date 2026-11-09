@@ -82,15 +82,20 @@ def _select_prompt(market: str, num: int, rows: Sequence[dict],
     )
     return (
         f"오늘 {'미국' if market == 'us' else '국내'} 주식 {criteria_label} 후보 "
-        f"목록이다. 단타 자동매매 프로그램이 이 중 {num}개 종목을 골라 즉시 "
-        f"매수하고, 목표 수익(+1~2%) 또는 손절(-3%)에서 청산하려 한다.\n\n"
+        f"목록이다. 단타 자동매매 프로그램이 이 중 최대 {num}개 종목을 골라 "
+        f"즉시 매수하고, 좁은 손절선(약 -1%)과 그보다 큰 목표 수익(약 +2%, "
+        f"도달 후에는 고점을 따라가며 익절)으로 청산하려 한다.\n\n"
         f"{lines}\n\n"
         f"제공된 수치만 근거로, 단타에 맞게 유동성(거래량)이 충분하고 상승 "
-        f"모멘텀이 있으며 급반전 위험이 작아 보이는 종목 {num}개를 골라 달라.\n"
+        f"모멘텀이 있으며 급반전 위험이 작아 보이는 종목을 좋은 순서대로 "
+        f"최대 {num}개 골라 달라. 이미 과하게 급등해 매수 직후 급락할 위험이 "
+        f"큰 종목, 호가 간격이 넓을 소형주는 제외하라. 적합한 종목이 없으면 "
+        f"억지로 채우지 말고 '선정: 없음'이라고 답하라.\n"
         "거래량·거래대금이 작아 매도가 즉시 체결되지 않을 수 있는 종목은 "
         "절대 고르지 말 것.\n"
         f"출력 형식(반드시 지킬 것):\n"
-        f"첫 줄: 선정: 코드1, 코드2, ...  (정확히 {num}개, 위 목록에 있는 코드만)\n"
+        f"첫 줄: 선정: 코드1, 코드2, ...  (최대 {num}개, 위 목록에 있는 코드만. "
+        f"없으면 '선정: 없음')\n"
         "다음 줄부터: 종목별 선정 이유 1문장과 유의점 1문장."
     )
 
@@ -99,7 +104,8 @@ def parse_selection(text: str, valid_codes: Sequence[str],
                     num: int) -> list[str]:
     """분석 응답에서 선정 종목 코드를 추출한다.
 
-    '선정:' 줄을 우선 찾고, 없으면 본문 전체에서 후보 코드의 등장 순서를 쓴다.
+    '선정:' 줄을 우선 찾고, 그런 줄이 아예 없을 때만 본문 전체에서 후보 코드의
+    등장 순서를 쓴다. '선정: 없음'이면 빈 목록을 돌려준다.
     후보 목록에 없는 코드는 버린다. 국내 NXT 통합 표기(005930_AL)와 순수
     코드(005930)는 어느 쪽으로 답해도 같은 후보로 인정한다.
     """
@@ -119,13 +125,24 @@ def parse_selection(text: str, valid_codes: Sequence[str],
             if code and code not in picked:
                 picked.append(code)
 
+    found_line = False
     for line in text.splitlines():
-        stripped = line.strip()
+        stripped = line.strip().lstrip("*#>-• ").strip()   # 마크다운 장식 제거
         if stripped.startswith("선정") or stripped.upper().startswith("SELECTED"):
-            take(re.findall(r"[A-Za-z0-9._]+", stripped.split(":", 1)[-1]))
-            if picked:
+            if ":" not in stripped and "：" not in stripped:
+                continue                    # '선정 결과' 같은 제목 줄
+            found_line = True
+            body = re.split(r"[:：]", stripped, maxsplit=1)[-1].lstrip("* ")
+            # 맨 앞의 '코드, 코드, ...' 나열만 읽는다 — 같은 줄 뒤쪽의 설명
+            # ('NETG는 제외했다' 등)에 나온 종목을 선정으로 오해하지 않게 한다
+            head = re.match(r"[A-Za-z0-9._]+(?:\s*[,，/·]\s*[A-Za-z0-9._]+)*", body)
+            if head:
+                take(re.findall(r"[A-Za-z0-9._]+", head.group(0)))
+            if picked or "없음" in body:
                 break
-    if not picked:
+    # '선정:' 줄이 있으면 그 줄만 믿는다 — '선정: 없음'인데 본문에서 제외
+    # 사유로 언급된 종목을 고르는 일이 없게 한다
+    if not picked and not found_line:
         take(re.findall(r"[A-Za-z0-9._]+", text))
     return picked[:num]
 
@@ -151,10 +168,27 @@ class ClaudeCodeAnalyst:
 
     @staticmethod
     def _find_cli() -> str:
+        import os
         import shutil
         for name in ("claude", "claude.cmd", "claude.exe"):
             path = shutil.which(name)
             if path:
+                return path
+        # PATH에 없어도 설치돼 있을 수 있다 (바로가기로 실행하면 사용자 PATH가
+        # 반영되지 않는 경우가 있다) — 알려진 설치 위치를 직접 찾는다
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(home, ".local", "bin", "claude.exe"),
+            os.path.join(home, ".local", "bin", "claude"),
+            os.path.join(home, ".claude", "local", "claude.exe"),
+            os.path.join(home, ".claude", "local", "claude"),
+            os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                         "claude", "claude.exe"),
+            "/usr/local/bin/claude",
+        ]
+        for path in candidates:
+            if path and os.path.isfile(path):
                 return path
         raise RuntimeError(
             "Claude Code가 설치되어 있지 않다. PowerShell에서\n"
