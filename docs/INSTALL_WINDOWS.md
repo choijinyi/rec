@@ -42,7 +42,7 @@ Claude API 키 대신 claude.ai **Pro/Max 구독**으로 선정을 돌릴 수 �
 
 AI를 쓸 수 없으면 기본 설정에서는 매수를 쉰다(대시보드의 "AI 선정 필수"를
 끄면 등락률 상위로 대체). Claude Code가 PATH에 없어도 기본 설치 위치
-(`%USERPROFILE%\\.local\\bin\\claude.exe` 등)를 직접 찾는다.
+(`%USERPROFILE%\.local\bin\claude.exe` 등)를 직접 찾는다.
 
 ## 사용 방법
 
