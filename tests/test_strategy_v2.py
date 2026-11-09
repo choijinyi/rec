@@ -66,10 +66,10 @@ def scan(trader, slots=1):
 
 
 class DefaultsTest(unittest.TestCase):
-    def test_stop_is_tighter_than_target(self):
+    def test_stop_is_not_wider_than_target(self):
         cfg = ScalpConfig()
-        self.assertLess(cfg.stop_pct, cfg.target_pct)
-        self.assertEqual((cfg.target_pct, cfg.stop_pct), (2.0, 1.0))
+        self.assertLessEqual(cfg.stop_pct, cfg.target_pct)
+        self.assertEqual((cfg.target_pct, cfg.stop_pct), (2.0, 2.0))
         self.assertTrue(cfg.require_ai)
 
 
@@ -108,12 +108,12 @@ class TrailingExitTest(unittest.TestCase):
             trader.step()
         self.assertIn("AAA", trader.positions)
 
-    def test_stop_at_minus_one_percent(self):
+    def test_stop_at_minus_two_percent(self):
         trader, api = self._entered()
-        api.prices["AAA"] = 99.4                 # -0.6% — 유지
+        api.prices["AAA"] = 98.5                 # -1.5% — 유지
         trader.step()
         self.assertIn("AAA", trader.positions)
-        api.prices["AAA"] = 98.9                 # -1.1% — 손절
+        api.prices["AAA"] = 97.9                 # -2.1% — 손절
         trader.step()
         self.assertEqual(trader.trades[-1].reason, "손절")
 
