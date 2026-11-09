@@ -83,7 +83,7 @@ def _select_prompt(market: str, num: int, rows: Sequence[dict],
     return (
         f"오늘 {'미국' if market == 'us' else '국내'} 주식 {criteria_label} 후보 "
         f"목록이다. 단타 자동매매 프로그램이 이 중 최대 {num}개 종목을 골라 "
-        f"즉시 매수하고, 좁은 손절선(약 -1%)과 그보다 큰 목표 수익(약 +2%, "
+        f"즉시 매수하고, 손절선(약 -2%)과 목표 수익(약 +2%, "
         f"도달 후에는 고점을 따라가며 익절)으로 청산하려 한다.\n\n"
         f"{lines}\n\n"
         f"제공된 수치만 근거로, 단타에 맞게 유동성(거래량)이 충분하고 상승 "

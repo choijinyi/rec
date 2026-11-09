@@ -181,12 +181,15 @@ class ScalpConfig:
     # 손익비: 손절을 목표보다 좁게 둔다. 목표 +1.5% / 손절 -3%는 한 번 지면
     # 두 번 이겨야 메워져 승률 67% 이상이 필요했다 (실전 12회 승률 42%)
     target_pct: float = 2.0       # 익절 목표(%) — 도달하면 추적 익절 시작
-    stop_pct: float = 1.0         # 손절선(%) — 넘어가면 무조건 전량 매도
+    stop_pct: float = 2.0         # 손절선(%) — 넘어가면 무조건 전량 매도
     trail_pct: float = 0.7        # 목표 도달 후 고점 대비 이만큼 밀리면 익절 (0이면 목표가 즉시 익절)
     max_spread_pct: float = 0.3   # 매수·매도 호가 간격이 이보다 넓으면 매수하지 않는다 (0이면 끔)
     open_delay_min: float = 15.0  # 각 장 시작 후 이 시간(분) 동안은 매수하지 않는다
     max_chase_reentries: int = 1  # 같은 종목을 직전 매수가보다 비싸게 다시 사는 횟수(하루)
     require_ai: bool = True       # AI 선정이 불가하면 등락률 상위로 대체하지 않고 매수를 쉰다
+    # 본전 감시: 손실 중인 보유 종목을 손절하지 않고 지켜보다가 매입단가에
+    # 이 여유(%)를 더한 가격(수수료 감안 손익분기점)에 닿으면 판다
+    breakeven_buffer_pct: float = 0.3
     max_positions: int = 2        # 동시 보유 종목 수
     total_cash: float = 1_000_000
     poll_interval: float = 3.0
@@ -244,6 +247,9 @@ class Position:
     # 이 포지션과 무관하게 계좌에 원래 있던 수량 (체결 검증용, 모르면 None)
     baseline_qty: int | None = None
     exit_unconfirmed: int = 0    # 주문은 사라졌는데 잔고가 안 줄어든 확인 횟수
+    # 본전 감시: 손절·시간초과·장마감 정리 없이 손익분기점 도달만 기다린다
+    watch: bool = False
+    missing_count: int = 0       # 계좌에서 안 보인 연속 확인 횟수 (감시 종료 판단)
     peak_price: float = 0.0      # 보유 중 최고가 (추적 익절용)
     trailing: bool = False       # 목표 수익 도달 후 추적 익절 중
 
@@ -252,6 +258,8 @@ class Position:
             return "매수 체결 확인 중"
         if self.exit_pending:
             return f"{self.exit_reason} 매도 체결 대기({self.exit_attempts}차)"
+        if self.watch:
+            return "본전 감시 중"
         if self.trailing:
             return "추적 익절 중"
         return "편입 보유" if self.adopted else "보유"
@@ -349,9 +357,34 @@ class Scalper:
         return sum(1 for t in self.trades if t.pnl <= 0)
 
     def equity(self) -> float:
+        # 편입·감시 종목은 프로그램 자금으로 산 것이 아니므로 평가액에서 뺀다
         held = sum(p.quantity * (p.last_price or p.entry_price)
-                   for p in self.positions.values())
+                   for p in self.positions.values() if not p.adopted)
         return self.cash + held
+
+    def breakeven_price(self, pos: Position) -> float:
+        return pos.entry_price * (1 + self.config.breakeven_buffer_pct / 100)
+
+    def _breakeven_limit(self, pos: Position, price: float) -> float:
+        """본전 매도 지정가: 손익분기점 아래로는 절대 내지 않는다.
+
+        매수호가가 손익분기점 이상이면 그 호가에 내서 바로 체결시키고,
+        아니면 손익분기점에 걸어 둔다. 호가를 못 받으면 현재가에 낸다.
+        """
+        floor = self.breakeven_price(pos)
+        if hasattr(self.api, "best_bid_ask"):
+            try:
+                bid, _ask = self.api.best_bid_ask(pos.code)
+            except Exception:
+                bid = 0.0
+            if bid > 0:
+                return max(floor, bid)
+        return max(floor, price)
+
+    def _open_slots(self) -> int:
+        """신규 매수에 쓸 수 있는 자리. 본전 감시 종목은 자리를 차지하지 않는다."""
+        trading = sum(1 for p in self.positions.values() if not p.watch)
+        return self.config.max_positions - trading
 
     def session(self) -> str:
         if self.config.market == "us":
@@ -637,8 +670,20 @@ class Scalper:
             if not pos.adopted:
                 self.cash += filled * pos.exit_price
             pos.quantity = remaining
+        if pos.watch:
+            self._back_to_watch(pos, "본전 매도 주문이 체결되지 않았다")
+            return
         pos.exit_needs_resend = True
         self._resend_exit(pos, now)
+
+    def _back_to_watch(self, pos: Position, why: str) -> None:
+        """본전 매도가 안 받아지면 가격을 낮추지 않고 다시 감시한다."""
+        pos.exit_pending = False
+        pos.exit_needs_resend = False
+        pos.exit_order = ""
+        pos.exit_unconfirmed = 0
+        self._log(f"{why}: {pos.code} {pos.quantity}주 — 본전 감시를 계속한다")
+        self._save_state()
 
     def _confirm_exit_by_balance(self, pos: Position, now: dt.datetime) -> None:
         """주문이 사라진 뒤 실계좌 보유로 실제 매도 여부를 확인한다.
@@ -668,6 +713,9 @@ class Scalper:
             if not pos.adopted:
                 self.cash += sold * pos.exit_price
             pos.quantity = unsold
+        if pos.watch:
+            self._back_to_watch(pos, "본전 매도 주문이 체결 없이 사라졌다")
+            return
         self._log(f"매도 주문이 체결 없이 사라짐: {pos.code} {unsold}주 미매도 확인 "
                   f"→ 재주문")
         pos.exit_needs_resend = True
@@ -718,6 +766,8 @@ class Scalper:
                 blind_min = (self.clock() - (pos.last_quote_time
                                              or pos.entry_time)
                              ).total_seconds() / 60
+                if pos.watch:
+                    continue           # 감시 종목은 시세가 끊겨도 던지지 않는다
                 if blind_min >= self.config.blind_exit_min and pos.last_price:
                     try:
                         self._close(pos, pos.last_price, "시세공백 보호청산")
@@ -732,6 +782,16 @@ class Scalper:
             held_min = (self.clock() - pos.entry_time).total_seconds() / 60
             cfg = self.config
             pos.peak_price = max(pos.peak_price, price)
+            if pos.watch:
+                if price >= self.breakeven_price(pos):
+                    try:
+                        self._close(pos, self._breakeven_limit(pos, price),
+                                    "본전 매도")
+                    except Exception as e:
+                        self.last_error = f"{code} 본전 매도 주문 오류: {e}"
+                        logger.warning("%s 본전 매도 실패(다음 주기에 재시도): %s",
+                                       code, e)
+                continue
             try:
                 if pct <= -cfg.stop_pct:
                     self._close(pos, price, "손절")
@@ -976,7 +1036,8 @@ class Scalper:
 
     # ── 계좌 보유 편입 / 수동 청산 (UI 요청) ────────────────
     def request(self, code: str, mode: str) -> None:
-        """mode: manage(편입 후 익절·손절 규칙 적용) | sell(즉시 전량 매도)."""
+        """mode: manage(편입 후 익절·손절 규칙 적용) | watch(손절 없이 본전 감시)
+        | unwatch(본전 감시 해제) | sell(즉시 전량 매도)."""
         with self._req_lock:
             self._requests.append((code.strip().upper(), mode))
 
@@ -993,9 +1054,40 @@ class Scalper:
     def _adopt(self, code: str, mode: str) -> None:
         pos = self.positions.get(code)
         if pos is not None:
-            if mode == "sell" and not (pos.entry_pending or pos.exit_pending):
+            if pos.entry_pending or pos.exit_pending:
+                return
+            if mode == "sell":
                 price = pos.last_price or self.api.current_price(code)
+                pos.watch = False
                 self._close(pos, price, "수동 청산")
+            elif mode == "watch" and not pos.watch:
+                ref = pos.last_price or pos.entry_price
+                if ref >= self.breakeven_price(pos):
+                    self._log(f"본전 감시 불가({code}): 이미 손익분기점 이상이다 "
+                              f"— 손실 중인 종목만 넣을 수 있다")
+                    return
+                pos.watch = True
+                pos.trailing = False
+                self._log(f"본전 감시로 전환: {code} {pos.quantity}주 — 손절 없이 "
+                          f"{self.breakeven_price(pos):,.2f} 이상에서 매도")
+                self._save_state()
+            elif mode == "manage" and pos.watch:
+                pos.watch = False
+                self._log(f"본전 감시 해제: {code} — 익절·손절 규칙을 다시 적용한다")
+                self._save_state()
+            elif mode == "unwatch" and pos.watch:
+                if pos.adopted:
+                    # 사용자가 원래 들고 있던 주식 — 감시만 끝내고 그대로 둔다
+                    del self.positions[code]
+                    self._log(f"본전 감시 해제: {code} — 프로그램은 이 종목을 "
+                              f"더 이상 건드리지 않는다 (계좌 보유는 그대로)")
+                else:
+                    pos.watch = False
+                    self._log(f"본전 감시 해제: {code} — 익절·손절 규칙을 다시 "
+                              f"적용한다")
+                self._save_state()
+            return
+        if mode == "unwatch":
             return
         holding = self.holdings.get(code)
         if holding is None and hasattr(self.api, "us_balances"):
@@ -1010,14 +1102,28 @@ class Scalper:
         except Exception:
             price = float(holding.get("now_price") or 0)
         avg = float(holding.get("avg_price") or 0) or price
+        if mode == "watch" and float(holding.get("avg_price") or 0) <= 0:
+            self._log(f"본전 감시 불가({code}): 계좌에서 매입단가를 받지 못했다")
+            return
+        if mode == "watch" and price >= avg * (
+                1 + self.config.breakeven_buffer_pct / 100):
+            # 넣는 즉시 팔려 버리므로 받지 않는다 (수익 종목을 실수로 파는 것 방지)
+            self._log(f"본전 감시 불가({code}): 이미 손익분기점 이상이다 "
+                      f"— 손실 중인 종목만 넣을 수 있다")
+            return
         now = self.clock()
         pos = Position(code, qty, avg, now, last_price=price,
                        last_quote_time=now, orig_qty=qty, adopted=True,
                        baseline_qty=max(0, int(holding.get("qty") or qty) - qty),
-                       peak_price=price)
+                       peak_price=price, watch=(mode == "watch"))
         self.positions[code] = pos
-        self._log(f"계좌 보유 편입: {code} {qty}주 (매입단가 {avg:,.2f}, "
-                  f"현재 {pos.pct(price):+.2f}%) — 익절·손절 규칙 적용")
+        if pos.watch:
+            self._log(f"본전 감시 시작: {code} {qty}주 (매입단가 {avg:,.2f}, "
+                      f"현재 {pos.pct(price):+.2f}%) — 손절 없이 "
+                      f"{self.breakeven_price(pos):,.2f} 이상에서 매도")
+        else:
+            self._log(f"계좌 보유 편입: {code} {qty}주 (매입단가 {avg:,.2f}, "
+                      f"현재 {pos.pct(price):+.2f}%) — 익절·손절 규칙 적용")
         if mode == "sell":
             self._close(pos, price, "수동 청산")
         self._save_state()
@@ -1032,7 +1138,7 @@ class Scalper:
                     {"code": p.code, "quantity": p.quantity,
                      "entry_price": p.entry_price,
                      "entry_time": p.entry_time.isoformat(),
-                     "adopted": p.adopted}
+                     "adopted": p.adopted, "watch": p.watch}
                     for p in self.positions.values()]}
         try:
             tmp = f"{self.state_path}.tmp"
@@ -1071,18 +1177,30 @@ class Scalper:
             pos = Position(code, qty, float(item.get("entry_price", 0)),
                            entry_time, orig_qty=qty,
                            adopted=bool(item.get("adopted")),
+                           watch=bool(item.get("watch")),
                            baseline_qty=max(0, actual - qty))
             self.positions[code] = pos
             if not pos.adopted:
                 self.cash -= qty * pos.entry_price
+            # 프로그램이 꺼져 있는 동안 이미 손절선을 지나 버린 종목은 재시작과
+            # 동시에 큰 손실로 던지지 않고 본전 감시로 돌린다 (해제·즉시 매도 가능)
+            now_price = float(balances.get(code, {}).get("now_price") or 0)
+            if (not pos.watch and now_price > 0 and pos.entry_price > 0
+                    and pos.pct(now_price) <= -self.config.stop_pct):
+                pos.watch = True
+                pos.last_price = now_price
+                self._log(f"{code}: 이미 손절선 아래({pos.pct(now_price):+.2f}%)"
+                          f" — 손절하지 않고 본전 감시로 둔다 "
+                          f"({self.breakeven_price(pos):,.2f} 이상에서 매도)")
             self._log(f"이전 실행 포지션 복원: {code} {qty}주 "
-                      f"(매입단가 {pos.entry_price:,.2f}) — 익절·손절 감시 재개")
+                      f"(매입단가 {pos.entry_price:,.2f}) — "
+                      f"{'본전 감시' if pos.watch else '익절·손절 감시'} 재개")
         self._save_state()
 
     def _flatten_for_close(self, left: float) -> None:
         """장 마감 1시간 전 시점에 남은 보유를 전량 정리한다 (손익 무관)."""
         targets = [p for p in self.positions.values()
-                   if not (p.entry_pending or p.exit_pending)]
+                   if not (p.entry_pending or p.exit_pending or p.watch)]
         if not targets:
             return
         session = self.session()
@@ -1108,10 +1226,10 @@ class Scalper:
         left = self.minutes_to_close()
         if left is not None and left <= self.config.flatten_min:
             self._flatten_for_close(left)
-        slots = self.config.max_positions - len(self.positions)
+        slots = self._open_slots()
         if slots > 0 and self._entries_allowed():
             self._consume_scan(slots)
-            slots = self.config.max_positions - len(self.positions)
+            slots = self._open_slots()
             self._maybe_scan(slots)
 
     def reconcile(self) -> None:
@@ -1132,6 +1250,28 @@ class Scalper:
         self.holdings = balances
         for code in list(self.positions):
             pos = self.positions[code]
+            if pos.watch and not pos.exit_pending:
+                actual = int(balances.get(code, {}).get("qty") or 0)
+                if actual >= pos.quantity:
+                    pos.missing_count = 0
+                    continue
+                pos.missing_count += 1
+                if pos.missing_count < 2:      # 잔고 반영 지연에 속지 않게 두 번 확인
+                    continue
+                pos.missing_count = 0
+                if not pos.adopted:    # 프로그램이 샀던 종목이면 현금을 되돌린다
+                    self.cash += ((pos.quantity - max(actual, 0))
+                                  * (pos.last_price or pos.entry_price))
+                if actual <= 0:
+                    del self.positions[code]
+                    self._log(f"본전 감시 종료: {code} — 계좌에 더 이상 없다")
+                else:
+                    self._log(f"본전 감시 수량 조정: {code} {pos.quantity}주 → "
+                              f"{actual}주 (계좌 보유 기준)")
+                    pos.quantity = actual
+                    pos.orig_qty = actual
+                self._save_state()
+                continue
             if pos.entry_pending or pos.exit_pending or pos.adopted:
                 continue
             actual = balances.get(code, {}).get("qty", pos.quantity)

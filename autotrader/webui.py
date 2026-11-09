@@ -2,7 +2,7 @@
 
 파이썬 표준 라이브러리(http.server)만으로 동작하며 127.0.0.1 전용이다.
 AI(Claude Fable)가 거래량·등락률 상위에서 매매 종목을 자동 선정하고,
-목표 수익(+1~2%) 익절 / -3% 손절을 반복하는 단타 루프를 제어한다.
+목표 수익(+1~2%) 익절 / -2% 손절을 반복하는 단타 루프와 손실 보유 종목의 본전 감시를 제어한다.
 실행: python -m autotrader ui
 """
 
@@ -86,7 +86,7 @@ class AppState:
 
     # ── 실행 제어 ──────────────────────────────────────────
     def start(self, market: str, target_pct, max_positions, cash,
-              confirm: str = "", stop_pct=1.0, require_ai: bool = True) -> dict:
+              confirm: str = "", stop_pct=2.0, require_ai: bool = True) -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -152,14 +152,32 @@ class AppState:
             return {"ok": True}
 
     def adopt(self, code: str, mode: str) -> dict:
-        """계좌 보유 종목을 관리 대상으로 편입(manage)하거나 즉시 매도(sell)한다."""
+        """계좌 보유 종목 처리 요청.
+
+        mode: manage(익절·손절 규칙 적용) | watch(손절 없이 본전 감시) |
+        unwatch(본전 감시 해제) | sell(즉시 매도). code가 "*LOSERS"이고 mode가 watch면 손실 중인 보유
+        종목 전부를 본전 감시로 넣는다.
+        """
         if not (self.trader and self.thread and self.thread.is_alive()):
             return {"error": "먼저 시작해야 한다 (장중에 처리된다)."}
-        if mode not in ("manage", "sell"):
+        if mode not in ("manage", "sell", "watch", "unwatch"):
             return {"error": f"알 수 없는 요청: {mode}"}
         code = (code or "").strip().upper()
         if not code:
             return {"error": "종목코드가 비어 있다."}
+        if code == "*LOSERS":
+            if mode != "watch":
+                return {"error": "전체 요청은 본전 감시만 가능하다."}
+            watching = {c for c, p in self.trader.positions.items() if p.watch}
+            losers = [c for c, h in self.trader.holdings.items()
+                      if h.get("qty", 0) > 0 and h.get("pl_rt", 0) < 0
+                      and c not in watching]
+            if not losers:
+                return {"error": "본전 감시로 넣을 손실 종목이 없다 "
+                                 "(보유 목록은 시작 후 1분 안에 표시된다)."}
+            for loser in losers:
+                self.trader.request(loser, "watch")
+            return {"ok": True, "codes": losers}
         self.trader.request(code, mode)
         return {"ok": True}
 
@@ -201,15 +219,18 @@ class AppState:
                  "entry": p.entry_price, "last": p.last_price,
                  "pct": round(p.pct(), 2),
                  "held_min": round((now - p.entry_time).total_seconds() / 60),
-                 "state": p.state()}
+                 "state": p.state(), "watch": p.watch,
+                 "breakeven": round(trader.breakeven_price(p), 4)}
                 for p in list(trader.positions.values())
             ]
             managed = set(trader.positions)
+            watching = {c for c, p in trader.positions.items() if p.watch}
             out["holdings"] = [
                 {"code": code, "qty": h.get("qty", 0),
                  "sellable": h.get("sellable", 0),
                  "avg": h.get("avg_price", 0), "now": h.get("now_price", 0),
-                 "pl_rt": h.get("pl_rt", 0), "managed": code in managed}
+                 "pl_rt": h.get("pl_rt", 0), "managed": code in managed,
+                 "watching": code in watching}
                 for code, h in sorted(trader.holdings.items())
                 if h.get("qty", 0) > 0
             ]
@@ -267,12 +288,12 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 .fixed{color:var(--dim);font-size:12px;align-self:flex-end;padding-bottom:8px}
 </style></head><body>
 <h1>AutoTrader AI 단타 <span id="modeBadge" class="badge mock">모의투자</span></h1>
-<div class="sub">AI가 종목을 골라 매수 → 좁은 손절 / 목표 도달 후 고점을 따라가며 익절 · 장 시작 15분 뒤~마감 1시간 전</div>
+<div class="sub">AI가 종목을 골라 매수 → 손절 / 목표 도달 후 고점을 따라가며 익절 · 장 시작 15분 뒤~마감 1시간 전</div>
 
 <div class="row">
   <select id="market"><option value="kr">국내주식</option><option value="us">미국주식</option></select>
   <span><label>목표 수익 %</label><br><input id="target" value="2" size="4" title="이 수익률에 닿으면 바로 팔지 않고, 고점에서 0.7% 밀릴 때 익절합니다"></span>
-  <span><label>손절 %</label><br><input id="stop" value="1" size="4" title="매수가 대비 이만큼 내리면 무조건 전량 매도. 목표 수익보다 작게 두세요"></span>
+  <span><label>손절 %</label><br><input id="stop" value="2" size="4" title="매수가 대비 이만큼 내리면 무조건 전량 매도"></span>
   <label title="켜면 AI 선정이 안 될 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 선정 필수</label>
   <span><label>동시 종목</label><br><input id="maxpos" value="2" size="3"></span>
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
@@ -297,7 +318,8 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <tbody id="positions"><tr><td colspan="7">없음</td></tr></tbody></table>
 </div>
 
-<div class="panel"><h2>실계좌 보유 종목 <span class="fixed">(1분마다 동기화 · 프로그램 밖의 보유는 손대지 않습니다)</span></h2>
+<div class="panel"><h2>실계좌 보유 종목 <span class="fixed">(1분마다 동기화 · 프로그램 밖의 보유는 손대지 않습니다)</span>
+  <button id="watchAll" onclick="watchLosers()" title="손실 중인 보유 종목을 모두 손절 없이 지켜보다가 손익분기점에 닿으면 팝니다">손실 종목 모두 본전 감시</button></h2>
   <table><thead><tr><th>종목</th><th>보유</th><th>매입단가</th><th>현재가</th>
   <th>손익률</th><th>처리</th></tr></thead>
   <tbody id="holdings"><tr><td colspan="6">시작 후 1분 안에 표시됩니다 (미국주식)</td></tr></tbody></table>
@@ -327,10 +349,17 @@ async function start(){
 }
 async function adopt(code,mode){
   const msg=mode==="sell"?code+" 보유 수량 전부를 지금 매도합니다. 진행할까요?"
-    :code+"을(를) 관리 대상으로 편입합니다. 익절 +목표%·손절 -3% 규칙이 즉시 적용되어, 이미 -3% 아래면 바로 손절 매도됩니다. 진행할까요?";
+    :mode==="unwatch"?code+"의 본전 감시를 해제합니다. 팔지 않고 그대로 두며, 프로그램은 이 종목을 더 이상 건드리지 않습니다(프로그램이 직접 산 종목이면 익절·손절 규칙이 다시 적용됩니다). 진행할까요?"
+    :mode==="watch"?code+"을(를) 본전 감시로 넣습니다. 손절하지 않고 지켜보다가 손익분기점(매입단가+수수료 여유)에 닿으면 전량 매도합니다. 진행할까요?"
+    :code+"을(를) 관리 대상으로 편입합니다. 익절·손절 규칙이 즉시 적용되어, 이미 손절선 아래면 바로 손절 매도됩니다. 진행할까요?";
   if(!confirm(msg))return;
   const r=await api("/api/adopt",{code:code,mode:mode});
   $("msg").textContent=r.error||(code+" 요청 접수 — 다음 주기(3초 내)에 처리됩니다");
+}
+async function watchLosers(){
+  if(!confirm("손실 중인 보유 종목을 모두 본전 감시로 넣습니다. 손절하지 않고 지켜보다가 손익분기점에 닿으면 매도합니다. 진행할까요?"))return;
+  const r=await api("/api/adopt",{code:"*LOSERS",mode:"watch"});
+  $("msg").textContent=r.error||("본전 감시 요청 접수: "+r.codes.join(", "));
 }
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
 function drawChart(prices,code){
@@ -368,14 +397,21 @@ async function refresh(){
         p.entry.toLocaleString(undefined,{maximumFractionDigits:2})+"</td><td>"+
         (p.last?p.last.toLocaleString(undefined,{maximumFractionDigits:2}):"-")+
         "</td><td class='"+(p.pct>=0?"pos":"neg")+"'>"+p.pct.toFixed(2)+"%</td><td>"+
-        p.held_min+"</td><td>"+(p.state||"")+"</td></tr>").join("")
+        p.held_min+"</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
+        Number(p.breakeven).toLocaleString(undefined,{maximumFractionDigits:2}):"")+
+        "</td></tr>").join("")
       :"<tr><td colspan='7'>없음</td></tr>";
     if(s.holdings&&s.holdings.length){
       $("holdings").innerHTML=s.holdings.map(h=>"<tr><td>"+h.code+"</td><td>"+h.qty+
         "</td><td>"+Number(h.avg).toLocaleString(undefined,{maximumFractionDigits:2})+
         "</td><td>"+Number(h.now).toLocaleString(undefined,{maximumFractionDigits:2})+
         "</td><td class='"+(h.pl_rt>=0?"pos":"neg")+"'>"+Number(h.pl_rt).toFixed(2)+
-        "%</td><td>"+(h.managed?"관리 중":
+        "%</td><td>"+(h.watching?"본전 감시 중 "+
+        "<button data-c='"+h.code+"' data-m='unwatch' onclick='adopt(this.dataset.c,this.dataset.m)'>감시 해제</button> "+
+        "<button class='danger' data-c='"+h.code+"' data-m='sell' onclick='adopt(this.dataset.c,this.dataset.m)'>즉시 매도</button>"
+        :h.managed?"관리 중 "+(h.pl_rt<0?
+        "<button data-c='"+h.code+"' data-m='watch' onclick='adopt(this.dataset.c,this.dataset.m)'>본전 감시</button>":"")
+        :(h.pl_rt<0?"<button data-c='"+h.code+"' data-m='watch' onclick='adopt(this.dataset.c,this.dataset.m)'>본전 감시</button> ":"")+
         "<button data-c='"+h.code+"' data-m='manage' onclick='adopt(this.dataset.c,this.dataset.m)'>관리 편입</button> "+
         "<button class='danger' data-c='"+h.code+"' data-m='sell' onclick='adopt(this.dataset.c,this.dataset.m)'>즉시 매도</button>")+
         "</td></tr>").join("");
@@ -431,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(self.state.start(
                     market=body.get("market", "kr"),
                     target_pct=body.get("target_pct", 2.0),
-                    stop_pct=body.get("stop_pct", 1.0),
+                    stop_pct=body.get("stop_pct", 2.0),
                     require_ai=bool(body.get("require_ai", True)),
                     max_positions=body.get("max_positions", 2),
                     cash=body.get("cash"),

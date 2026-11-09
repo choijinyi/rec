@@ -49,7 +49,7 @@ class StartStopTest(unittest.TestCase):
         self.assertEqual(r, {"ok": True})
         trader = self.state.trader
         self.assertEqual(trader.config.target_pct, 2.0)
-        self.assertEqual(trader.config.stop_pct, 1.0)   # 기본 손절 -1%
+        self.assertEqual(trader.config.stop_pct, 2.0)   # 기본 손절 -2%
         self.assertTrue(trader.config.require_ai)        # 기본: AI 선정 필수
         self.assertEqual(trader.config.max_positions, 3)
         self.assertIsNotNone(trader.selector)           # AI 선정 연결
