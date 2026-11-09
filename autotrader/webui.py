@@ -187,6 +187,8 @@ class AppState:
             out["wins"] = trader.wins
             out["losses"] = trader.losses
             out["session"] = trader.session()
+            left = trader.minutes_to_close()
+            out["minutes_to_close"] = None if left is None else round(left)
             out["halt_reason"] = trader.halt_reason
             out["selection_note"] = trader.selection_note
             out["events"] = trader.events[-30:]
@@ -346,6 +348,7 @@ async function refresh(){
     $("realConfirm").style.display=real?"inline-block":"none";
     let run=s.running?("실행 중 · "+(s.session||"-")):"대기";
     if(s.running&&s.session==="장외")run="대기 (장외)";
+    if(s.running&&s.minutes_to_close!=null)run+=" · 마감까지 "+s.minutes_to_close+"분";
     if(s.halt_reason)run+=" · "+s.halt_reason;
     $("stRun").textContent=run;
     $("stEquity").textContent=s.equity!=null?Math.round(s.equity).toLocaleString():"-";
