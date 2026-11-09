@@ -86,7 +86,7 @@ class AppState:
 
     # ── 실행 제어 ──────────────────────────────────────────
     def start(self, market: str, target_pct, max_positions, cash,
-              confirm: str = "") -> dict:
+              confirm: str = "", stop_pct=1.0, require_ai: bool = True) -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -99,6 +99,8 @@ class AppState:
                 scalp_cfg = ScalpConfig(
                     market=market,
                     target_pct=_parse_float(target_pct, "목표 수익 %"),
+                    stop_pct=_parse_float(stop_pct, "손절 %"),
+                    require_ai=bool(require_ai),
                     max_positions=_parse_int(max_positions, "동시 종목 수"),
                     total_cash=_parse_float(cash, "총 투입 금액"),
                     allow_real=not mock,
@@ -134,6 +136,7 @@ class AppState:
             self.params = {"market": market,
                            "target_pct": scalp_cfg.target_pct,
                            "stop_pct": scalp_cfg.stop_pct,
+                           "require_ai": scalp_cfg.require_ai,
                            "max_positions": scalp_cfg.max_positions,
                            "cash": scalp_cfg.total_cash,
                            "mode": "mock" if mock else "real"}
@@ -264,12 +267,13 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 .fixed{color:var(--dim);font-size:12px;align-self:flex-end;padding-bottom:8px}
 </style></head><body>
 <h1>AutoTrader AI 단타 <span id="modeBadge" class="badge mock">모의투자</span></h1>
-<div class="sub">AI가 종목을 계속 찾아 매수 → 목표 수익 익절 / -3% 무조건 손절 반복 · 장전~장후</div>
+<div class="sub">AI가 종목을 골라 매수 → 좁은 손절 / 목표 도달 후 고점을 따라가며 익절 · 장 시작 15분 뒤~마감 1시간 전</div>
 
 <div class="row">
   <select id="market"><option value="kr">국내주식</option><option value="us">미국주식</option></select>
-  <span><label>목표 수익 %</label><br><input id="target" value="1.5" size="4" title="1~2% 권장. 이 수익률 도달 시 전량 익절"></span>
-  <span class="fixed">손절 -3% 고정</span>
+  <span><label>목표 수익 %</label><br><input id="target" value="2" size="4" title="이 수익률에 닿으면 바로 팔지 않고, 고점에서 0.7% 밀릴 때 익절합니다"></span>
+  <span><label>손절 %</label><br><input id="stop" value="1" size="4" title="매수가 대비 이만큼 내리면 무조건 전량 매도. 목표 수익보다 작게 두세요"></span>
+  <label title="켜면 AI 선정이 안 될 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 선정 필수</label>
   <span><label>동시 종목</label><br><input id="maxpos" value="2" size="3"></span>
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>
@@ -316,7 +320,8 @@ headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undef
 return r.json();}
 async function start(){
   const r=await api("/api/start",{market:$("market").value,
-    target_pct:$("target").value.trim(),max_positions:$("maxpos").value.trim(),
+    target_pct:$("target").value.trim(),stop_pct:$("stop").value.trim(),
+    require_ai:$("needAI").checked,max_positions:$("maxpos").value.trim(),
     cash:$("cash").value.trim(),confirm:$("confirm").value.trim()});
   $("msg").textContent=r.error||"AI 단타 시작 - 장중에 종목을 자동 선정해 매매합니다";
 }
@@ -425,7 +430,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/start":
                 self._send(self.state.start(
                     market=body.get("market", "kr"),
-                    target_pct=body.get("target_pct", 1.5),
+                    target_pct=body.get("target_pct", 2.0),
+                    stop_pct=body.get("stop_pct", 1.0),
+                    require_ai=bool(body.get("require_ai", True)),
                     max_positions=body.get("max_positions", 2),
                     cash=body.get("cash"),
                     confirm=body.get("confirm", ""),

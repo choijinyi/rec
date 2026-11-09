@@ -311,6 +311,23 @@ class KiwoomRestClient:
         self._last_prices[code] = price
         return price
 
+    def best_bid_ask(self, code: str) -> tuple[float, float]:
+        """최우선 (매수호가, 매도호가). 호가 간격으로 유동성을 확인하는 데 쓴다."""
+        if self.market == "us":
+            res = self._call(_API_PRICE_US_BID[0], _API_PRICE_US_BID[1],
+                             {"stex_tp": self.resolve_exchange(code),
+                              "stk_cd": code})
+            bid_raw, ask_raw = res.get("fpr_buy_bid"), res.get("fpr_sel_bid")
+        else:
+            res = self._call("/api/dostk/mrkcond", "ka10004", {"stk_cd": code})
+            bid_raw, ask_raw = res.get("buy_fpr_bid"), res.get("sel_fpr_bid")
+        if bid_raw in (None, "") or ask_raw in (None, ""):
+            raise KiwoomRestError(f"{code} 호가를 찾지 못했다")
+        bid, ask = self._parse_price(bid_raw), self._parse_price(ask_raw)
+        if bid <= 0 or ask <= 0:
+            raise KiwoomRestError(f"{code} 호가가 비어 있다 (매수 {bid}, 매도 {ask})")
+        return bid, ask
+
     def send_market_order(self, account_no: str, code: str, side: str,
                           quantity: int, kr_exchange: str = "KRX",
                           limit_price: float | None = None) -> str:

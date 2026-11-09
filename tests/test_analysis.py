@@ -57,7 +57,8 @@ class SelectSymbolsTest(unittest.TestCase):
         # 프롬프트에 단타 규칙과 후보 데이터, 출력 형식이 들어가야 한다
         self.assertIn("NVDA", prompts[0])
         self.assertIn("단타", prompts[0])
-        self.assertIn("-3%", prompts[0])
+        self.assertIn("-1%", prompts[0])
+        self.assertIn("없음", prompts[0])
         self.assertIn("선정:", prompts[0])
 
     def test_api_analyst_selects(self):
