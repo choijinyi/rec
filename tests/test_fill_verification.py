@@ -59,7 +59,8 @@ def make(api, state_path=None, **kw):
     clock = {"now": datetime(2025, 10, 6, 23, 0)}
     cfg = dict(market="us", max_positions=1, total_cash=1500,
                scan_interval=99999.0, min_dollar_volume=0,
-               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0)
+               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0,
+               risk_pct=0)
     cfg.update(kw)
     trader = Scalper(api=api, config=ScalpConfig(**cfg),
                      selector=lambda rows, n: ([rows[0]["code"]], ""),

@@ -38,6 +38,9 @@ _API_PRICE_US_BID = ("/api/us/mrkcond", "usa20101")
 _API_PRICE_US_TICK = ("/api/us/chart", "usa06010")
 _API_ORDER_US = {"buy": ("/api/us/ordr", "ust20000"),
                  "sell": ("/api/us/ordr", "ust20001")}
+# 분봉 차트 — AI 매매 시점 판단에 넘길 장중 흐름
+_API_BARS_US = ("/api/us/chart", "usa06011")
+_API_BARS_KR = ("/api/dostk/chart", "ka10080")
 # 미국주식 현재가 응답에서 시도할 필드 후보
 _US_PRICE_KEYS = ("cur_prc", "last_pric", "cur_pric", "now_pric", "prpr")
 
@@ -53,6 +56,13 @@ _API_RANK = {
         "stk_cnd": "0", "crd_cnd": "0", "updown_incls": "1",
         "pric_cnd": "0", "trde_prica_cnd": "0", "stex_tp": "3",
     }),
+    ("kr", "value"): ("/api/dostk/rkinfo", "ka10032", {    # 거래대금상위
+        "mrkt_tp": "000", "mang_stk_incls": "0", "stex_tp": "3",
+    }),
+    ("us", "value"): ("/api/us/rkinfo", "usa20530", {      # 당일 거래대금 상위
+        "stex_tp": "0", "inds_cd": "", "stk_tp": "0", "trde_qty_tp": "0",
+        "qry_tp": "1", "stk_cnd": "0", "pric_cnd": "0", "trde_prica_cnd": "0",
+    }),
     ("us", "volume"): ("/api/us/rkinfo", "usa20530", {     # 당일 거래량 상위
         "stex_tp": "0", "inds_cd": "", "stk_tp": "0", "trde_qty_tp": "0",
         "qry_tp": "0", "stk_cnd": "0", "pric_cnd": "0", "trde_prica_cnd": "0",
@@ -63,7 +73,8 @@ _API_RANK = {
         "trde_prica_cnd": "0", "trde_qty_tp": "",
     }),
 }
-RANK_CRITERIA_LABELS = {"volume": "당일 거래량 상위", "change": "등락률 상위"}
+RANK_CRITERIA_LABELS = {"volume": "당일 거래량 상위", "change": "등락률 상위",
+                        "value": "당일 거래대금 상위"}
 
 Transport = Callable[[str, dict, dict], dict]
 
@@ -328,6 +339,45 @@ class KiwoomRestClient:
             raise KiwoomRestError(f"{code} 호가가 비어 있다 (매수 {bid}, 매도 {ask})")
         return bid, ask
 
+    def minute_bars(self, code: str, scope: int = 1, count: int = 90) -> list[dict]:
+        """최근 분봉을 오래된 것부터 돌려준다: [{"t", "o", "h", "l", "c", "v"}].
+
+        t는 체결시각(YYYYMMDDHHMMSS). AI 매매 시점 판단의 입력으로 쓴다.
+        """
+        if self.market == "us":
+            res = self._call(_API_BARS_US[0], _API_BARS_US[1],
+                             {"stex_tp": self.resolve_exchange(code),
+                              "stk_cd": code, "tic_scope": str(scope),
+                              "upd_stkpc_tp": "0", "exrt_appl_tp": "0"})
+            rows = res.get("result_list") or []
+        else:
+            res = self._call(_API_BARS_KR[0], _API_BARS_KR[1],
+                             {"stk_cd": code, "tic_scope": str(scope),
+                              "upd_stkpc_tp": "1"})
+            rows = res.get("stk_min_pole_chart_qry") or []
+        bars = []
+        for row in rows:
+            try:
+                close = self._parse_price(row.get("cur_prc"))
+            except (TypeError, ValueError):
+                continue
+            if close <= 0:
+                continue
+
+            def num(key, default=close):
+                try:
+                    return self._parse_price(row.get(key)) or default
+                except (TypeError, ValueError):
+                    return default
+            bars.append({"t": str(row.get("cntr_tm", "")).strip(),
+                         "o": num("open_pric"), "h": num("high_pric"),
+                         "l": num("low_pric"), "c": close,
+                         "v": num("trde_qty", 0.0)})
+        if not bars:
+            raise KiwoomRestError(f"{code} 분봉을 받지 못했다")
+        bars.sort(key=lambda b: b["t"])
+        return bars[-count:]
+
     def send_market_order(self, account_no: str, code: str, side: str,
                           quantity: int, kr_exchange: str = "KRX",
                           limit_price: float | None = None) -> str:
@@ -410,6 +460,7 @@ class KiwoomRestClient:
                 "price": pick("cur_prc", "last_pric", "now_pric"),
                 "change_pct": pick("flu_rt", "updown_rt", "chg_rt"),
                 "volume": pick("trde_qty", "now_trde_qty", "acc_trde_qty"),
+                "value": pick("trde_prica"),
                 "exchange": pick("stex_tp"),
             }
             # 순위 응답이 알려준 거래소를 캐시해 두면 시세·주문에 그대로 쓴다.
@@ -518,11 +569,24 @@ def _read_parser(path: str | Path) -> configparser.ConfigParser:
     return parser
 
 
+def _flag(raw: str) -> bool:
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def load_config(path: str | Path) -> dict:
-    """config.ini에서 [kiwoom] appkey/secretkey/mode를 읽는다."""
+    """config.ini에서 [kiwoom] 접속 정보와 [claude]·[universe] 설정을 읽는다."""
     parser = _read_parser(path)
     section = parser["kiwoom"] if parser.has_section("kiwoom") else {}
+    claude = parser["claude"] if parser.has_section("claude") else {}
+    universe = parser["universe"] if parser.has_section("universe") else {}
     return {
+        # AI 매매 시점 판단: 모델과 판단 강도 (비우면 기본값)
+        "claude_model": claude.get("model", "").strip(),
+        "claude_effort": claude.get("effort", "").strip().lower(),
+        # 종목군: 대형주·주요 ETF로 제한(기본). add/remove로 조정
+        "universe_restrict": _flag(universe.get("restrict", "true")),
+        "universe_add": universe.get("add", "").strip(),
+        "universe_remove": universe.get("remove", "").strip(),
         "appkey": section.get("appkey", "").strip(),
         "secretkey": section.get("secretkey", "").strip(),
         "mode": section.get("mode", "mock").strip().lower(),

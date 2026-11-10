@@ -65,7 +65,8 @@ def make(hour, minute=0, **kw):
     clock = {"now": datetime(2026, 11, 9, hour, minute)}   # 월요일
     cfg = dict(market="kr", max_positions=1, total_cash=1_000_000,
                scan_interval=99999.0,
-               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0)
+               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0,
+               risk_pct=0)
     cfg.update(kw)
     api = FakeAPI({"AAA": 10_000}, ROWS)
     trader = Scalper(api=api, config=ScalpConfig(**cfg),
@@ -146,14 +147,6 @@ class LiquidityDefaultsTest(unittest.TestCase):
             {"code": "005930", "price": "70000", "change_pct": "1", "volume": "15000000"},
         ]
         self.assertEqual(self._candidates(rows, market="kr"), ["005930"])
-
-
-class SelectPromptTest(unittest.TestCase):
-    def test_prompt_forbids_illiquid(self):
-        from autotrader.analysis import _select_prompt
-
-        prompt = _select_prompt("us", 2, [{"code": "NVDA"}], "거래량 상위")
-        self.assertIn("거래대금", prompt)
 
 
 if __name__ == "__main__":

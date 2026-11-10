@@ -48,7 +48,8 @@ def make_trader(price_seqs=None, ranking=None, selector=None, **cfg_kw):
     defaults = dict(market="kr", target_pct=1.5, stop_pct=3.0,
                     max_positions=2, total_cash=2_000_000,
                     scan_interval=99999.0, min_dollar_volume=0,
-                    trail_pct=0, open_delay_min=0, require_ai=False)
+                    trail_pct=0, open_delay_min=0, require_ai=False,
+                    risk_pct=0, daily_loss_pct=6.0)
     defaults.update(cfg_kw)
     api = FakeAPI(price_seqs, ranking if ranking is not None else list(ROWS))
     trader = Scalper(api=api, config=ScalpConfig(**defaults),
@@ -240,7 +241,8 @@ class ReconcileTest(unittest.TestCase):
             api=api,
             config=ScalpConfig(market="us", max_positions=1, total_cash=1000,
                                scan_interval=99999.0, min_dollar_volume=0,
-                               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0),
+                               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0,
+                               risk_pct=0),
             selector=lambda r, n: (["AAPL"], ""),
             is_simulation=True,
             utc_clock=lambda: datetime(2025, 10, 6, 14, 0, tzinfo=timezone.utc),
@@ -340,7 +342,8 @@ class PreexistingHoldingsTest(unittest.TestCase):
             api=api,
             config=ScalpConfig(market="us", max_positions=1, total_cash=700,
                                scan_interval=99999.0, min_dollar_volume=0,
-                               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0),
+                               target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0,
+                               risk_pct=0),
             selector=lambda r, n: (["SOXL"], ""),
             is_simulation=True,
             utc_clock=lambda: datetime(2025, 10, 6, 14, 0, tzinfo=timezone.utc),
