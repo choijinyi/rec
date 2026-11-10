@@ -369,7 +369,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 
 <div class="panel"><h2>보유 포지션</h2>
   <table><thead><tr><th>종목</th><th>수량</th><th>진입가</th><th>현재가</th>
-  <th>수익률</th><th>손절가</th><th>목표가</th><th>보유(분)</th><th>상태</th></tr></thead>
+  <th>수익률</th><th>손절가</th><th>목표가</th><th title="프로그램이 이 종목을 관리하기 시작한 뒤 지난 시간">경과 시간</th><th>상태</th></tr></thead>
   <tbody id="positions"><tr><td colspan="9">없음</td></tr></tbody></table>
 </div>
 
@@ -455,7 +455,7 @@ async function refresh(){
         (p.last?p.last.toLocaleString(undefined,{maximumFractionDigits:2}):"-")+
         "</td><td class='"+(p.pct>=0?"pos":"neg")+"'>"+p.pct.toFixed(2)+"%</td><td>"+
         fmt(p.stop)+"</td><td>"+fmt(p.target)+"</td><td>"+
-        p.held_min+"</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
+        p.held_min+"분</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
         Number(p.breakeven).toLocaleString(undefined,{maximumFractionDigits:2}):"")+
         "</td></tr>").join("")
       :"<tr><td colspan='9'>없음</td></tr>";
