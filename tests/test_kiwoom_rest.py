@@ -202,6 +202,46 @@ class ClaudeAndUniverseConfigTest(unittest.TestCase):
         self.assertFalse(cfg["universe_restrict"])
 
 
+class UsBalanceSignTest(unittest.TestCase):
+    """손실 종목의 손익률은 음수로 읽혀야 한다 (본전 감시 대상 판별에 쓴다)."""
+
+    def _balances(self, rows):
+        def transport(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            return {"return_code": 0, "result_list": rows}
+
+        return KiwoomRestClient("AK", "SK", mock=True, market="us",
+                                transport=transport).us_balances()
+
+    def test_loss_keeps_minus_sign(self):
+        out = self._balances([
+            {"stk_cd": "CDT", "poss_qty": "000000000101", "sell_alowq": "101",
+             "frgn_stk_book_uv": "11.3400", "now_pric": "0.8400",
+             "pl_rt": "-92.66", "frgn_stk_nm": "CDT 에퀴티"},
+            {"stk_cd": "AAPL", "poss_qty": "5", "sell_alowq": "5",
+             "frgn_stk_book_uv": "200.0000", "now_pric": "210.0000",
+             "pl_rt": "4.90"}])
+        self.assertEqual(out["CDT"]["pl_rt"], -92.66)
+        self.assertEqual(out["CDT"]["avg_price"], 11.34)
+        self.assertEqual(out["AAPL"]["pl_rt"], 4.9)
+
+    def test_unsigned_rate_takes_direction_from_prices(self):
+        # 서버가 부호 없이 주더라도 매입단가보다 싸면 손실이다
+        out = self._balances([
+            {"stk_cd": "ONCO", "poss_qty": "193", "sell_alowq": "193",
+             "frgn_stk_book_uv": "7.5400", "now_pric": "3.5800",
+             "pl_rt": "52.59"}])
+        self.assertEqual(out["ONCO"]["pl_rt"], -52.59)
+
+    def test_missing_rate_is_computed(self):
+        out = self._balances([
+            {"stk_cd": "NVDA", "poss_qty": "7", "sell_alowq": "7",
+             "frgn_stk_book_uv": "188.2000", "now_pric": "178.6700",
+             "pl_rt": ""}])
+        self.assertAlmostEqual(out["NVDA"]["pl_rt"], -5.06, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()
 

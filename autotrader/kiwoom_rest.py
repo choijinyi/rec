@@ -490,11 +490,23 @@ class KiwoomRestClient:
                         return self._parse_price(row.get(key) or 0)
                     except (TypeError, ValueError):
                         return 0.0
+                avg, now = num("frgn_stk_book_uv"), num("now_pric")
+                # 손익률은 부호가 뜻이다(손실은 음수). 가격 파서는 부호를 떼므로
+                # 따로 읽고, 매입단가·현재가가 있으면 그 둘로 방향을 다시 확인한다
+                try:
+                    pl_rt = float(str(row.get("pl_rt") or 0).replace(",", "")
+                                  .replace("%", "").strip() or 0)
+                except ValueError:
+                    pl_rt = 0.0
+                if avg > 0 and now > 0:
+                    direction = (now > avg) - (now < avg)
+                    if direction and (pl_rt > 0) - (pl_rt < 0) != direction:
+                        pl_rt = (abs(pl_rt) or abs(now / avg - 1) * 100) * direction
                 out[code] = {"qty": self._to_int(row.get("poss_qty")),
                              "sellable": self._to_int(row.get("sell_alowq")),
-                             "avg_price": num("frgn_stk_book_uv"),
-                             "now_price": num("now_pric"),
-                             "pl_rt": num("pl_rt"),
+                             "avg_price": avg,
+                             "now_price": now,
+                             "pl_rt": round(pl_rt, 2),
                              "name": str(row.get("frgn_stk_nm", "")).strip()}
         return out
 
