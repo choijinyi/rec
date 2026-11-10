@@ -78,10 +78,18 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo us_day_session = true
         echo.
         echo [claude]
-        echo ; AI 종목 선정 방식. auto = 키가 있으면 API, 없으면 Claude Code 구독 로그인
+        echo ; AI 매매 판단 방식. auto = 키가 있으면 API, 없으면 Claude Code 구독 로그인
         echo backend = auto
         echo ; API 방식을 쓸 때만 입력. 구독 로그인 사용 시 비워 두세요.
         echo api_key =
+        echo ; 판단 모델과 강도^(low/medium/high^). 비우면 Opus 5.5, medium
+        echo model = claude-opus-5-5
+        echo effort = medium
+        echo.
+        echo [universe]
+        echo ; 매매 종목군은 대형주와 주요 ETF로 제한됩니다. 종목을 더하거나 빼려면:
+        echo add =
+        echo remove =
     )
 )
 echo    완료
@@ -106,8 +114,8 @@ echo  =====================================================
 echo    설치가 끝났습니다!
 echo.
 echo    바탕화면의 "AutoTrader 실행"을 더블클릭하면 브라우저에
-echo    AI 단타 대시보드가 열립니다. 목표 수익 %%와 총 투입 금액을
-echo    입력하고 시작을 누르면 AI가 종목을 골라 매매를 반복합니다.
+echo    AI 단타 대시보드가 열립니다. 총 투입 금액과 1회 손실 한도를
+echo    입력하고 시작을 누르면 AI가 대형주·ETF에서 매매 시점을 판단합니다.
 echo.
 echo    [준비 - 최초 1회, 잠시 후 열리는 config.ini에 입력]
 echo      openapi.kiwoom.com : 키움 REST API 신청 후

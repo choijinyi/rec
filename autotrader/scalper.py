@@ -1,16 +1,16 @@
 """AI 단타 자동매매.
 
-거래량·등락률 상위 후보를 AI(Claude Fable)가 분석해 매매 종목을 자동
-선정하고, 선정 즉시 매수한 뒤 목표 수익(+1~2%, 설정 가능)에서 익절,
--3%에서 무조건 손절한다. 청산으로 슬롯이 비면 다시 후보를 찾아 같은
-매매를 계속 반복한다.
+대형주·주요 ETF 가운데 거래가 활발한 후보를 고르고, AI(Claude Opus 5.5)가
+분봉 흐름을 보고 진입 시점과 손절가·목표가를 제안한다. 엔진은 그 제안을
+검증한 뒤(손절 폭 상한, 손익비, 판단 유효 시간) 1회 손실 한도에 맞춘
+수량으로 매수하고, 손절·익절·시간초과로 청산한다. 보유 중에는 AI가 주기적으로
+청산 시점을 점검해 손절가를 올리거나 조기 청산을 제안한다.
 
-- 매매 시간: 국내는 장전~장후(08:00~20:00, 정규장 외 시간은 NXT 대체거래소
-  지정가), 미국은 주간거래(한국 낮)+정규장.
-- 안전장치: 포지션이 일정 시간 익절/손절에 닿지 않으면 정리하고 교체(시간초과),
-  당일 누적 손실 한도 도달 시 신규 매수 중단, 일일 매매 횟수 제한,
-  같은 종목 재매수 대기(쿨다운), 실전 이중 확인.
-- AI 선정이 실패하면 등락률 모멘텀 상위로 자동 대체되어 매매가 멈추지 않는다.
+- AI는 제안만 한다. 주문 집행과 손절은 코드가 맡고, AI가 응답하지 않으면
+  새로 사지 않는다(보유 종목은 코드 규칙으로 계속 관리).
+- AI는 손절가를 올릴 수만 있다. 넓히거나 없앨 수 없다.
+- 안전장치: 종목군 제한, 유동성·호가 간격 필터, 장 마감 가드, 체결 확인,
+  당일 손실·횟수 한도, 재매수 대기, 실전 이중 확인.
 """
 
 from __future__ import annotations
@@ -23,6 +23,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
+
+from .indicators import summarize_bars
+from .universe import KIND_LABELS, LEVERAGED
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +189,22 @@ class ScalpConfig:
     max_spread_pct: float = 0.3   # 매수·매도 호가 간격이 이보다 넓으면 매수하지 않는다 (0이면 끔)
     open_delay_min: float = 15.0  # 각 장 시작 후 이 시간(분) 동안은 매수하지 않는다
     max_chase_reentries: int = 1  # 같은 종목을 직전 매수가보다 비싸게 다시 사는 횟수(하루)
-    require_ai: bool = True       # AI 선정이 불가하면 등락률 상위로 대체하지 않고 매수를 쉰다
+    require_ai: bool = True       # AI 판단을 받을 수 없으면 등락률 상위로 대체하지 않고 매수를 쉰다
+    # 1회 손실 한도: 손절까지 갔을 때 잃는 금액이 총 투입 금액의 이 %를 넘지
+    # 않도록 수량을 정한다 (손절이 먼 종목은 자동으로 적게 산다). 0이면 끔
+    risk_pct: float = 0.5
+    min_stop_pct: float = 0.4     # AI가 준 손절 폭이 이보다 좁으면 이 폭으로 넓힌다
+    min_rr: float = 1.2           # AI 목표 폭 ÷ 손절 폭이 이 배수에 못 미치면 사지 않는다
+    # AI 목표 폭 하한(%) — 수수료와 호가 비용을 빼고도 남을 만큼 움직일 자리만 산다
+    min_target_pct: float = 1.0
+    # 수익이 손절 폭의 이 배수에 닿으면 손절가를 본전 위로 올린다 (0이면 끔)
+    breakeven_at_r: float = 1.0
+    plan_ttl_sec: float = 90.0    # AI 판단의 유효 시간(초) — 지나면 버린다
+    max_drift_pct: float = 0.4    # AI가 본 가격에서 이 % 넘게 움직였으면 판단을 버린다
+    review_interval: float = 240.0  # 보유 종목 AI 청산 점검 주기(초, 0이면 끔)
+    shortlist_size: int = 6       # AI에 분봉과 함께 넘길 후보 수
+    # 매매 허용 종목군 {코드: 구분}. None이면 제한하지 않는다
+    universe: dict | None = None
     # 본전 감시: 손실 중인 보유 종목을 손절하지 않고 지켜보다가 매입단가에
     # 이 여유(%)를 더한 가격(수수료 감안 손익분기점)에 닿으면 판다
     breakeven_buffer_pct: float = 0.3
@@ -197,9 +215,9 @@ class ScalpConfig:
     cooldown_min: float = 30.0    # 손절한 종목 재매수 대기(분)
     win_cooldown_min: float = 5.0  # 익절한 종목 재매수 대기(분) — 짧게 두어 반복 매매
     stale_min: float = 60.0       # 이 시간(분) 안에 익절/손절 미도달 시 교체
-    daily_loss_pct: float = 6.0   # 당일 누적 손실이 자본의 이 % 도달 시 신규 매수 중단
+    daily_loss_pct: float = 2.0   # 당일 누적 손실이 자본의 이 % 도달 시 신규 매수 중단
     blind_exit_min: float = 5.0   # 시세 조회가 이 시간(분) 이상 막히면 보호 청산
-    max_trades_per_day: int = 40  # 당일 최대 청산 횟수
+    max_trades_per_day: int = 20  # 당일 최대 청산 횟수
     allow_real: bool = False
     us_day_session: bool = True
     us_extended: bool = True      # 미국 프리마켓·애프터마켓 매매
@@ -218,6 +236,23 @@ class ScalpConfig:
     fill_timeout_sec: float = 45.0  # 지정가 주문이 이 시간 안에 체결되지 않으면 취소·재주문
     chase_step_pct: float = 0.3     # 추격 매도 회차마다 현재가 대비 낮추는 폭(%)
     chase_max_pct: float = 2.0      # 추격 매도 최대 할인 폭(%)
+
+
+@dataclass
+class EntryPlan:
+    """AI(또는 대체 규칙)가 낸 진입 제안. 엔진이 검증한 뒤에만 주문으로 이어진다."""
+
+    code: str
+    max_price: float | None = None   # 이 가격을 넘으면 쫓아 사지 않는다
+    stop: float | None = None        # 제안 손절가
+    target: float | None = None      # 제안 목표가
+    reason: str = ""
+    ref_price: float = 0.0           # AI가 판단할 때 본 가격
+    decided_at: dt.datetime | None = None
+
+    @property
+    def has_levels(self) -> bool:
+        return bool(self.max_price or self.stop or self.target)
 
 
 @dataclass
@@ -252,6 +287,12 @@ class Position:
     missing_count: int = 0       # 계좌에서 안 보인 연속 확인 횟수 (감시 종료 판단)
     peak_price: float = 0.0      # 보유 중 최고가 (추적 익절용)
     trailing: bool = False       # 목표 수익 도달 후 추적 익절 중
+    # 종목별 손절가·목표가 (0이면 설정의 손절 %·목표 %를 쓴다)
+    stop_price: float = 0.0
+    target_price: float = 0.0
+    init_risk: float = 0.0       # 진입 시 1주당 위험(매입가 - 손절가)
+    be_moved: bool = False       # 손절가를 본전 위로 올렸는지
+    last_review: dt.datetime | None = None   # 마지막 AI 청산 점검 시각
 
     def state(self) -> str:
         if self.entry_pending:
@@ -289,12 +330,15 @@ class Scalper:
 
     def __init__(self, api: RankedMarketAPI, config: ScalpConfig,
                  selector: Callable[[list[dict], int],
-                                    tuple[list[str], str]] | None = None,
+                                    tuple[list, str]] | None = None,
+                 reviewer: Callable[[list[dict]],
+                                    tuple[list[dict], str]] | None = None,
                  is_simulation: bool = True,
                  clock: Callable[[], dt.datetime] = dt.datetime.now,
                  utc_clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
                  sleep: Callable[[float], None] = time.sleep,
-                 state_path: str | None = None):
+                 state_path: str | None = None,
+                 journal_path: str | None = None):
         if not is_simulation and not config.allow_real:
             raise PermissionError(
                 "실전투자 접속이 감지되었다. 모의투자로 검증하거나 allow_real을 "
@@ -303,6 +347,8 @@ class Scalper:
             raise ValueError("목표 수익 %는 0보다 크고 10 이하여야 한다")
         if not 0 < config.stop_pct <= 20:
             raise ValueError("손절 %는 0보다 크고 20 이하여야 한다")
+        if not 0 <= config.risk_pct <= 5:
+            raise ValueError("1회 손실 한도 %는 0 이상 5 이하여야 한다")
         if config.max_positions < 1:
             raise ValueError("동시 종목 수는 1 이상이어야 한다")
         if config.total_cash <= 0:
@@ -310,6 +356,8 @@ class Scalper:
         self.api = api
         self.config = config
         self.selector = selector
+        self.reviewer = reviewer
+        self.journal_path = journal_path
         self.clock = clock
         self.utc_clock = utc_clock
         self.sleep = sleep
@@ -319,13 +367,17 @@ class Scalper:
         self.trades: list[Trade] = []
         self.events: list[str] = []
         self.selection_note = ""
+        self.review_note = ""     # 최근 AI 청산 점검 근거
         self.last_error = ""
         self.halt_reason = ""     # 일일 한도 도달 등으로 신규 매수가 멈춘 이유
         self._cooldown: dict[str, dt.datetime] = {}
         self._fail_counts: dict[str, int] = {}
         self._scan_lock = threading.Lock()
         self._scan_thread: threading.Thread | None = None
-        self._scan_result: tuple[list[str], str] | None = None
+        self._scan_result: tuple[list[EntryPlan], str] | None = None
+        self._review_thread: threading.Thread | None = None
+        self._review_result: tuple[list[dict], str, dt.datetime] | None = None
+        self._review_state = ""           # AI 청산 점검 상태 변화 로그용
         self._last_scan = 0.0
         self._rescan_asap = False
         self._no_candidates = False
@@ -364,6 +416,69 @@ class Scalper:
 
     def breakeven_price(self, pos: Position) -> float:
         return pos.entry_price * (1 + self.config.breakeven_buffer_pct / 100)
+
+    def stop_price(self, pos: Position) -> float:
+        return pos.stop_price or pos.entry_price * (1 - self.config.stop_pct / 100)
+
+    def target_price(self, pos: Position) -> float:
+        return pos.target_price or pos.entry_price * (
+            1 + self.config.target_pct / 100)
+
+    def _plan_levels(self, price: float,
+                     plan: EntryPlan | None) -> tuple[float, float] | str:
+        """매수가 기준 (손절가, 목표가). AI 제안은 허용 범위 안으로 맞춘다.
+
+        손절 폭은 [min_stop_pct, stop_pct] 안으로 제한한다. AI가 준 목표 폭이
+        너무 작거나(min_target_pct) 손절 폭의 min_rr배에 못 미치면 진입하지
+        않으며, 그때는 이유를 문자열로 돌려준다.
+        """
+        cfg = self.config
+        stop_pct = cfg.stop_pct
+        if plan is not None and plan.stop and 0 < plan.stop < price:
+            stop_pct = (1 - plan.stop / price) * 100
+            stop_pct = min(max(stop_pct, min(cfg.min_stop_pct, cfg.stop_pct)),
+                           cfg.stop_pct)
+        target_pct = cfg.target_pct
+        if plan is not None and plan.target and plan.target > price:
+            target_pct = min((plan.target / price - 1) * 100, 10.0)
+            if target_pct < cfg.min_target_pct:
+                return (f"목표까지 {target_pct:.2f}%뿐이라 수수료를 빼면 남지 않는다 "
+                        f"(최소 {cfg.min_target_pct}%)")
+            if target_pct < stop_pct * cfg.min_rr:
+                return (f"목표 폭이 손절 폭의 {cfg.min_rr}배에 못 미친다 "
+                        f"(손익비 부족)")
+        return price * (1 - stop_pct / 100), price * (1 + target_pct / 100)
+
+    def _size(self, code: str, price: float, stop: float) -> int:
+        """매수 수량: 슬롯 예산과 1회 손실 한도 가운데 더 작은 쪽."""
+        cfg = self.config
+        quantity = int(min(self._per_slot_budget(), self.cash) // price)
+        if quantity < 1:
+            self._log(f"{code} 매수 건너뜀: 1주 금액({price:,.2f})이 슬롯 예산보다 크다")
+            return 0
+        if cfg.risk_pct > 0:
+            per_share = price - stop
+            allowed = cfg.total_cash * cfg.risk_pct / 100
+            risk_qty = int(allowed // per_share) if per_share > 0 else 0
+            if risk_qty < 1:
+                self._cooldown[code] = self.clock() + dt.timedelta(minutes=30)
+                self._log(f"{code} 매수 건너뜀: 1주만 사도 손절 시 손실"
+                          f"({per_share:,.2f})이 1회 손실 한도({allowed:,.2f})를 넘는다")
+                return 0
+            quantity = min(quantity, risk_qty)
+        return quantity
+
+    def _journal(self, kind: str, **data) -> None:
+        """AI 판단과 매매 결과를 한 줄씩 남긴다 (나중에 판단 품질을 복기하는 용도)."""
+        if not self.journal_path:
+            return
+        try:
+            with open(self.journal_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"time": self.clock().isoformat(),
+                                    "kind": kind, **data},
+                                   ensure_ascii=False, default=str) + "\n")
+        except OSError as e:
+            logger.warning("매매 기록 저장 실패: %s", e)
 
     def _breakeven_limit(self, pos: Position, price: float) -> float:
         """본전 매도 지정가: 손익분기점 아래로는 절대 내지 않는다.
@@ -451,11 +566,17 @@ class Scalper:
     def _per_slot_budget(self) -> float:
         return self.config.total_cash / self.config.max_positions
 
-    def _buy(self, code: str) -> bool:
+    def _buy(self, code: str, plan: EntryPlan | None = None) -> bool:
         try:
             price = self.api.current_price(code)
         except Exception as e:
             raise QuoteUnavailable(f"{code} 시세 조회 실패: {e}") from e
+        if plan is not None and plan.has_levels and plan.ref_price:
+            drift = abs(price / plan.ref_price - 1) * 100
+            if drift > self.config.max_drift_pct:
+                self._log(f"매수 건너뜀({code}): AI 판단 이후 가격이 {drift:.2f}% "
+                          f"움직였다 — 판단을 버린다")
+                return False
         if self._chase_blocked(code, price):
             self._cooldown[code] = self.clock() + dt.timedelta(minutes=60)
             self._log(f"매수 건너뜀({code}): 오늘 이미 더 낮은 가격에 샀던 종목을 "
@@ -478,15 +599,25 @@ class Scalper:
             price = ask            # 매도호가에 사야 바로 체결된다
             if self._verify:
                 limit = ask
-        quantity = int(min(self._per_slot_budget(), self.cash) // price)
+        if plan is not None and plan.max_price and price > plan.max_price:
+            self._log(f"매수 건너뜀({code}): 현재 {price:,.2f}가 AI 진입 상한 "
+                      f"{plan.max_price:,.2f}보다 높다 — 쫓아 사지 않는다")
+            return False
+        levels = self._plan_levels(price, plan)
+        if isinstance(levels, str):
+            self._log(f"매수 건너뜀({code}): {levels}")
+            return False
+        stop, target = levels
+        quantity = self._size(code, price, stop)
         if quantity < 1:
-            self._log(f"{code} 매수 건너뜀: 1주 금액({price:,.2f})이 슬롯 예산보다 크다")
             return False
         ord_no = self._order(code, "buy", quantity, limit_price=limit)
         self._note_entry(code, price)
         now = self.clock()
         pos = Position(code, quantity, price, now, last_price=price,
-                       last_quote_time=now, orig_qty=quantity, peak_price=price)
+                       last_quote_time=now, orig_qty=quantity, peak_price=price,
+                       stop_price=stop, target_price=target,
+                       init_risk=price - stop)
         if self._verify:
             pos.entry_pending = True
             pos.entry_order = ord_no
@@ -494,8 +625,11 @@ class Scalper:
         self.positions[code] = pos
         self.cash -= quantity * price
         self._log(f"매수{' 주문' if self._verify else ''}: {code} {quantity}주 "
-                  f"@{price:,.2f} (목표 +{self.config.target_pct}% / "
-                  f"손절 -{self.config.stop_pct}%)")
+                  f"@{price:,.2f} (손절 {stop:,.2f} / 목표 {target:,.2f}, "
+                  f"손절 시 손실 약 {(price - stop) * quantity:,.2f})")
+        self._journal("buy", code=code, quantity=quantity, price=price,
+                      stop=stop, target=target,
+                      reason=plan.reason if plan else "")
         self._save_state()
         return True
 
@@ -554,6 +688,11 @@ class Scalper:
                   f"({pos.pct(price):+.2f}%, 손익 {pnl:+,.2f}, "
                   f"누적 {self.realized_pnl:+,.2f})"
                   f"{' — 체결 확인' if self._verify else ''}")
+        self._journal("trade", code=pos.code, quantity=qty,
+                      entry=pos.entry_price, exit=price, pnl=round(pnl, 4),
+                      pct=round(pos.pct(price), 3), reason=reason,
+                      held_min=round((self.clock() - pos.entry_time)
+                                     .total_seconds() / 60, 1))
         self._save_state()
 
     # ── 지정가 체결 확인 (미국주식) ───────────────────────
@@ -792,11 +931,26 @@ class Scalper:
                         logger.warning("%s 본전 매도 실패(다음 주기에 재시도): %s",
                                        code, e)
                 continue
+            stop = self.stop_price(pos)
+            target = self.target_price(pos)
+            # 수익이 손절 폭만큼 나면 손절가를 본전 위로 올린다 — 이기던 매매가
+            # 손실로 끝나지 않게 한다
+            if cfg.breakeven_at_r > 0 and not pos.be_moved:
+                risk = pos.init_risk or pos.entry_price * cfg.stop_pct / 100
+                floor = self.breakeven_price(pos)
+                if (price >= pos.entry_price + risk * cfg.breakeven_at_r
+                        and stop < floor < price):
+                    pos.stop_price = stop = floor
+                    pos.be_moved = True
+                    self._log(f"손절가 상향: {code} → {floor:,.2f} (본전 확보, "
+                              f"현재 {pct:+.2f}%)")
+                    self._save_state()
             try:
-                if pct <= -cfg.stop_pct:
-                    self._close(pos, price, "손절")
+                if price <= stop:
+                    self._close(pos, price, "손절" if price < pos.entry_price
+                                else "수익 보전")
                 elif cfg.trail_pct <= 0:
-                    if pct >= cfg.target_pct:
+                    if price >= target:
                         self._close(pos, price, "익절")
                     elif held_min >= cfg.stale_min:
                         self._close(pos, price, "시간초과")
@@ -804,7 +958,7 @@ class Scalper:
                     # 고점에서 trail_pct만큼 밀리면 이익을 확정한다
                     if price <= pos.peak_price * (1 - cfg.trail_pct / 100):
                         self._close(pos, price, "익절")
-                elif pct >= cfg.target_pct:
+                elif price >= target:
                     pos.trailing = True
                     self._log(f"목표 도달: {code} {pct:+.2f}% — 추적 익절 시작 "
                               f"(고점 대비 -{cfg.trail_pct}%에서 매도)")
@@ -841,14 +995,21 @@ class Scalper:
     def _candidates(self) -> list[dict]:
         rows: list[dict] = []
         seen: set[str] = set()
-        for criteria in ("change", "volume"):
+        universe = self.config.universe
+        # 종목군을 제한하면 대형주가 모이는 거래대금 순위를 넓게 훑는다
+        criteria_list = (("value", "volume", "change") if universe is not None
+                         else ("change", "volume"))
+        limit = 100 if universe is not None else 10
+        for criteria in criteria_list:
             try:
-                fetched = self.api.top_stocks(criteria, limit=10)
+                fetched = self.api.top_stocks(criteria, limit=limit)
             except Exception as e:
                 logger.warning("순위 조회 실패(%s): %s", criteria, e)
                 continue
             for row in fetched:
                 code = row.get("code", "")
+                if universe is not None and code.upper() not in universe:
+                    continue                      # 대형주·주요 ETF만 매매한다
                 if code and code not in seen:
                     seen.add(code)
                     rows.append(row)
@@ -877,57 +1038,136 @@ class Scalper:
 
         return [r for r in rows if ok(r)]
 
+    def _shortlist(self, ranked: list[dict], size: int) -> list[dict]:
+        """AI에 넘길 후보. 레버리지 ETF는 등락률이 커서 상위를 독차지하므로
+        2개까지만 넣어 대형주·일반 ETF가 함께 검토되게 한다."""
+        universe = self.config.universe or {}
+        out, leveraged = [], 0
+        for row in ranked:
+            if universe.get(str(row.get("code", "")).upper()) == LEVERAGED:
+                if leveraged >= 2:
+                    continue
+                leveraged += 1
+            out.append(row)
+            if len(out) >= size:
+                break
+        return out
+
+    def _enrich(self, rows: list[dict]) -> list[dict]:
+        """후보·보유 종목에 분봉 요약과 종목 구분을 붙인다 (AI 판단 입력)."""
+        universe = self.config.universe or {}
+        fetch = getattr(self.api, "minute_bars", None)
+        out = []
+        for row in rows:
+            item = dict(row)
+            kind = universe.get(str(row.get("code", "")).upper())
+            if kind:
+                item["kind"] = KIND_LABELS.get(kind, kind)
+            if fetch is not None:
+                try:
+                    summary = summarize_bars(fetch(row["code"]))
+                    if summary:
+                        item["bars"] = summary
+                        # 순위 응답의 가격은 분봉보다 늦을 수 있다 — AI가 서로
+                        # 어긋난 숫자를 보지 않게 분봉의 최근 종가로 맞춘다
+                        if "price" in item:
+                            item["price"] = f"{summary['last']:,.2f}"
+                except Exception as e:   # 분봉이 없어도 판단은 진행한다
+                    logger.info("%s 분봉 조회 실패(분봉 없이 판단): %s",
+                                row.get("code"), e)
+            out.append(item)
+        return out
+
+    def _to_plans(self, picked: list, rows: list[dict]) -> list[EntryPlan]:
+        """선정 결과(코드 문자열 또는 AI 계획 dict)를 진입 계획으로 맞춘다."""
+        by_code = {r["code"]: r for r in rows}
+        plans: list[EntryPlan] = []
+        now = self.clock()
+        for item in picked or []:
+            if isinstance(item, EntryPlan):
+                plan = item
+            elif isinstance(item, dict):
+                plan = EntryPlan(str(item.get("code", "")),
+                                 max_price=item.get("max_price"),
+                                 stop=item.get("stop"),
+                                 target=item.get("target"),
+                                 reason=str(item.get("reason") or ""))
+            else:
+                plan = EntryPlan(str(item))
+            row = by_code.get(plan.code)
+            if row is None or any(p.code == plan.code for p in plans):
+                continue
+            if plan.has_levels:
+                plan.ref_price = ((row.get("bars") or {}).get("last")
+                                  or abs(self._row_float(row, "price")))
+            plan.decided_at = now
+            plans.append(plan)
+        return plans
+
     def _scan_worker(self, slots: int) -> None:
         try:
             rows = self._candidates()
             if not rows:
                 if not self._no_candidates:
                     self._no_candidates = True
-                    self._log("탐색: 매수 가능한 후보가 없다(필터·쿨다운 제외) "
+                    self._log("탐색: 매수 가능한 후보가 없다(종목군·필터·쿨다운 제외) "
                               "— 30초 간격으로 재탐색한다")
                 self._retry_scan_soon()
                 return
             self._no_candidates = False
             ranked = sorted(rows, key=lambda r: self._row_float(r, "change_pct"),
                             reverse=True)
-            codes: list[str] = []
+            plans: list[EntryPlan] = []
             note = ""
             ai_only = self.selector is not None and self.config.require_ai
             if self.selector is not None:
                 # AI 필수 모드에서는 예비 후보도 AI가 고른 것만 쓰므로 넉넉히 받는다
                 want = slots + 2 if ai_only else slots
+                short = self._shortlist(
+                    ranked, max(self.config.shortlist_size, want))
                 try:
-                    picked, note = self.selector(rows, want)
-                    valid = {r["code"] for r in rows}
-                    codes = [c for c in picked if c in valid][:want]
+                    short = self._enrich(short)
+                    picked, note = self.selector(short, want)
+                    plans = self._to_plans(picked, short)[:want]
+                    self._journal(
+                        "entry_decision",
+                        candidates=[{"code": r["code"], "price": r.get("price"),
+                                     "change_pct": r.get("change_pct")}
+                                    for r in short],
+                        plans=[{"code": p.code, "max_price": p.max_price,
+                                "stop": p.stop, "target": p.target,
+                                "reason": p.reason} for p in plans],
+                        note=note)
                 except Exception as e:
                     if ai_only:
                         self.selection_note = (
-                            f"AI 선정 불가 — 매수를 쉬는 중이다.\n사유: {str(e)[:300]}")
+                            f"AI 판단 불가 — 매수를 쉬는 중이다.\n사유: {str(e)[:300]}")
                         if self._ai_state != "down":
                             self._ai_state = "down"
-                            self._log("AI 선정 불가 — 등락률 상위로 대체하지 않고 "
+                            self._log("AI 판단 불가 — 등락률 상위로 대체하지 않고 "
                                       f"매수를 쉰다 ({str(e)[:60]})")
                         return
                     logger.warning("AI 선정 실패, 모멘텀 상위로 대체: %s", e)
                     note = f"AI 선정 불가({str(e)[:80]}) — 등락률 모멘텀 상위로 자동 대체"
             if ai_only:
-                if not codes:
+                if not plans:
                     self.selection_note = note or "AI가 적합한 종목이 없다고 판단했다."
                     if self._ai_state != "none":
                         self._ai_state = "none"
-                        self._log("AI 판단: 지금은 살 만한 종목이 없다 — 매수를 쉰다")
+                        self._log("AI 판단: 지금은 살 만한 자리가 없다 — 매수를 쉰다")
                     return
                 self._ai_state = "ok"
             else:
-                if not codes:   # AI 실패/무효 → 등락률 모멘텀 상위로 대체
-                    codes = [r["code"] for r in ranked[:slots]]
+                if not plans:   # AI 실패/무효 → 등락률 모멘텀 상위로 대체
+                    plans = [EntryPlan(r["code"]) for r in ranked[:slots]]
                     note = note or "AI 선정 불가 — 등락률 모멘텀 상위로 자동 대체"
                 # 주문이 거부된 종목을 즉시 대체할 수 있게 예비 후보를 뒤에 붙인다
-                backup = [r["code"] for r in ranked if r["code"] not in codes]
-                codes = (codes + backup)[: slots + 3]
+                chosen = {p.code for p in plans}
+                backup = [EntryPlan(r["code"]) for r in ranked
+                          if r["code"] not in chosen]
+                plans = (plans + backup)[: slots + 3]
             with self._scan_lock:
-                self._scan_result = (codes, note)
+                self._scan_result = (plans, note)
         except Exception as e:
             logger.warning("종목 탐색 오류: %s", e)
         finally:
@@ -955,17 +1195,25 @@ class Scalper:
             result, self._scan_result = self._scan_result, None
         if result is None:
             return
-        codes, note = result
+        plans, note = result
         if note:
             self.selection_note = note
         filled = 0
-        for code in codes:
+        now = self.clock()
+        for plan in plans:
+            code = plan.code
             if filled >= slots:
                 break
             if code in self.positions:
                 continue
+            if (plan.has_levels and plan.decided_at is not None
+                    and (now - plan.decided_at).total_seconds()
+                    > self.config.plan_ttl_sec):
+                self._log(f"매수 건너뜀({code}): AI 판단이 나온 지 오래됐다 "
+                          f"— 다시 판단을 받는다")
+                continue
             try:
-                if self._buy(code):
+                if self._buy(code, plan):
                     filled += 1
             except QuoteUnavailable as e:
                 # 서버측 시세 오류일 뿐 종목의 문제가 아니다 — 제외 없이
@@ -990,8 +1238,93 @@ class Scalper:
                 self._cooldown[code] = self.clock() + dt.timedelta(hours=hours)
                 self._log(f"매수 실패({code}): {message[:90]}"
                           f" → {'당일' if hard else '1시간'} 제외, 다음 후보로 교체")
-        if codes and filled == 0:
-            self._retry_scan_soon()   # 전부 거부되면 2분을 기다리지 않고 재탐색
+        if plans and filled == 0:
+            # 전부 거부되면 탐색 주기를 다 기다리지 않고 다시 찾는다
+            self._retry_scan_soon(60.0 if any(p.has_levels for p in plans)
+                                  else 30.0)
+
+    # ── AI 청산 점검 (보유 종목) ───────────────────────────
+    def _review_rows(self) -> list[dict]:
+        now = self.clock()
+        rows = []
+        for pos in self.positions.values():
+            if (pos.entry_pending or pos.exit_pending or pos.watch
+                    or not pos.last_price):
+                continue
+            since = pos.last_review or pos.entry_time
+            if (now - since).total_seconds() < self.config.review_interval:
+                continue
+            rows.append({
+                "code": pos.code, "entry": pos.entry_price,
+                "price": pos.last_price, "pct": round(pos.pct(), 2),
+                "held_min": round((now - pos.entry_time).total_seconds() / 60),
+                "stop": round(self.stop_price(pos), 4),
+                "target": round(self.target_price(pos), 4),
+                "peak": pos.peak_price, "trailing": pos.trailing})
+        return rows
+
+    def _maybe_review(self) -> None:
+        if (self.reviewer is None or self.config.review_interval <= 0
+                or self._review_thread is not None):
+            return
+        rows = self._review_rows()
+        if not rows:
+            return
+        now = self.clock()
+        for row in rows:
+            self.positions[row["code"]].last_review = now
+        thread = threading.Thread(target=self._review_worker, args=(rows,),
+                                  daemon=True)
+        self._review_thread = thread
+        thread.start()
+
+    def _review_worker(self, rows: list[dict]) -> None:
+        try:
+            reviews, note = self.reviewer(self._enrich(rows))
+            with self._scan_lock:
+                self._review_result = (reviews, note, self.clock())
+            self._review_state = "ok"
+        except Exception as e:
+            if self._review_state != "down":
+                self._review_state = "down"
+                self._log("AI 청산 점검 불가 — 손절·목표 규칙만으로 관리한다 "
+                          f"({str(e)[:60]})")
+        finally:
+            self._review_thread = None
+
+    def _consume_review(self) -> None:
+        with self._scan_lock:
+            result, self._review_result = self._review_result, None
+        if result is None:
+            return
+        reviews, note, decided_at = result
+        if (self.clock() - decided_at).total_seconds() > self.config.plan_ttl_sec:
+            return                               # 늦게 도착한 판단은 쓰지 않는다
+        if note:
+            self.review_note = note
+        for review in reviews:
+            pos = self.positions.get(review.get("code", ""))
+            if (pos is None or pos.entry_pending or pos.exit_pending
+                    or pos.watch or not pos.last_price):
+                continue
+            action = review.get("action")
+            reason = str(review.get("reason") or "")[:80]
+            price = pos.last_price
+            if action == "exit":
+                try:
+                    self._log(f"AI 청산 판단: {pos.code} — {reason or '흐름 약화'}")
+                    self._close(pos, price, "AI 청산")
+                except Exception as e:
+                    self.last_error = f"{pos.code} AI 청산 주문 오류: {e}"
+            elif action == "tighten":
+                new_stop = review.get("stop") or 0
+                # 손절가는 올릴 수만 있다 — 낮추거나 현재가 위로 두는 제안은 버린다
+                if self.stop_price(pos) < new_stop < price:
+                    pos.stop_price = float(new_stop)
+                    self._log(f"AI 손절가 상향: {pos.code} → {new_stop:,.2f}"
+                              f"{' — ' + reason if reason else ''}")
+                    self._save_state()
+        self._journal("review", reviews=reviews, note=note)
 
     # ── 일일 안전장치 ─────────────────────────────────────
     def _entries_allowed(self) -> bool:
@@ -1138,7 +1471,10 @@ class Scalper:
                     {"code": p.code, "quantity": p.quantity,
                      "entry_price": p.entry_price,
                      "entry_time": p.entry_time.isoformat(),
-                     "adopted": p.adopted, "watch": p.watch}
+                     "adopted": p.adopted, "watch": p.watch,
+                     "stop_price": p.stop_price,
+                     "target_price": p.target_price,
+                     "init_risk": p.init_risk, "be_moved": p.be_moved}
                     for p in self.positions.values()]}
         try:
             tmp = f"{self.state_path}.tmp"
@@ -1178,6 +1514,10 @@ class Scalper:
                            entry_time, orig_qty=qty,
                            adopted=bool(item.get("adopted")),
                            watch=bool(item.get("watch")),
+                           stop_price=float(item.get("stop_price") or 0),
+                           target_price=float(item.get("target_price") or 0),
+                           init_risk=float(item.get("init_risk") or 0),
+                           be_moved=bool(item.get("be_moved")),
                            baseline_qty=max(0, actual - qty))
             self.positions[code] = pos
             if not pos.adopted:
@@ -1186,7 +1526,7 @@ class Scalper:
             # 동시에 큰 손실로 던지지 않고 본전 감시로 돌린다 (해제·즉시 매도 가능)
             now_price = float(balances.get(code, {}).get("now_price") or 0)
             if (not pos.watch and now_price > 0 and pos.entry_price > 0
-                    and pos.pct(now_price) <= -self.config.stop_pct):
+                    and now_price <= self.stop_price(pos)):
                 pos.watch = True
                 pos.last_price = now_price
                 self._log(f"{code}: 이미 손절선 아래({pos.pct(now_price):+.2f}%)"
@@ -1223,6 +1563,7 @@ class Scalper:
             return
         self._process_requests()
         self._monitor_positions()
+        self._consume_review()
         left = self.minutes_to_close()
         if left is not None and left <= self.config.flatten_min:
             self._flatten_for_close(left)
@@ -1231,6 +1572,7 @@ class Scalper:
             self._consume_scan(slots)
             slots = self._open_slots()
             self._maybe_scan(slots)
+        self._maybe_review()
 
     def reconcile(self) -> None:
         """실계좌 잔고와 내부 장부를 맞춘다 (미국주식, us_balances 지원 시).
@@ -1293,8 +1635,11 @@ class Scalper:
         cfg = self.config
         self._log(f"AI 단타 시작: {'미국' if cfg.market == 'us' else '국내'} / "
                   f"목표 +{cfg.target_pct}%(추적 {cfg.trail_pct}%) · "
-                  f"손절 -{cfg.stop_pct}% / "
-                  f"동시 {cfg.max_positions}종목 / 총 {cfg.total_cash:,.0f}")
+                  f"손절 최대 -{cfg.stop_pct}% / "
+                  f"1회 손실 한도 {cfg.risk_pct}% / "
+                  f"동시 {cfg.max_positions}종목 / 총 {cfg.total_cash:,.0f}"
+                  + (f" / 종목군 {len(cfg.universe)}개(대형주·주요 ETF)"
+                     if cfg.universe is not None else ""))
         try:
             self.restore_state()
         except Exception as e:

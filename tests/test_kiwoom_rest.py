@@ -95,6 +95,113 @@ class LoadConfigTest(unittest.TestCase):
             load_config("/no/such/config.ini")
 
 
+class MinuteBarsAndValueRankTest(unittest.TestCase):
+    """AI 매매 시점 판단용 분봉과 거래대금 순위."""
+
+    def _client(self, market, responses):
+        calls = []
+
+        def transport(url, headers, body):
+            calls.append((url, headers.get("api-id"), body))
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            return responses[headers["api-id"]]
+
+        client = KiwoomRestClient("AK", "SK", mock=True, market=market,
+                                  transport=transport)
+        return client, calls
+
+    def test_us_minute_bars_sorted_oldest_first(self):
+        client, calls = self._client("us", {
+            "usa10098": {"return_code": 0, "list": [{"stex_tp": "ND"}]},
+            "usa06011": {"return_code": 0, "result_list": [
+                {"cur_prc": "201.3900", "trde_qty": "20", "open_pric": "201.3000",
+                 "high_pric": "201.4000", "low_pric": "201.2500",
+                 "cntr_tm": "20260624080900"},
+                {"cur_prc": "201.3000", "trde_qty": "10", "open_pric": "201.2000",
+                 "high_pric": "201.3500", "low_pric": "201.1000",
+                 "cntr_tm": "20260624080800"},
+                {"cur_prc": "", "cntr_tm": "20260624080700"}]}})
+        bars = client.minute_bars("NVDA")
+        self.assertEqual([b["t"] for b in bars],
+                         ["20260624080800", "20260624080900"])
+        self.assertEqual(bars[-1], {"t": "20260624080900", "o": 201.3,
+                                    "h": 201.4, "l": 201.25, "c": 201.39,
+                                    "v": 20.0})
+        url, api_id, body = calls[-1]
+        self.assertTrue(url.endswith("/api/us/chart"))
+        self.assertEqual(body["stex_tp"], "ND")
+        self.assertEqual(body["tic_scope"], "1")
+
+    def test_kr_minute_bars_strip_signs(self):
+        client, calls = self._client("kr", {
+            "ka10080": {"return_code": 0, "stk_min_pole_chart_qry": [
+                {"cur_prc": "-78800", "trde_qty": "7913",
+                 "cntr_tm": "20250917132000", "open_pric": "-78850",
+                 "high_pric": "-78900", "low_pric": "-78800"}]}})
+        bars = client.minute_bars("005930", count=30)
+        self.assertEqual(bars[0]["c"], 78800.0)
+        self.assertEqual(bars[0]["h"], 78900.0)
+        self.assertEqual(calls[-1][2]["stk_cd"], "005930")
+
+    def test_empty_bars_raise(self):
+        client, _ = self._client("kr", {
+            "ka10080": {"return_code": 0, "stk_min_pole_chart_qry": []}})
+        with self.assertRaises(KiwoomRestError):
+            client.minute_bars("005930")
+
+    def test_dollar_volume_ranking(self):
+        client, calls = self._client("us", {
+            "usa20530": {"return_code": 0, "result_list": [
+                {"stex_tp": "ND", "stk_cd": "NVDA", "stk_nm": "엔비디아",
+                 "cur_prc": "+201.47", "flu_rt": "+0.71",
+                 "acc_trde_qty": "46000000", "trde_prica": "926000"}]}})
+        rows = client.top_stocks("value", limit=100)
+        self.assertEqual(rows[0]["code"], "NVDA")
+        self.assertEqual(rows[0]["value"], "926000")
+        self.assertEqual(calls[-1][2]["qry_tp"], "1")     # 거래대금 상위
+
+    def test_kr_dollar_volume_ranking(self):
+        client, calls = self._client("kr", {
+            "ka10032": {"return_code": 0, "trde_prica_upper": [
+                {"stk_cd": "005930_AL", "stk_nm": "삼성전자",
+                 "cur_prc": "-152000", "flu_rt": "-0.07",
+                 "now_trde_qty": "34954641", "trde_prica": "5308092"}]}})
+        rows = client.top_stocks("value")
+        self.assertEqual(rows[0]["code"], "005930")
+        self.assertEqual(rows[0]["volume"], "34954641")
+
+
+class ClaudeAndUniverseConfigTest(unittest.TestCase):
+    def _load(self, text):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.ini")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return load_config(path)
+
+    def test_defaults(self):
+        cfg = self._load("[kiwoom]\nappkey=A\nsecretkey=B\n")
+        self.assertEqual(cfg["claude_model"], "")
+        self.assertTrue(cfg["universe_restrict"])
+        self.assertEqual(cfg["universe_add"], "")
+
+    def test_overrides(self):
+        cfg = self._load(
+            "[kiwoom]\nappkey=A\nsecretkey=B\n"
+            "[claude]\nmodel = claude-sonnet-5-5\neffort = LOW\n"
+            "[universe]\nadd = COIN, HOOD ; 추가\nremove = TSLA\n"
+            "restrict = false\n")
+        self.assertEqual(cfg["claude_model"], "claude-sonnet-5-5")
+        self.assertEqual(cfg["claude_effort"], "low")
+        self.assertEqual(cfg["universe_add"], "COIN, HOOD")
+        self.assertEqual(cfg["universe_remove"], "TSLA")
+        self.assertFalse(cfg["universe_restrict"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

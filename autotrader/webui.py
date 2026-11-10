@@ -1,8 +1,8 @@
 """AI 단타 대시보드 (로컬 웹 UI).
 
 파이썬 표준 라이브러리(http.server)만으로 동작하며 127.0.0.1 전용이다.
-AI(Claude Fable)가 거래량·등락률 상위에서 매매 종목을 자동 선정하고,
-목표 수익(+1~2%) 익절 / -2% 손절을 반복하는 단타 루프와 손실 보유 종목의 본전 감시를 제어한다.
+대형주·주요 ETF 가운데 AI(Claude Opus 5.5)가 분봉을 보고 진입·청산 시점을
+판단하는 단타 루프와, 손실 보유 종목의 본전 감시를 제어한다.
 실행: python -m autotrader ui
 """
 
@@ -19,6 +19,9 @@ from .kiwoom_rest import (
     KiwoomRestClient, KiwoomRestError, _read_parser, load_config,
 )
 from .scalper import ScalpConfig, Scalper
+from .universe import build_universe
+
+_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 class RecordingAPI:
@@ -66,6 +69,7 @@ class AppState:
         self.lock = threading.Lock()
         # 테스트에서 가짜 클라이언트/분석기를 주입할 수 있게 팩토리로 분리
         self.client_factory = KiwoomRestClient
+        self.ai_label = ""        # 최근 판단에 쓴 모델·호출 방식
         self.analyst_factory = ClaudeAnalyst          # API 키 방식
         self.cli_analyst_factory = ClaudeCodeAnalyst  # Claude Code 구독 로그인
 
@@ -75,18 +79,26 @@ class AppState:
         config.ini [claude] backend = auto(기본) | api | cli 로 강제할 수 있다.
         """
         parser = _read_parser(self.config_path)
-        api_key, backend = "", "auto"
+        api_key, backend, kwargs = "", "auto", {}
         if parser.has_section("claude"):
             section = parser["claude"]
             api_key = section.get("api_key", "").strip()
             backend = (section.get("backend", "auto").strip().lower() or "auto")
+            # 모델·판단 강도: 비워 두면 기본값(Opus 5.5, medium)
+            model = section.get("model", "").strip()
+            effort = section.get("effort", "").strip().lower()
+            if model:
+                kwargs["model"] = model
+            if effort in _EFFORTS:
+                kwargs["effort"] = effort
         if backend == "api" or (backend == "auto" and api_key):
-            return self.analyst_factory(api_key)
-        return self.cli_analyst_factory()
+            return self.analyst_factory(api_key, **kwargs)
+        return self.cli_analyst_factory(**kwargs)
 
     # ── 실행 제어 ──────────────────────────────────────────
     def start(self, market: str, target_pct, max_positions, cash,
-              confirm: str = "", stop_pct=2.0, require_ai: bool = True) -> dict:
+              confirm: str = "", stop_pct=2.0, require_ai: bool = True,
+              risk_pct=0.5, leveraged: bool = True) -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -96,10 +108,19 @@ class AppState:
                 return {"need_confirm": True,
                         "error": "실전투자 모드다. 확인란에 YES를 입력해야 시작된다."}
             try:
+                # 종목군: 대형주·주요 ETF만 매매한다 (config.ini [universe]로 조정)
+                universe = None
+                if cfg.get("universe_restrict", True):
+                    universe = build_universe(
+                        market, leveraged=bool(leveraged),
+                        add=cfg.get("universe_add"),
+                        remove=cfg.get("universe_remove"))
                 scalp_cfg = ScalpConfig(
                     market=market,
                     target_pct=_parse_float(target_pct, "목표 수익 %"),
                     stop_pct=_parse_float(stop_pct, "손절 %"),
+                    risk_pct=_parse_float(risk_pct, "1회 손실 한도 %"),
+                    universe=universe,
                     require_ai=bool(require_ai),
                     max_positions=_parse_int(max_positions, "동시 종목 수"),
                     total_cash=_parse_float(cash, "총 투입 금액"),
@@ -110,18 +131,43 @@ class AppState:
                                              mock=mock, market=market)
                 api = RecordingAPI(client)
 
+                holder: dict = {}
+
+                def context() -> dict:
+                    ctx = {"max_stop_pct": scalp_cfg.stop_pct,
+                           "min_stop_pct": min(scalp_cfg.min_stop_pct,
+                                               scalp_cfg.stop_pct),
+                           "min_rr": scalp_cfg.min_rr,
+                           "min_target_pct": scalp_cfg.min_target_pct,
+                           "stale_min": scalp_cfg.stale_min}
+                    running = holder.get("trader")
+                    if running is not None:
+                        ctx["session"] = running.session()
+                        ctx["minutes_to_close"] = running.minutes_to_close()
+                    return ctx
+
                 def selector(rows, num, _self=self):
-                    # 선정 시점에 분석 백엔드를 만든다. 백엔드가 없으면
-                    # 예외가 나고, Scalper가 모멘텀 상위로 자동 대체한다.
+                    # 판단 시점에 분석 백엔드를 만든다. 백엔드가 없으면 예외가
+                    # 나고, 엔진은 새로 사지 않는다(AI 필수 모드).
                     analyst = _self._make_analyst()
-                    return analyst.select_symbols(
-                        market, rows, num, criteria_label="당일 거래량·등락률 상위")
+                    _self.ai_label = analyst.label
+                    return analyst.plan_entries(market, rows, num, context())
+
+                def reviewer(rows, _self=self):
+                    analyst = _self._make_analyst()
+                    return analyst.review_positions(market, rows, context())
 
                 # 프로그램이 산 포지션을 재시작 후에도 이어서 관리하기 위한 상태 파일
-                state_path = str(Path(self.config_path).resolve()
-                                 .with_name(f"autotrader_state_{market}.json"))
+                base = Path(self.config_path).resolve()
+                state_path = str(base.with_name(f"autotrader_state_{market}.json"))
+                # AI 판단과 매매 결과 기록 (판단 품질 복기용)
+                journal_path = str(base.with_name(
+                    f"autotrader_journal_{market}.jsonl"))
                 trader = Scalper(api=api, config=scalp_cfg, selector=selector,
-                                 is_simulation=mock, state_path=state_path)
+                                 reviewer=reviewer, is_simulation=mock,
+                                 state_path=state_path,
+                                 journal_path=journal_path)
+                holder["trader"] = trader
             except (ValueError, PermissionError) as e:
                 return {"error": str(e)}
 
@@ -136,6 +182,9 @@ class AppState:
             self.params = {"market": market,
                            "target_pct": scalp_cfg.target_pct,
                            "stop_pct": scalp_cfg.stop_pct,
+                           "risk_pct": scalp_cfg.risk_pct,
+                           "universe": (len(universe) if universe is not None
+                                        else None),
                            "require_ai": scalp_cfg.require_ai,
                            "max_positions": scalp_cfg.max_positions,
                            "cash": scalp_cfg.total_cash,
@@ -198,7 +247,8 @@ class AppState:
             "prices": [], "events": [], "positions": [], "trades": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "wins": 0, "losses": 0, "session": "", "halt_reason": "",
-            "selection_note": "", "chart_code": "", "holdings": [],
+            "selection_note": "", "review_note": "", "ai": self.ai_label,
+            "chart_code": "", "holdings": [],
         }
         trader = self.trader
         if trader:
@@ -212,6 +262,7 @@ class AppState:
             out["minutes_to_close"] = None if left is None else round(left)
             out["halt_reason"] = trader.halt_reason
             out["selection_note"] = trader.selection_note
+            out["review_note"] = trader.review_note
             out["events"] = trader.events[-30:]
             now = trader.clock()
             out["positions"] = [
@@ -220,6 +271,8 @@ class AppState:
                  "pct": round(p.pct(), 2),
                  "held_min": round((now - p.entry_time).total_seconds() / 60),
                  "state": p.state(), "watch": p.watch,
+                 "stop": None if p.watch else round(trader.stop_price(p), 4),
+                 "target": None if p.watch else round(trader.target_price(p), 4),
                  "breakeven": round(trader.breakeven_price(p), 4)}
                 for p in list(trader.positions.values())
             ]
@@ -288,13 +341,15 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 .fixed{color:var(--dim);font-size:12px;align-self:flex-end;padding-bottom:8px}
 </style></head><body>
 <h1>AutoTrader AI 단타 <span id="modeBadge" class="badge mock">모의투자</span></h1>
-<div class="sub">AI가 종목을 골라 매수 → 손절 / 목표 도달 후 고점을 따라가며 익절 · 장 시작 15분 뒤~마감 1시간 전</div>
+<div class="sub">대형주·주요 ETF만 매매 · AI(Opus 5.5)가 분봉을 보고 진입·청산 시점 판단 · 1회 손실 한도에 맞춰 수량 결정 · 장 시작 15분 뒤~마감 1시간 전</div>
 
 <div class="row">
   <select id="market"><option value="kr">국내주식</option><option value="us">미국주식</option></select>
-  <span><label>목표 수익 %</label><br><input id="target" value="2" size="4" title="이 수익률에 닿으면 바로 팔지 않고, 고점에서 0.7% 밀릴 때 익절합니다"></span>
-  <span><label>손절 %</label><br><input id="stop" value="2" size="4" title="매수가 대비 이만큼 내리면 무조건 전량 매도"></span>
-  <label title="켜면 AI 선정이 안 될 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 선정 필수</label>
+  <span><label>목표 수익 %</label><br><input id="target" value="2" size="4" title="AI가 목표가를 주지 않을 때 쓰는 기본 목표입니다. AI 목표가는 최소 +1% 이상만 받습니다. 목표에 닿으면 바로 팔지 않고, 고점에서 0.7% 밀릴 때 익절합니다"></span>
+  <span><label>최대 손절 %</label><br><input id="stop" value="2" size="4" title="AI가 종목마다 손절가를 정하되, 매수가에서 이 폭보다 멀리 두지 못합니다. 손절가에 닿으면 무조건 전량 매도"></span>
+  <span><label>1회 손실 한도 %</label><br><input id="risk" value="0.5" size="4" title="한 번 손절했을 때 잃는 금액이 총 투입 금액의 이 %를 넘지 않게 수량을 정합니다"></span>
+  <label title="켜면 AI 판단을 받을 수 없을 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 판단 필수</label>
+  <label title="TQQQ·SOXL 같은 지수형 레버리지·인버스 ETF를 후보에 넣습니다"><input type="checkbox" id="lev" checked> 레버리지 ETF 포함</label>
   <span><label>동시 종목</label><br><input id="maxpos" value="2" size="3"></span>
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>
@@ -314,8 +369,8 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 
 <div class="panel"><h2>보유 포지션</h2>
   <table><thead><tr><th>종목</th><th>수량</th><th>진입가</th><th>현재가</th>
-  <th>수익률</th><th>보유(분)</th><th>상태</th></tr></thead>
-  <tbody id="positions"><tr><td colspan="7">없음</td></tr></tbody></table>
+  <th>수익률</th><th>손절가</th><th>목표가</th><th>보유(분)</th><th>상태</th></tr></thead>
+  <tbody id="positions"><tr><td colspan="9">없음</td></tr></tbody></table>
 </div>
 
 <div class="panel"><h2>실계좌 보유 종목 <span class="fixed">(1분마다 동기화 · 프로그램 밖의 보유는 손대지 않습니다)</span>
@@ -329,13 +384,14 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 
 <div class="cols">
   <div class="panel"><h2>청산 기록 / 이벤트</h2><ul id="log"><li>기록 없음</li></ul></div>
-  <div class="panel"><h2>Fable 종목 선정 근거</h2><div id="note">아직 선정 전입니다.
-AI 선정이 불가하면 등락률 모멘텀 상위로 자동 대체됩니다.
-선정은 참고 자료이며 투자 자문이 아닙니다.</div></div>
+  <div class="panel"><h2>AI 매매 판단 근거 <span class="fixed" id="aiLabel"></span></h2><div id="note">아직 판단 전입니다.
+AI 판단을 받을 수 없으면 새로 사지 않습니다(보유 종목은 손절·목표 규칙으로 관리).
+판단은 참고 자료이며 투자 자문이 아닙니다.</div></div>
 </div>
 
 <script>
 const $=id=>document.getElementById(id);
+const fmt=v=>v==null?"-":Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
 $("market").onchange=()=>{ $("cash").value = $("market").value==="us" ? "1000" : "1000000"; };
 async function api(path,body){const r=await fetch(path,{method:body?"POST":"GET",
 headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
@@ -343,9 +399,10 @@ return r.json();}
 async function start(){
   const r=await api("/api/start",{market:$("market").value,
     target_pct:$("target").value.trim(),stop_pct:$("stop").value.trim(),
+    risk_pct:$("risk").value.trim(),leveraged:$("lev").checked,
     require_ai:$("needAI").checked,max_positions:$("maxpos").value.trim(),
     cash:$("cash").value.trim(),confirm:$("confirm").value.trim()});
-  $("msg").textContent=r.error||"AI 단타 시작 - 장중에 종목을 자동 선정해 매매합니다";
+  $("msg").textContent=r.error||"AI 단타 시작 - 장중에 대형주·주요 ETF에서 진입 시점을 판단해 매매합니다";
 }
 async function adopt(code,mode){
   const msg=mode==="sell"?code+" 보유 수량 전부를 지금 매도합니다. 진행할까요?"
@@ -397,10 +454,11 @@ async function refresh(){
         p.entry.toLocaleString(undefined,{maximumFractionDigits:2})+"</td><td>"+
         (p.last?p.last.toLocaleString(undefined,{maximumFractionDigits:2}):"-")+
         "</td><td class='"+(p.pct>=0?"pos":"neg")+"'>"+p.pct.toFixed(2)+"%</td><td>"+
+        fmt(p.stop)+"</td><td>"+fmt(p.target)+"</td><td>"+
         p.held_min+"</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
         Number(p.breakeven).toLocaleString(undefined,{maximumFractionDigits:2}):"")+
         "</td></tr>").join("")
-      :"<tr><td colspan='7'>없음</td></tr>";
+      :"<tr><td colspan='9'>없음</td></tr>";
     if(s.holdings&&s.holdings.length){
       $("holdings").innerHTML=s.holdings.map(h=>"<tr><td>"+h.code+"</td><td>"+h.qty+
         "</td><td>"+Number(h.avg).toLocaleString(undefined,{maximumFractionDigits:2})+
@@ -419,7 +477,10 @@ async function refresh(){
     drawChart(s.prices,s.chart_code);
     $("log").innerHTML=[...s.trades,...s.events].slice(-15).reverse()
       .map(e=>"<li>"+e+"</li>").join("")||"<li>기록 없음</li>";
-    if(s.selection_note)$("note").textContent="[Fable 선정 근거]\\n"+s.selection_note+
+    $("aiLabel").textContent=s.ai?"("+s.ai+")":"";
+    if(s.selection_note||s.review_note)$("note").textContent=
+      (s.selection_note?"[진입 판단]\\n"+s.selection_note:"")+
+      (s.review_note?(s.selection_note?"\\n\\n":"")+"[보유 종목 점검]\\n"+s.review_note:"")+
       "\\n\\n※ 참고 자료이며 투자 자문이 아닙니다.";
     if(s.last_error)$("msg").textContent=s.last_error;
   }catch(e){}
@@ -469,6 +530,8 @@ class Handler(BaseHTTPRequestHandler):
                     target_pct=body.get("target_pct", 2.0),
                     stop_pct=body.get("stop_pct", 2.0),
                     require_ai=bool(body.get("require_ai", True)),
+                    risk_pct=body.get("risk_pct", 0.5),
+                    leveraged=bool(body.get("leveraged", True)),
                     max_positions=body.get("max_positions", 2),
                     cash=body.get("cash"),
                     confirm=body.get("confirm", ""),

@@ -211,3 +211,125 @@ class DashboardWiringTest(unittest.TestCase):
         self.assertEqual(state.trader.config.target_pct, 2.5)
         self.assertFalse(state.trader.config.require_ai)
         state.stop()
+
+
+class TimingWiringTest(unittest.TestCase):
+    """대시보드 → 엔진: 종목군·1회 손실 한도·AI 판단 연결."""
+
+    def _state(self, extra=""):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = make_state(tmp.name, claude=extra)
+        self.addCleanup(lambda: state.trader and state.trader.stop())
+        return state
+
+    def test_start_passes_risk_and_universe(self):
+        state = self._state()
+        r = state.start(market="us", target_pct="2", max_positions="2",
+                        cash="1000", risk_pct="0.7", leveraged=False)
+        self.assertEqual(r, {"ok": True})
+        cfg = state.trader.config
+        self.assertEqual(cfg.risk_pct, 0.7)
+        self.assertIn("NVDA", cfg.universe)
+        self.assertNotIn("TQQQ", cfg.universe)          # 레버리지 ETF 제외
+        self.assertNotIn("ONCO", cfg.universe)
+        self.assertEqual(state.params["universe"], len(cfg.universe))
+        self.assertTrue(state.trader.journal_path.endswith(
+            "autotrader_journal_us.jsonl"))
+
+    def test_defaults_are_half_percent_risk_with_leveraged(self):
+        state = self._state()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        cfg = state.trader.config
+        self.assertEqual(cfg.risk_pct, 0.5)
+        self.assertIn("TQQQ", cfg.universe)
+        self.assertIsNotNone(state.trader.reviewer)
+
+    def test_universe_section_in_config(self):
+        state = self._state("[universe]\nadd = COIN\nremove = TSLA\n")
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        self.assertIn("COIN", state.trader.config.universe)
+        self.assertNotIn("TSLA", state.trader.config.universe)
+        state.trader.stop()
+        off = self._state("[universe]\nrestrict = false\n")
+        off.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        self.assertIsNone(off.trader.config.universe)
+
+    def test_invalid_risk_is_reported(self):
+        state = self._state()
+        r = state.start(market="us", target_pct="2", max_positions="2",
+                        cash="1000", risk_pct="x")
+        self.assertIn("1회 손실 한도", r["error"])
+        r = state.start(market="us", target_pct="2", max_positions="2",
+                        cash="1000", risk_pct="9")
+        self.assertIn("1회 손실 한도", r["error"])
+
+    def test_subscription_login_is_default_backend(self):
+        state = self._state("[claude]\nbackend = auto\napi_key =\n")
+        made = []
+        state.cli_analyst_factory = lambda **kw: made.append(("cli", kw)) or "CLI"
+        state.analyst_factory = lambda key, **kw: made.append(("api", kw)) or "API"
+        self.assertEqual(state._make_analyst(), "CLI")
+        self.assertEqual(made, [("cli", {})])           # 기본 모델(Opus 5.5)
+
+    def test_model_and_effort_from_config(self):
+        state = self._state(
+            "[claude]\nmodel = claude-sonnet-5-5\neffort = low\napi_key = K\n")
+        made = []
+        state.analyst_factory = lambda key, **kw: made.append((key, kw)) or "API"
+        self.assertEqual(state._make_analyst(), "API")
+        self.assertEqual(made, [("K", {"model": "claude-sonnet-5-5",
+                                       "effort": "low"})])
+
+    def test_selector_and_reviewer_call_the_analyst(self):
+        state = self._state()
+        seen = {}
+
+        class FakeAnalyst:
+            label = "claude-opus-5-5 · 구독 로그인"
+
+            def plan_entries(self, market, rows, num, context=None):
+                seen["entry"] = (market, num, context)
+                return [{"code": rows[0]["code"], "stop": 99.0,
+                         "target": 102.0}], "근거"
+
+            def review_positions(self, market, rows, context=None):
+                seen["review"] = (market, context)
+                return [{"code": rows[0]["code"], "action": "hold"}], "유지"
+
+        state.cli_analyst_factory = lambda **kw: FakeAnalyst()
+        state.start(market="us", target_pct="2", max_positions="2",
+                    cash="1000", stop_pct="1.5")
+        trader = state.trader
+        plans, note = trader.selector([{"code": "NVDA", "price": "100"}], 1)
+        self.assertEqual(plans[0]["code"], "NVDA")
+        market, num, context = seen["entry"]
+        self.assertEqual((market, num), ("us", 1))
+        self.assertEqual(context["max_stop_pct"], 1.5)
+        self.assertIn("session", context)
+        self.assertEqual(state.status()["ai"], "claude-opus-5-5 · 구독 로그인")
+        reviews, _ = trader.reviewer([{"code": "NVDA"}])
+        self.assertEqual(reviews[0]["action"], "hold")
+        self.assertEqual(seen["review"][0], "us")
+
+    def test_status_shows_stop_and_target(self):
+        from datetime import datetime
+
+        from autotrader.scalper import Position
+
+        state = self._state()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        trader = state.trader
+        state.stop()                 # 매매 루프가 표시용 포지션을 건드리지 않게
+        state.thread.join(5)
+        trader.positions["NVDA"] = Position(
+            "NVDA", 2, 200.0, datetime.now(), last_price=201.0,
+            stop_price=198.5, target_price=203.0)
+        trader.review_note = "유지 NVDA"
+        s = state.status()
+        self.assertEqual(s["positions"][0]["stop"], 198.5)
+        self.assertEqual(s["positions"][0]["target"], 203.0)
+        self.assertEqual(s["review_note"], "유지 NVDA")
+        trader.positions.clear()

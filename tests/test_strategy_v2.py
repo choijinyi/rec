@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from autotrader.analysis import ClaudeCodeAnalyst, parse_selection
+from autotrader.analysis import ClaudeCodeAnalyst
 from autotrader.scalper import (
     ScalpConfig, Scalper, kr_session_start, us_session_start,
 )
@@ -48,7 +48,8 @@ ROWS = [{"code": "AAA", "price": "100", "change_pct": "5", "volume": "9000000"},
 def make(api, hour=10, minute=0, selector="AAA", **kw):
     clock = {"now": datetime(2026, 11, 9, hour, minute)}      # 월요일, 국내
     cfg = dict(market="kr", max_positions=1, total_cash=100_000,
-               scan_interval=99999.0, min_dollar_volume=0, min_price=1)
+               scan_interval=99999.0, min_dollar_volume=0, min_price=1,
+               risk_pct=0)
     cfg.update(kw)
     if isinstance(selector, str):
         code = selector
@@ -229,8 +230,8 @@ class RequireAiTest(unittest.TestCase):
         trader = make(api, selector=boom)
         scan(trader)
         self.assertEqual(api.orders, [])           # 등락률 상위로 대신 사지 않는다
-        self.assertIn("AI 선정 불가", trader.selection_note)
-        self.assertEqual(sum("AI 선정 불가" in e for e in trader.events), 1)
+        self.assertIn("AI 판단 불가", trader.selection_note)
+        self.assertEqual(sum("AI 판단 불가" in e for e in trader.events), 1)
 
     def test_ai_says_none_means_no_buy(self):
         api = FakeAPI({"AAA": 100.0, "BBB": 50.0}, ROWS)
@@ -283,22 +284,6 @@ class DailyLimitResetTest(unittest.TestCase):
         t.utc_clock = lambda: datetime(2026, 11, 10, 1, 30, tzinfo=UTC)
         # ET 11/9 20:30(주간거래 시작 뒤) → 11/10 거래일
         self.assertEqual(t._day_key(), "2026-11-10")
-
-
-class SelectionParsingTest(unittest.TestCase):
-    V = ["NETG", "SOXL", "NVDA"]
-
-    def test_none_answer_returns_empty(self):
-        text = "선정: 없음\n\nNVDA는 과열, SOXL은 변동성 과다로 제외한다."
-        self.assertEqual(parse_selection(text, self.V, 2), [])
-
-    def test_bold_line_with_trailing_explanation(self):
-        text = "**선정: SOXL** — 3개는 채울 수 없다. NETG는 유동성 미달로 제외했다."
-        self.assertEqual(parse_selection(text, self.V, 3), ["SOXL"])
-
-    def test_heading_then_selection_line(self):
-        text = "## 선정 결과\n\n선정: SOXL, NVDA\n- SOXL: 거래량 최대"
-        self.assertEqual(parse_selection(text, self.V, 3), ["SOXL", "NVDA"])
 
 
 class FindCliTest(unittest.TestCase):

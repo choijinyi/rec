@@ -6,3 +6,4 @@ data/*.csv
 config.ini
 autotrader_state_*.json
 autotrader_state_*.json.tmp
+autotrader_journal_*.jsonl
