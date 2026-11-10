@@ -535,6 +535,31 @@ class KiwoomRestClient:
                             "side": str(row.get("slby_tp", "")).strip()})
         return out
 
+    def order_fill(self, ord_no: str) -> tuple[int, float] | None:
+        """당일 주문의 (체결수량, 평균 체결단가). 체결이 없으면 None (ust21510).
+
+        프로그램 손익을 주문가가 아니라 실제 체결가로 기록하는 데 쓴다.
+        """
+        res = self._call("/api/us/acnt", "ust21510",
+                         {"slby_tp": "0", "stex_tp": "", "stk_cd": ""})
+        rows = next((v for v in res.values() if isinstance(v, list)), [])
+        key = str(ord_no or "").strip().lstrip("0")
+        qty, amount = 0, 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("ord_no", "")).strip().lstrip("0") != key:
+                continue
+            filled = self._to_int(row.get("cntr_qty"))
+            try:
+                price = self._parse_price(row.get("cntr_uv") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if filled > 0 and price > 0:
+                qty += filled
+                amount += filled * price
+        return (qty, amount / qty) if qty else None
+
     def cancel_order(self, ord_no: str, code: str) -> None:
         """미체결 주문 1건 취소(ust20003)."""
         self._call("/api/us/ordr", "ust20003",
@@ -585,12 +610,20 @@ def _flag(raw: str) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _opt_float(raw: str) -> float | None:
+    try:
+        return float(str(raw).replace("%", "").strip())
+    except ValueError:
+        return None
+
+
 def load_config(path: str | Path) -> dict:
     """config.ini에서 [kiwoom] 접속 정보와 [claude]·[universe] 설정을 읽는다."""
     parser = _read_parser(path)
     section = parser["kiwoom"] if parser.has_section("kiwoom") else {}
     claude = parser["claude"] if parser.has_section("claude") else {}
     universe = parser["universe"] if parser.has_section("universe") else {}
+    strategy = parser["strategy"] if parser.has_section("strategy") else {}
     return {
         # AI 매매 시점 판단: 모델과 판단 강도 (비우면 기본값)
         "claude_model": claude.get("model", "").strip(),
@@ -599,6 +632,9 @@ def load_config(path: str | Path) -> dict:
         "universe_restrict": _flag(universe.get("restrict", "true")),
         "universe_add": universe.get("add", "").strip(),
         "universe_remove": universe.get("remove", "").strip(),
+        # 손익에 반영할 편도 수수료(%)·매도 세금(%). 비우면 시장별 기본값
+        "fee_pct": _opt_float(strategy.get("fee_pct", "")),
+        "sell_tax_pct": _opt_float(strategy.get("sell_tax_pct", "")),
         "appkey": section.get("appkey", "").strip(),
         "secretkey": section.get("secretkey", "").strip(),
         "mode": section.get("mode", "mock").strip().lower(),

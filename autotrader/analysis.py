@@ -122,6 +122,7 @@ def _entry_prompt(market: str, num: int, rows: Sequence[dict],
 
 def _review_prompt(market: str, rows: Sequence[dict],
                    context: dict | None) -> str:
+    gap = (context or {}).get("tighten_gap_pct", 0.5)
     blocks = []
     for r in rows:
         blocks.append(
@@ -129,7 +130,8 @@ def _review_prompt(market: str, rows: Sequence[dict],
             f"{_num(r.get('price'))} ({_signed(r.get('pct'))}) | 보유 "
             f"{r.get('held_min', '?')}분 | 손절가 {_num(r.get('stop'))} | "
             f"목표가 {_num(r.get('target'))} | 보유 중 고가 {_num(r.get('peak'))}"
-            f"{' | 추적 익절 중' if r.get('trailing') else ''}\n"
+            f"{' | 추적 익절 중' if r.get('trailing') else ''}"
+            f"{'' if r.get('can_tighten', True) else ' | 손절가 상향 아직 불가'}\n"
             f"{_bars_block(r.get('bars'))}")
     body = "\n\n".join(blocks)
     return (
@@ -138,7 +140,11 @@ def _review_prompt(market: str, rows: Sequence[dict],
         "종목마다 셋 중 하나를 고른다.\n"
         "- hold: 흐름이 살아 있어 그대로 둔다.\n"
         "- tighten: 손절가를 올린다(stop에 새 손절가). 손절가는 올릴 수만 "
-        "있고, 현재가보다 낮아야 한다. 상승 중 생긴 새 지지 아래로 잡는다.\n"
+        f"있고, 현재가보다 최소 {gap}% 아래여야 한다. 상승 중 생긴 새 지지 "
+        "아래로 잡는다. 수익이 처음 손절 폭만큼 나기 전에는 올릴 수 없다"
+        "('손절가 상향 아직 불가'로 표시된 종목) — 그때는 hold나 exit만 고른다.\n"
+        "- 목표가에 닿으면 프로그램이 바로 익절하므로, 목표가 근처라는 이유로 "
+        "손절가를 바짝 올릴 필요는 없다.\n"
         "- exit: 흐름이 꺾였거나 더 들고 갈 이유가 없어 지금 판다.\n"
         "작은 흔들림에 팔지 말고, 진입 근거가 무너졌을 때만 exit을 고른다.\n\n"
         "출력 형식(JSON 객체 하나만, 다른 글 금지):\n"

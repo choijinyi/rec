@@ -185,7 +185,9 @@ class ScalpConfig:
     # 두 번 이겨야 메워져 승률 67% 이상이 필요했다 (실전 12회 승률 42%)
     target_pct: float = 2.0       # 익절 목표(%) — 도달하면 추적 익절 시작
     stop_pct: float = 2.0         # 손절선(%) — 넘어가면 무조건 전량 매도
-    trail_pct: float = 0.7        # 목표 도달 후 고점 대비 이만큼 밀리면 익절 (0이면 목표가 즉시 익절)
+    # 목표가에 닿으면 바로 익절한다(0). 0보다 크면 목표 도달 뒤 고점에서 이 %만큼
+    # 밀릴 때 판다 — 목표 폭이 1%대일 때는 이익의 절반을 돌려주게 된다
+    trail_pct: float = 0.0
     max_spread_pct: float = 0.3   # 매수·매도 호가 간격이 이보다 넓으면 매수하지 않는다 (0이면 끔)
     open_delay_min: float = 15.0  # 각 장 시작 후 이 시간(분) 동안은 매수하지 않는다
     max_chase_reentries: int = 1  # 같은 종목을 직전 매수가보다 비싸게 다시 사는 횟수(하루)
@@ -202,6 +204,14 @@ class ScalpConfig:
     plan_ttl_sec: float = 90.0    # AI 판단의 유효 시간(초) — 지나면 버린다
     max_drift_pct: float = 0.4    # AI가 본 가격에서 이 % 넘게 움직였으면 판단을 버린다
     review_interval: float = 240.0  # 보유 종목 AI 청산 점검 주기(초, 0이면 끔)
+    # AI의 손절가 상향은 수익이 손절 폭만큼 난 뒤에만 받고, 그때도 현재가에서
+    # 이 %만큼은 떨어뜨린다 — 작은 흔들림에 본전으로 나오는 것을 막는다
+    tighten_gap_pct: float = 0.5
+    # AI가 "살 자리 없음"을 이어서 답하면 탐색 간격을 이 값(초)까지 늘린다
+    scan_backoff_max: float = 360.0
+    # 손익에 반영할 편도 수수료(%)와 매도 시 세금(%). 0이면 반영하지 않는다
+    fee_pct: float = 0.0
+    sell_tax_pct: float = 0.0
     shortlist_size: int = 6       # AI에 분봉과 함께 넘길 후보 수
     # 매매 허용 종목군 {코드: 구분}. None이면 제한하지 않는다
     universe: dict | None = None
@@ -234,6 +244,8 @@ class ScalpConfig:
     entry_cutoff_min: float = 60.0
     flatten_min: float = 60.0
     fill_timeout_sec: float = 45.0  # 지정가 주문이 이 시간 안에 체결되지 않으면 취소·재주문
+    exit_timeout_sec: float = 15.0  # 청산 매도는 더 짧게 기다리고 추격한다
+    exit_slip_pct: float = 0.5      # 청산 매도 지정가를 현재가에서 이 %보다 낮추지 않는다
     chase_step_pct: float = 0.3     # 추격 매도 회차마다 현재가 대비 낮추는 폭(%)
     chase_max_pct: float = 2.0      # 추격 매도 최대 할인 폭(%)
 
@@ -323,6 +335,7 @@ class Trade:
     reason: str                   # 익절 / 손절 / 시간초과 / 중지
     closed_at: dt.datetime
     day: str = ""                 # 거래일 키 (당일 한도 계산용)
+    fee: float = 0.0              # 수수료·세금 (pnl은 이 금액을 뺀 값)
 
 
 class Scalper:
@@ -394,6 +407,7 @@ class Scalper:
         self._flatten_notice_for = None   # 마감 정리를 알린 장 (중복 로그 방지)
         self._sym_day: dict[str, dict] = {}   # 종목별 당일 매수 이력(추격 재매수 제한)
         self._ai_state = ""               # AI 선정 상태 변화 로그용
+        self._none_streak = 0             # AI가 이어서 "살 자리 없음"이라 답한 횟수
 
     # ── 상태 조회 (UI 공용) ────────────────────────────────
     @property
@@ -656,6 +670,8 @@ class Scalper:
             self._order(pos.code, "sell", pos.quantity)
             self._finalize(pos, price, reason)
             return
+        if reason != "본전 매도":      # 본전 매도는 손익분기점 아래로 내지 않는다
+            price = self._exit_limit(pos.code, price)
         ord_no = self._order(pos.code, "sell", pos.quantity, limit_price=price)
         pos.exit_pending = True
         pos.exit_reason = reason
@@ -667,17 +683,64 @@ class Scalper:
         self._log(f"{reason} 매도 주문: {pos.code} {pos.quantity}주 @{price:,.2f} "
                   f"({pos.pct(price):+.2f}%) — 체결 확인 중")
 
+    def _exit_limit(self, code: str, price: float) -> float:
+        """청산 매도 지정가. 매수호가에 맞춰 바로 체결되게 낸다.
+
+        내려가는 중에 직전 체결가로 지정가를 내면 받아 줄 상대가 없어 한참
+        뒤 더 낮은 가격에 팔게 된다. 호가가 지나치게 낮으면 현재가에서
+        exit_slip_pct보다 낮추지는 않는다(나머지는 추격 매도가 처리).
+        """
+        if not hasattr(self.api, "best_bid_ask"):
+            return price
+        try:
+            bid, _ask = self.api.best_bid_ask(code)
+        except Exception:
+            bid = 0.0
+        if bid > 0:
+            return max(bid, price * (1 - self.config.exit_slip_pct / 100))
+        return price * (1 - 0.001)       # 호가를 못 받으면 0.1% 낮춰 낸다
+
+    def _order_fill(self, ord_no: str, expected: float) -> float | None:
+        """주문의 실제 평균 체결가. 조회할 수 없거나 값이 이상하면 None."""
+        fetch = getattr(self.api, "order_fill", None)
+        if fetch is None or not ord_no or expected <= 0:
+            return None
+        try:
+            filled = fetch(ord_no)
+        except Exception as e:
+            logger.info("체결가 조회 실패(주문가로 기록): %s", e)
+            return None
+        if not filled:
+            return None
+        _qty, fill_price = filled
+        if fill_price <= 0 or abs(fill_price / expected - 1) > 0.03:
+            return None
+        return float(fill_price)
+
+    def _fees(self, pos: Position, qty: int, exit_price: float) -> float:
+        cfg = self.config
+        if cfg.fee_pct <= 0 and cfg.sell_tax_pct <= 0:
+            return 0.0
+        sell = qty * exit_price
+        buy = 0.0 if pos.adopted else qty * pos.entry_price   # 편입분은 매도분만
+        return ((buy + sell) * cfg.fee_pct + sell * cfg.sell_tax_pct) / 100
+
     def _finalize(self, pos: Position, price: float, reason: str) -> None:
         """체결이 확인된 청산을 장부에 반영한다."""
-        pnl = pos.partial_pnl + (price - pos.entry_price) * pos.quantity
-        if not pos.adopted:     # 편입분은 프로그램 현금으로 산 것이 아니다
-            self.cash += pos.quantity * price
+        if self._verify and pos.exit_order:
+            price = self._order_fill(pos.exit_order, price) or price
+        gross = pos.partial_pnl + (price - pos.entry_price) * pos.quantity
         qty = max(pos.orig_qty, pos.quantity)
-        if reason == "익절" and pnl < 0:
-            reason = "익절 미체결 손실"   # 익절 주문이 안 받아져 추격 매도로 손해
+        fee = self._fees(pos, qty, price)
+        pnl = gross - fee
+        if not pos.adopted:     # 편입분은 프로그램 현금으로 산 것이 아니다
+            self.cash += pos.quantity * price - fee
+        if reason in ("익절", "수익 보전") and gross < 0:
+            # 주문이 제때 받아지지 않아 낮춰 팔면서 손실로 끝났다
+            reason = f"{reason} 미체결 손실"
         self.trades.append(Trade(pos.code, qty, pos.entry_price, price, pnl,
                                  pos.pct(price), reason, self.clock(),
-                                 day=self._day_key()))
+                                 day=self._day_key(), fee=fee))
         self.positions.pop(pos.code, None)
         # 익절한 종목은 짧게 쉬고 재진입을 허용해 매매가 계속 이어지게 한다
         minutes = (self.config.win_cooldown_min if pnl > 0
@@ -685,11 +748,13 @@ class Scalper:
         self._cooldown[pos.code] = self.clock() + dt.timedelta(minutes=minutes)
         self._rescan_asap = True   # 슬롯이 비었으니 즉시 재탐색
         self._log(f"{reason}: {pos.code} {qty}주 @{price:,.2f} "
-                  f"({pos.pct(price):+.2f}%, 손익 {pnl:+,.2f}, "
+                  f"({pos.pct(price):+.2f}%, 손익 {pnl:+,.2f}"
+                  f"{f', 수수료 {fee:,.2f} 차감' if fee else ''}, "
                   f"누적 {self.realized_pnl:+,.2f})"
                   f"{' — 체결 확인' if self._verify else ''}")
         self._journal("trade", code=pos.code, quantity=qty,
                       entry=pos.entry_price, exit=price, pnl=round(pnl, 4),
+                      fee=round(fee, 4),
                       pct=round(pos.pct(price), 3), reason=reason,
                       held_min=round((self.clock() - pos.entry_time)
                                      .total_seconds() / 60, 1))
@@ -758,7 +823,13 @@ class Scalper:
             actual = self._actual_qty(pos.code)
             if actual is not None:
                 pos.baseline_qty = max(0, actual - pos.quantity)
-            self._log(f"매수 체결 확인: {pos.code} {pos.quantity}주")
+            fill = self._order_fill(pos.entry_order, pos.entry_price)
+            if fill and fill != pos.entry_price:
+                # 실제 체결가로 장부를 맞춘다 (손절가·목표가는 계획한 가격 그대로)
+                self.cash += (pos.entry_price - fill) * pos.quantity
+                pos.entry_price = fill
+            self._log(f"매수 체결 확인: {pos.code} {pos.quantity}주"
+                      f"{f' @{fill:,.2f}' if fill else ''}")
             self._save_state()
             return
         if (now - pos.entry_sent_at).total_seconds() < self.config.fill_timeout_sec:
@@ -792,7 +863,9 @@ class Scalper:
         if order is None:          # 미체결 목록에서 사라짐 — 체결 또는 소멸
             self._confirm_exit_by_balance(pos, now)
             return
-        if (now - pos.exit_sent_at).total_seconds() < self.config.fill_timeout_sec:
+        timeout = (self.config.fill_timeout_sec if pos.watch
+                   else self.config.exit_timeout_sec)
+        if (now - pos.exit_sent_at).total_seconds() < timeout:
             return
         try:
             self.api.cancel_order(order["ord_no"], pos.code)
@@ -1146,6 +1219,7 @@ class Scalper:
                             self._ai_state = "down"
                             self._log("AI 판단 불가 — 등락률 상위로 대체하지 않고 "
                                       f"매수를 쉰다 ({str(e)[:60]})")
+                        self._back_off_scan()
                         return
                     logger.warning("AI 선정 실패, 모멘텀 상위로 대체: %s", e)
                     note = f"AI 선정 불가({str(e)[:80]}) — 등락률 모멘텀 상위로 자동 대체"
@@ -1155,8 +1229,10 @@ class Scalper:
                     if self._ai_state != "none":
                         self._ai_state = "none"
                         self._log("AI 판단: 지금은 살 만한 자리가 없다 — 매수를 쉰다")
+                    self._back_off_scan()
                     return
                 self._ai_state = "ok"
+                self._none_streak = 0
             else:
                 if not plans:   # AI 실패/무효 → 등락률 모멘텀 상위로 대체
                     plans = [EntryPlan(r["code"]) for r in ranked[:slots]]
@@ -1172,6 +1248,19 @@ class Scalper:
             logger.warning("종목 탐색 오류: %s", e)
         finally:
             self._scan_thread = None
+
+    def _back_off_scan(self) -> None:
+        """AI가 살 자리가 없다고 답할수록 다음 판단 요청을 늦춘다.
+
+        조용한 장에서 2분마다 묻는 것은 구독 사용 한도만 쓴다. 간격을
+        탐색 주기의 1.5배, 2배, … 로 늘려 scan_backoff_max에서 멈춘다.
+        포지션이 청산되면(_rescan_asap) 곧바로 다시 묻는다.
+        """
+        cfg = self.config
+        self._none_streak += 1
+        delay = min(cfg.scan_interval * (1 + 0.5 * self._none_streak),
+                    max(cfg.scan_backoff_max, cfg.scan_interval))
+        self._retry_scan_soon(delay)
 
     def _retry_scan_soon(self, seconds: float = 30.0) -> None:
         self._last_scan = time.monotonic() - self.config.scan_interval + seconds
@@ -1260,8 +1349,14 @@ class Scalper:
                 "held_min": round((now - pos.entry_time).total_seconds() / 60),
                 "stop": round(self.stop_price(pos), 4),
                 "target": round(self.target_price(pos), 4),
-                "peak": pos.peak_price, "trailing": pos.trailing})
+                "peak": pos.peak_price, "trailing": pos.trailing,
+                "can_tighten": self._reached_one_r(pos)})
         return rows
+
+    def _reached_one_r(self, pos: Position) -> bool:
+        """수익이 처음 손절 폭만큼 난 적이 있는가 (AI 손절가 상향 허용 조건)."""
+        risk = pos.init_risk or pos.entry_price * self.config.stop_pct / 100
+        return pos.be_moved or pos.peak_price >= pos.entry_price + risk
 
     def _maybe_review(self) -> None:
         if (self.reviewer is None or self.config.review_interval <= 0
@@ -1317,10 +1412,21 @@ class Scalper:
                 except Exception as e:
                     self.last_error = f"{pos.code} AI 청산 주문 오류: {e}"
             elif action == "tighten":
-                new_stop = review.get("stop") or 0
-                # 손절가는 올릴 수만 있다 — 낮추거나 현재가 위로 두는 제안은 버린다
-                if self.stop_price(pos) < new_stop < price:
-                    pos.stop_price = float(new_stop)
+                new_stop = float(review.get("stop") or 0)
+                # 수익이 손절 폭만큼 나기 전의 상향 제안은 받지 않는다 — 진입
+                # 직후 손절가를 바짝 올리면 작은 흔들림에 본전으로 나오고
+                # 수수료만 낸다
+                if not self._reached_one_r(pos):
+                    self._log(f"AI 손절가 상향 보류: {pos.code} — 수익이 아직 "
+                              f"손절 폭에 못 미친다 (손절가 "
+                              f"{self.stop_price(pos):,.2f} 유지)")
+                    continue
+                # 현재가에 너무 붙이지 않는다
+                new_stop = min(new_stop,
+                               price * (1 - self.config.tighten_gap_pct / 100))
+                # 손절가는 올릴 수만 있다 — 낮추는 제안은 버린다
+                if new_stop > self.stop_price(pos):
+                    pos.stop_price = new_stop
                     self._log(f"AI 손절가 상향: {pos.code} → {new_stop:,.2f}"
                               f"{' — ' + reason if reason else ''}")
                     self._save_state()
@@ -1634,7 +1740,8 @@ class Scalper:
         self._running = True
         cfg = self.config
         self._log(f"AI 단타 시작: {'미국' if cfg.market == 'us' else '국내'} / "
-                  f"목표 +{cfg.target_pct}%(추적 {cfg.trail_pct}%) · "
+                  f"목표 +{cfg.target_pct}%"
+                  f"({f'추적 {cfg.trail_pct}%' if cfg.trail_pct > 0 else '도달 시 익절'}) · "
                   f"손절 최대 -{cfg.stop_pct}% / "
                   f"1회 손실 한도 {cfg.risk_pct}% / "
                   f"동시 {cfg.max_positions}종목 / 총 {cfg.total_cash:,.0f}"

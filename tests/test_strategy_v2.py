@@ -75,12 +75,23 @@ class DefaultsTest(unittest.TestCase):
 
 
 class TrailingExitTest(unittest.TestCase):
-    def _entered(self):
+    def _entered(self, trail_pct=0.7):
         api = FakeAPI({"AAA": 100.0}, ROWS)
-        trader = make(api)
+        trader = make(api, trail_pct=trail_pct)     # 추적 익절은 선택 사항
         scan(trader)
         self.assertIn("AAA", trader.positions)
         return trader, api
+
+    def test_default_sells_at_target(self):
+        # 기본값: 목표가에 닿으면 바로 익절한다 (추적으로 이익을 돌려주지 않는다)
+        self.assertEqual(ScalpConfig().trail_pct, 0.0)
+        api = FakeAPI({"AAA": 100.0}, ROWS)
+        trader = make(api)
+        scan(trader)
+        api.prices["AAA"] = 102.1
+        trader.step()
+        self.assertNotIn("AAA", trader.positions)
+        self.assertEqual(trader.trades[-1].reason, "익절")
 
     def test_target_starts_trailing_instead_of_selling(self):
         trader, api = self._entered()
