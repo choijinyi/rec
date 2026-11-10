@@ -333,3 +333,18 @@ class TimingWiringTest(unittest.TestCase):
         self.assertEqual(s["positions"][0]["target"], 203.0)
         self.assertEqual(s["review_note"], "유지 NVDA")
         trader.positions.clear()
+
+    def test_fee_defaults_and_override(self):
+        state = self._state()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        self.assertEqual(state.trader.config.fee_pct, 0.07)   # 미국 편도 기본값
+        self.assertEqual(state.trader.config.trail_pct, 0.0)  # 목표가에서 바로 익절
+        self.assertEqual(state.status()["fees"], 0.0)
+        state.trader.stop()
+        kr = self._state()
+        kr.start(market="kr", target_pct="2", max_positions="2", cash="1000000")
+        self.assertEqual(kr.trader.config.fee_pct, 0.015)
+        kr.trader.stop()
+        custom = self._state("[strategy]\nfee_pct = 0.25\n")
+        custom.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        self.assertEqual(custom.trader.config.fee_pct, 0.25)

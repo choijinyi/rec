@@ -329,15 +329,37 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(rows[0]["stop"], 198.0)
         self.assertIn("bars", self.calls[0][0])           # 분봉을 붙여 넘긴다
 
-    def test_tighten_raises_stop(self):
+    def test_tighten_ignored_before_one_r(self):
+        # 수익이 손절 폭(2.00)만큼 나기 전에는 AI가 손절가를 올리지 못한다
         self.api.prices["NVDA"] = 201.0
         self.trader.step()
         advance(self.trader, 300)
         self.answer = ([{"code": "NVDA", "action": "tighten", "stop": 200.2,
                          "reason": "새 지지"}], "손절 상향")
+        rows = self.review()
+        self.assertFalse(rows[0]["can_tighten"])
+        self.assertAlmostEqual(self.trader.positions["NVDA"].stop_price, 198.0)
+        self.assertEqual(self.trader.review_note, "손절 상향")   # 근거는 표시
+
+    def test_tighten_raises_stop_after_one_r(self):
+        self.api.prices["NVDA"] = 202.4          # +1R 도달 → 본전 확보(200.6)
+        self.trader.step()
+        advance(self.trader, 300)
+        self.answer = ([{"code": "NVDA", "action": "tighten", "stop": 201.2,
+                         "reason": "새 지지"}], "")
+        rows = self.review()
+        self.assertTrue(rows[0]["can_tighten"])
+        self.assertAlmostEqual(self.trader.positions["NVDA"].stop_price, 201.2)
+
+    def test_tighten_keeps_distance_from_price(self):
+        # 현재가에 바짝 붙인 손절가는 0.5% 아래로 물린다
+        self.api.prices["NVDA"] = 202.4
+        self.trader.step()
+        advance(self.trader, 300)
+        self.answer = ([{"code": "NVDA", "action": "tighten", "stop": 202.3}], "")
         self.review()
-        self.assertAlmostEqual(self.trader.positions["NVDA"].stop_price, 200.2)
-        self.assertEqual(self.trader.review_note, "손절 상향")
+        self.assertAlmostEqual(self.trader.positions["NVDA"].stop_price,
+                               202.4 * 0.995)
 
     def test_ai_cannot_lower_the_stop(self):
         advance(self.trader, 300)
@@ -345,11 +367,13 @@ class ReviewTest(unittest.TestCase):
         self.review()
         self.assertAlmostEqual(self.trader.positions["NVDA"].stop_price, 198.0)
 
-    def test_stop_above_price_is_ignored(self):
+    def test_stop_above_price_never_sells(self):
+        self.api.prices["NVDA"] = 202.4
+        self.trader.step()
         advance(self.trader, 300)
-        self.answer = ([{"code": "NVDA", "action": "tighten", "stop": 200.5}], "")
+        self.answer = ([{"code": "NVDA", "action": "tighten", "stop": 205.0}], "")
         self.review()
-        self.assertAlmostEqual(self.trader.positions["NVDA"].stop_price, 198.0)
+        self.assertLess(self.trader.positions["NVDA"].stop_price, 202.4)
         self.assertEqual(len(self.api.orders), 1)
 
     def test_exit_sells_now(self):

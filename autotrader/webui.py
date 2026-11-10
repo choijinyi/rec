@@ -115,8 +115,14 @@ class AppState:
                         market, leveraged=bool(leveraged),
                         add=cfg.get("universe_add"),
                         remove=cfg.get("universe_remove"))
+                # 수수료: 화면의 손익이 계좌와 맞도록 뺀다 (config.ini [strategy])
+                fee_pct = cfg.get("fee_pct")
+                if fee_pct is None:
+                    fee_pct = 0.07 if market == "us" else 0.015
                 scalp_cfg = ScalpConfig(
                     market=market,
+                    fee_pct=max(0.0, fee_pct),
+                    sell_tax_pct=max(0.0, cfg.get("sell_tax_pct") or 0.0),
                     target_pct=_parse_float(target_pct, "목표 수익 %"),
                     stop_pct=_parse_float(stop_pct, "손절 %"),
                     risk_pct=_parse_float(risk_pct, "1회 손실 한도 %"),
@@ -139,6 +145,7 @@ class AppState:
                                                scalp_cfg.stop_pct),
                            "min_rr": scalp_cfg.min_rr,
                            "min_target_pct": scalp_cfg.min_target_pct,
+                           "tighten_gap_pct": scalp_cfg.tighten_gap_pct,
                            "stale_min": scalp_cfg.stale_min}
                     running = holder.get("trader")
                     if running is not None:
@@ -183,6 +190,7 @@ class AppState:
                            "target_pct": scalp_cfg.target_pct,
                            "stop_pct": scalp_cfg.stop_pct,
                            "risk_pct": scalp_cfg.risk_pct,
+                           "fee_pct": scalp_cfg.fee_pct,
                            "universe": (len(universe) if universe is not None
                                         else None),
                            "require_ai": scalp_cfg.require_ai,
@@ -246,7 +254,8 @@ class AppState:
                           or getattr(self.trader, "last_error", ""),
             "prices": [], "events": [], "positions": [], "trades": [],
             "equity": None, "cash": None, "realized_pnl": None,
-            "wins": 0, "losses": 0, "session": "", "halt_reason": "",
+            "wins": 0, "losses": 0, "fees": 0.0, "session": "",
+            "halt_reason": "",
             "selection_note": "", "review_note": "", "ai": self.ai_label,
             "chart_code": "", "holdings": [],
         }
@@ -256,6 +265,7 @@ class AppState:
             out["cash"] = trader.cash
             out["realized_pnl"] = trader.realized_pnl
             out["wins"] = trader.wins
+            out["fees"] = round(sum(t.fee for t in trader.trades), 2)
             out["losses"] = trader.losses
             out["session"] = trader.session()
             left = trader.minutes_to_close()
@@ -345,7 +355,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 
 <div class="row">
   <select id="market"><option value="kr">국내주식</option><option value="us">미국주식</option></select>
-  <span><label>목표 수익 %</label><br><input id="target" value="2" size="4" title="AI가 목표가를 주지 않을 때 쓰는 기본 목표입니다. AI 목표가는 최소 +1% 이상만 받습니다. 목표에 닿으면 바로 팔지 않고, 고점에서 0.7% 밀릴 때 익절합니다"></span>
+  <span><label>목표 수익 %</label><br><input id="target" value="2" size="4" title="AI가 목표가를 주지 않을 때 쓰는 기본 목표입니다. AI 목표가는 최소 +1% 이상만 받습니다. 목표가에 닿으면 바로 익절합니다"></span>
   <span><label>최대 손절 %</label><br><input id="stop" value="2" size="4" title="AI가 종목마다 손절가를 정하되, 매수가에서 이 폭보다 멀리 두지 못합니다. 손절가에 닿으면 무조건 전량 매도"></span>
   <span><label>1회 손실 한도 %</label><br><input id="risk" value="0.5" size="4" title="한 번 손절했을 때 잃는 금액이 총 투입 금액의 이 %를 넘지 않게 수량을 정합니다"></span>
   <label title="켜면 AI 판단을 받을 수 없을 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 판단 필수</label>
@@ -361,7 +371,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 <div class="grid">
   <div class="card"><div class="k">상태</div><div class="v" id="stRun">대기</div></div>
   <div class="card"><div class="k">평가액</div><div class="v" id="stEquity">-</div></div>
-  <div class="card"><div class="k">실현손익</div><div class="v" id="stPnl">-</div></div>
+  <div class="card"><div class="k">실현손익 <span id="feeNote"></span></div><div class="v" id="stPnl">-</div></div>
   <div class="card"><div class="k">오늘 매매</div><div class="v" id="stTrades">-</div></div>
   <div class="card"><div class="k">승 / 패</div><div class="v" id="stWinLoss">-</div></div>
   <div class="card"><div class="k">현금</div><div class="v" id="stCash">-</div></div>
@@ -369,7 +379,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 
 <div class="panel"><h2>보유 포지션</h2>
   <table><thead><tr><th>종목</th><th>수량</th><th>진입가</th><th>현재가</th>
-  <th>수익률</th><th>손절가</th><th>목표가</th><th>보유(분)</th><th>상태</th></tr></thead>
+  <th>수익률</th><th>손절가</th><th>목표가</th><th title="프로그램이 이 종목을 관리하기 시작한 뒤 지난 시간">경과 시간</th><th>상태</th></tr></thead>
   <tbody id="positions"><tr><td colspan="9">없음</td></tr></tbody></table>
 </div>
 
@@ -446,6 +456,8 @@ async function refresh(){
     const pnl=s.realized_pnl;
     $("stPnl").textContent=pnl!=null?Math.round(pnl).toLocaleString():"-";
     $("stPnl").className="v "+(pnl>0?"pos":(pnl<0?"neg":""));
+    $("feeNote").textContent=(s.params&&s.params.fee_pct>0)?"(수수료 "+
+      Number(s.fees||0).toLocaleString(undefined,{maximumFractionDigits:2})+" 차감)":"";
     $("stTrades").textContent=(s.wins+s.losses)+"회";
     $("stWinLoss").textContent=s.wins+" / "+s.losses;
     $("stCash").textContent=s.cash!=null?Math.round(s.cash).toLocaleString():"-";
@@ -455,7 +467,7 @@ async function refresh(){
         (p.last?p.last.toLocaleString(undefined,{maximumFractionDigits:2}):"-")+
         "</td><td class='"+(p.pct>=0?"pos":"neg")+"'>"+p.pct.toFixed(2)+"%</td><td>"+
         fmt(p.stop)+"</td><td>"+fmt(p.target)+"</td><td>"+
-        p.held_min+"</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
+        p.held_min+"분</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
         Number(p.breakeven).toLocaleString(undefined,{maximumFractionDigits:2}):"")+
         "</td></tr>").join("")
       :"<tr><td colspan='9'>없음</td></tr>";

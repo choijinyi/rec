@@ -90,6 +90,10 @@ if not exist "%INSTALL_DIR%\config.ini" (
         echo ; 매매 종목군은 대형주와 주요 ETF로 제한됩니다. 종목을 더하거나 빼려면:
         echo add =
         echo remove =
+        echo.
+        echo [strategy]
+        echo ; 화면 손익에서 뺄 편도 수수료 %%. 비우면 미국 0.07 / 국내 0.015
+        echo fee_pct =
     )
 )
 echo    완료

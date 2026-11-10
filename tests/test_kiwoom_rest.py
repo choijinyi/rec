@@ -242,6 +242,78 @@ class UsBalanceSignTest(unittest.TestCase):
         self.assertAlmostEqual(out["NVDA"]["pl_rt"], -5.06, places=2)
 
 
+class OrderFillTest(unittest.TestCase):
+    """실제 체결가 조회(ust21510): 손익을 주문가가 아니라 체결가로 기록한다."""
+
+    def _client(self, rows, key="result_list"):
+        calls = []
+
+        def transport(url, headers, body):
+            calls.append((headers.get("api-id"), body))
+            if url.endswith("/oauth2/token"):
+                return {"token": "T", "expires_dt": ""}
+            return {"return_code": 0, key: rows}
+
+        return KiwoomRestClient("AK", "SK", mock=True, market="us",
+                                transport=transport), calls
+
+    ROWS = [
+        {"ord_no": "000001153", "stk_cd": "SOXL", "slby_tp": "2",
+         "ord_qty": "000000000008", "ord_uv": "55.8600",
+         "cntr_qty": "000000000008", "cntr_uv": "55.8100"},
+        {"ord_no": "000001484", "stk_cd": "SOXL", "slby_tp": "1",
+         "cntr_qty": "000000000005", "cntr_uv": "56.3000"},
+        {"ord_no": "000001484", "stk_cd": "SOXL", "slby_tp": "1",
+         "cntr_qty": "000000000003", "cntr_uv": "56.2800"},
+        {"ord_no": "000002000", "stk_cd": "NVDA", "slby_tp": "2",
+         "cntr_qty": "000000000000", "cntr_uv": "0.0000"},
+    ]
+
+    def test_fill_price_by_order_number(self):
+        client, calls = self._client(self.ROWS)
+        self.assertEqual(client.order_fill("000001153"), (8, 55.81))
+        self.assertEqual(calls[-1][0], "ust21510")
+
+    def test_partial_fills_are_averaged(self):
+        client, _ = self._client(self.ROWS)
+        qty, price = client.order_fill("1484")          # 앞자리 0은 무시
+        self.assertEqual(qty, 8)
+        self.assertAlmostEqual(price, (5 * 56.30 + 3 * 56.28) / 8)
+
+    def test_unfilled_or_unknown_order_is_none(self):
+        client, _ = self._client(self.ROWS)
+        self.assertIsNone(client.order_fill("000002000"))
+        self.assertIsNone(client.order_fill("000009999"))
+
+    def test_reads_list_under_any_key(self):
+        # 명세 예시의 응답 키가 "result_lsit"로 적혀 있어 키 이름에 기대지 않는다
+        client, _ = self._client(self.ROWS, key="result_lsit")
+        self.assertEqual(client.order_fill("000001153"), (8, 55.81))
+
+
+class StrategyConfigTest(unittest.TestCase):
+    def _load(self, text):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.ini")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            return load_config(path)
+
+    def test_fee_defaults_to_unset(self):
+        cfg = self._load("[kiwoom]\nappkey=A\nsecretkey=B\n")
+        self.assertIsNone(cfg["fee_pct"])
+        self.assertIsNone(cfg["sell_tax_pct"])
+
+    def test_fee_override(self):
+        cfg = self._load("[kiwoom]\nappkey=A\nsecretkey=B\n"
+                         "[strategy]\nfee_pct = 0.25 ; 편도\nsell_tax_pct = 0\n")
+        self.assertEqual(cfg["fee_pct"], 0.25)
+        self.assertEqual(cfg["sell_tax_pct"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
