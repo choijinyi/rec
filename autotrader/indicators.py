@@ -2,13 +2,42 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Sequence
+
+GAP_MINUTES = 30      # 봉 사이가 이만큼 비면 장이 쉬었다가 다시 열린 것으로 본다
 
 
 def _pct(now: float, then: float) -> float | None:
     if not now or not then:
         return None
     return round((now / then - 1) * 100, 2)
+
+
+def _parse_time(raw) -> datetime | None:
+    try:
+        return datetime.strptime(str(raw)[:12], "%Y%m%d%H%M")
+    except ValueError:
+        return None
+
+
+def open_gap(rows: Sequence[dict]) -> dict | None:
+    """가장 최근에 장이 쉬었다 열린 지점의 갭.
+
+    {"gap_pct": 쉬기 전 종가 대비 다시 열린 뒤 첫 종가의 변화(%),
+     "bars_since": 다시 열린 뒤 지난 봉 수}. 쉰 구간이 없으면 None.
+    """
+    for i in range(len(rows) - 1, 0, -1):
+        after, before = _parse_time(rows[i].get("t")), _parse_time(rows[i - 1].get("t"))
+        if after is None or before is None:
+            return None
+        if (after - before).total_seconds() / 60 >= GAP_MINUTES:
+            prev, first = float(rows[i - 1]["c"]), float(rows[i]["c"])
+            if prev <= 0:
+                return None
+            return {"gap_pct": round((first / prev - 1) * 100, 2),
+                    "bars_since": len(rows) - i}
+    return None
 
 
 def summarize_bars(bars: Sequence[dict]) -> dict | None:
@@ -42,7 +71,10 @@ def summarize_bars(bars: Sequence[dict]) -> dict | None:
     if five[-1] != close:
         five.append(close)
     digits = 2 if close < 1000 else 0
+    gap = open_gap(rows) or {}
     return {
+        "gap_pct": gap.get("gap_pct"),
+        "bars_since_gap": gap.get("bars_since"),
         "last": close,
         "time": str(last.get("t", ""))[8:12],
         "day_high": max(float(b["h"]) for b in today),

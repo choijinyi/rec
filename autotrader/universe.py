@@ -15,9 +15,10 @@ from __future__ import annotations
 
 from typing import Iterable
 
-# 구분: stock(대형주) / etf(지수·섹터 ETF) / lev(레버리지·인버스 ETF)
-STOCK, ETF, LEVERAGED = "stock", "etf", "lev"
-KIND_LABELS = {STOCK: "대형주", ETF: "ETF", LEVERAGED: "레버리지 ETF"}
+# 구분: stock(대형주) / etf(지수·섹터 ETF) / lev(레버리지 ETF) / inv(인버스 ETF)
+STOCK, ETF, LEVERAGED, INVERSE = "stock", "etf", "lev", "inv"
+KIND_LABELS = {STOCK: "대형주", ETF: "ETF", LEVERAGED: "레버리지 ETF",
+               INVERSE: "인버스 ETF — 기초지수가 내리면 오른다"}
 
 US_STOCKS = """
 AAPL MSFT NVDA AMZN GOOGL GOOG META TSLA AVGO LLY JPM V MA UNH XOM COST WMT
@@ -32,9 +33,14 @@ SPY QQQ IWM DIA VOO IVV VTI XLK XLF XLE XLV XLY XLI XLP XLU XLC SMH SOXX XBI
 KRE GLD SLV TLT HYG EEM EFA FXI KWEB
 """.split()
 
-# 지수형 레버리지·인버스 ETF (단일 종목 레버리지 ETP는 넣지 않는다)
+# 지수형 레버리지 ETF (단일 종목 레버리지 ETP는 넣지 않는다)
 US_LEVERAGED = """
-TQQQ SQQQ SOXL SOXS UPRO SPXU SPXL SPXS TNA TZA QLD SSO TECL
+TQQQ SOXL UPRO SPXL TNA QLD SSO TECL
+""".split()
+
+# 지수형 인버스 ETF — 기초지수가 내릴 때 오른다. 하락장에서도 살 종목이 생긴다
+US_INVERSE = """
+SQQQ SOXS SPXU SPXS TZA SH PSQ SDS QID TECS
 """.split()
 
 KR_STOCKS = """
@@ -50,8 +56,36 @@ KR_ETFS = """
 """.split()
 
 KR_LEVERAGED = """
-122630 114800 252670 233740 251340 462330
+122630 233740 462330
 """.split()
+
+KR_INVERSE = """
+114800 252670 251340
+""".split()
+
+# 같은 기초지수를 따르는 종목 묶음: {묶음: {코드: 방향}} (+1 정방향, -1 인버스).
+# 한 묶음에서는 한 종목만 보유한다 — SOXL과 SOXS를 함께 들면 서로 상쇄되어
+# 수수료만 내고, 같은 방향을 둘 들면 한 지수에 위험이 몰린다
+GROUPS = {
+    "나스닥100": {"QQQ": 1, "TQQQ": 1, "QLD": 1, "SQQQ": -1, "PSQ": -1, "QID": -1},
+    "S&P500": {"SPY": 1, "VOO": 1, "IVV": 1, "UPRO": 1, "SPXL": 1, "SSO": 1,
+               "SPXU": -1, "SPXS": -1, "SH": -1, "SDS": -1},
+    "반도체": {"SMH": 1, "SOXX": 1, "SOXL": 1, "SOXS": -1},
+    "러셀2000": {"IWM": 1, "TNA": 1, "TZA": -1},
+    "기술주": {"XLK": 1, "TECL": 1, "TECS": -1},
+    "코스피200": {"069500": 1, "102110": 1, "122630": 1,
+                 "114800": -1, "252670": -1},
+    "코스닥150": {"229200": 1, "233740": 1, "251340": -1},
+    "2차전지": {"305720": 1, "462330": 1},
+}
+_GROUP_OF = {code: (name, direction)
+             for name, members in GROUPS.items()
+             for code, direction in members.items()}
+
+
+def group_of(code: str) -> tuple[str, int] | None:
+    """종목이 속한 (기초지수 묶음, 방향). 묶음이 없으면 None."""
+    return _GROUP_OF.get(str(code).upper().split("_", 1)[0])
 
 
 def _codes(raw: Iterable[str] | str | None) -> list[str]:
@@ -64,12 +98,18 @@ def _codes(raw: Iterable[str] | str | None) -> list[str]:
 
 def build_universe(market: str, leveraged: bool = True,
                    add: Iterable[str] | str | None = None,
-                   remove: Iterable[str] | str | None = None) -> dict[str, str]:
-    """{종목코드: 구분}. leveraged=False면 레버리지·인버스 ETF를 뺀다."""
+                   remove: Iterable[str] | str | None = None,
+                   inverse: bool | None = None) -> dict[str, str]:
+    """{종목코드: 구분}. leveraged=False면 레버리지·인버스 ETF를 뺀다.
+
+    inverse를 따로 주면 인버스 ETF만 넣거나 뺄 수 있다(기본은 leveraged를 따름).
+    """
+    if inverse is None:
+        inverse = leveraged
     if market == "us":
-        stocks, etfs, lev = US_STOCKS, US_ETFS, US_LEVERAGED
+        stocks, etfs, lev, inv = US_STOCKS, US_ETFS, US_LEVERAGED, US_INVERSE
     else:
-        stocks, etfs, lev = KR_STOCKS, KR_ETFS, KR_LEVERAGED
+        stocks, etfs, lev, inv = KR_STOCKS, KR_ETFS, KR_LEVERAGED, KR_INVERSE
     out: dict[str, str] = {}
     for code in stocks:
         out[code] = STOCK
@@ -78,6 +118,9 @@ def build_universe(market: str, leveraged: bool = True,
     if leveraged:
         for code in lev:
             out[code] = LEVERAGED
+    if inverse:
+        for code in inv:
+            out[code] = INVERSE
     for code in _codes(add):
         out.setdefault(code, STOCK)
     for code in _codes(remove):
