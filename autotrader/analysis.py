@@ -50,7 +50,12 @@ def _series(values: Sequence) -> str:
 def _bars_block(bars: dict | None) -> str:
     if not bars:
         return "  (분봉을 받지 못했다 — 흐름을 확인할 수 없으니 보수적으로 판단할 것)"
+    gap = ""
+    if bars.get("gap_pct") is not None and (bars.get("bars_since_gap") or 99) <= 30:
+        gap = (f"  장이 다시 열리며 갭 {_signed(bars['gap_pct'])} "
+               f"(열린 뒤 {bars['bars_since_gap']}분 경과)\n")
     return (
+        f"{gap}"
         f"  당일 고가 {_num(bars.get('day_high'))} / 저가 {_num(bars.get('day_low'))}"
         f" / VWAP {_num(bars.get('vwap'))} (현재가는 VWAP 대비 "
         f"{_signed(bars.get('vs_vwap_pct'))})\n"
@@ -108,6 +113,13 @@ def _entry_prompt(market: str, num: int, rows: Sequence[dict],
         "분봉에서 보이지 않으면 고르지 않는다.\n"
         f"- 목표가까지의 폭은 손절 폭의 {min_rr}배 이상이어야 한다.\n"
         "- 진입 상한가(max_price)는 이 가격을 넘으면 쫓아 사지 않을 가격이다.\n"
+        "- 인버스 ETF는 기초지수가 내릴 때 오른다. 판단은 그 ETF 자체의 분봉으로 "
+        "똑같이 한다(오르는 흐름의 눌림·돌파). 같은 지수의 정방향과 인버스를 "
+        "함께 고르지 않는다.\n"
+        "- '갭'이 표시된 종목은 장이 방금 다시 열린 것이다. 열린 뒤의 분봉이 갭을 "
+        "지키며 저점·고점을 높이면 진입 후보이고, 갭을 메우며 밀리거나 첫 봉 "
+        "고점을 넘지 못하면 고르지 않는다. 개장 초반은 흔들림이 크므로 손절가는 "
+        "열린 뒤 저점 아래로 넉넉히 잡는다.\n"
         "- 마땅한 자리가 없으면 아무것도 고르지 않는다. 억지로 채우지 않는다.\n\n"
         "출력 형식(JSON 객체 하나만, 다른 글 금지):\n"
         '{"market_view": "지금 장 흐름 한 문장", "decisions": [\n'

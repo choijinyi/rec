@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
 from .indicators import summarize_bars
-from .universe import KIND_LABELS, LEVERAGED
+from .universe import INVERSE, KIND_LABELS, LEVERAGED, group_of
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +190,11 @@ class ScalpConfig:
     trail_pct: float = 0.0
     max_spread_pct: float = 0.3   # 매수·매도 호가 간격이 이보다 넓으면 매수하지 않는다 (0이면 끔)
     open_delay_min: float = 15.0  # 각 장 시작 후 이 시간(분) 동안은 매수하지 않는다
+    # 갭이 큰 날의 조기 판단: 장이 다시 열리며 early_gap_pct 이상 뛰어오른 종목은
+    # 개장 대기를 early_open_min 분으로 줄이고 AI가 초반 분봉을 보고 판단한다.
+    # 그 밖의 종목은 open_delay_min을 그대로 기다린다 (0이면 끔)
+    early_open_min: float = 5.0
+    early_gap_pct: float = 2.0
     max_chase_reentries: int = 1  # 같은 종목을 직전 매수가보다 비싸게 다시 사는 횟수(하루)
     require_ai: bool = True       # AI 판단을 받을 수 없으면 등락률 상위로 대체하지 않고 매수를 쉰다
     # 1회 손실 한도: 손절까지 갔을 때 잃는 금액이 총 투입 금액의 이 %를 넘지
@@ -1109,21 +1114,50 @@ class Scalper:
                 return False                      # 오늘 더 싸게 샀던 종목 추격 금지
             if code in self.positions:
                 return False
+            if self._group_conflict(code):
+                return False                      # 같은 지수는 한 종목만 든다
             until = self._cooldown.get(code)
             return until is None or now >= until  # 쿨다운 중 재매수 금지
 
         return [r for r in rows if ok(r)]
 
+    def _group_conflict(self, code: str) -> str:
+        """같은 기초지수 묶음의 종목을 이미 들고 있으면 그 종목 코드를 돌려준다.
+
+        SOXL과 SOXS처럼 방향이 반대인 둘을 함께 들면 서로 상쇄되어 수수료만
+        내고, 같은 방향 둘은 한 지수에 위험이 몰린다. 본전 감시 종목은 세지
+        않는다.
+        """
+        group = group_of(code)
+        if group is None:
+            return ""
+        for held, pos in self.positions.items():
+            if held == code or pos.watch:
+                continue
+            other = group_of(held)
+            if other is not None and other[0] == group[0]:
+                return held
+        return ""
+
+    def _early_window(self) -> bool:
+        """개장 대기 중이지만 갭이 큰 종목은 먼저 판단해도 되는 구간인가."""
+        cfg = self.config
+        if cfg.early_gap_pct <= 0 or cfg.early_open_min >= cfg.open_delay_min:
+            return False
+        since = self.minutes_since_open()
+        return since is not None and cfg.early_open_min <= since < cfg.open_delay_min
+
     def _shortlist(self, ranked: list[dict], size: int) -> list[dict]:
         """AI에 넘길 후보. 레버리지 ETF는 등락률이 커서 상위를 독차지하므로
         2개까지만 넣어 대형주·일반 ETF가 함께 검토되게 한다."""
         universe = self.config.universe or {}
-        out, leveraged = [], 0
+        out, counts = [], {LEVERAGED: 0, INVERSE: 0}
         for row in ranked:
-            if universe.get(str(row.get("code", "")).upper()) == LEVERAGED:
-                if leveraged >= 2:
+            kind = universe.get(str(row.get("code", "")).upper())
+            if kind in counts:          # 레버리지·인버스 각각 2개까지
+                if counts[kind] >= 2:
                     continue
-                leveraged += 1
+                counts[kind] += 1
             out.append(row)
             if len(out) >= size:
                 break
@@ -1153,6 +1187,13 @@ class Scalper:
                                 row.get("code"), e)
             out.append(item)
         return out
+
+    def _gapped(self, row: dict) -> bool:
+        """장이 다시 열리며 early_gap_pct 이상 뛰어오른 종목인가 (분봉 기준)."""
+        bars = row.get("bars") or {}
+        gap, since = bars.get("gap_pct"), bars.get("bars_since_gap")
+        return (gap is not None and gap >= self.config.early_gap_pct
+                and since is not None and since <= 20)
 
     def _to_plans(self, picked: list, rows: list[dict]) -> list[EntryPlan]:
         """선정 결과(코드 문자열 또는 AI 계획 dict)를 진입 계획으로 맞춘다."""
@@ -1196,6 +1237,9 @@ class Scalper:
             plans: list[EntryPlan] = []
             note = ""
             ai_only = self.selector is not None and self.config.require_ai
+            early = self._early_window()
+            if early and not ai_only:
+                return               # 개장 초반 조기 진입은 AI 판단이 있을 때만
             if self.selector is not None:
                 # AI 필수 모드에서는 예비 후보도 AI가 고른 것만 쓰므로 넉넉히 받는다
                 want = slots + 2 if ai_only else slots
@@ -1203,6 +1247,19 @@ class Scalper:
                     ranked, max(self.config.shortlist_size, want))
                 try:
                     short = self._enrich(short)
+                    if early:
+                        # 개장 대기 중에는 갭이 크게 뜬 종목만 AI에 넘긴다
+                        short = [r for r in short if self._gapped(r)]
+                        if not short:
+                            left = (self.config.open_delay_min
+                                    - (self.minutes_since_open() or 0)) * 60
+                            self._retry_scan_soon(max(30.0, left))
+                            return
+                        self._log("개장 초반 조기 판단: 갭 "
+                                  + ", ".join(f"{r['code']} "
+                                              f"{r['bars']['gap_pct']:+.1f}%"
+                                              for r in short)
+                                  + " — AI가 초반 분봉으로 진입 여부를 본다")
                     picked, note = self.selector(short, want)
                     plans = self._to_plans(picked, short)[:want]
                     self._journal(
@@ -1297,6 +1354,11 @@ class Scalper:
             if filled >= slots:
                 break
             if code in self.positions:
+                continue
+            held = self._group_conflict(code)
+            if held:
+                self._log(f"매수 건너뜀({code}): 같은 지수를 따르는 {held}를 이미 "
+                          f"들고 있다")
                 continue
             if (plan.has_levels and plan.decided_at is not None
                     and (now - plan.decided_at).total_seconds()
@@ -1457,7 +1519,8 @@ class Scalper:
                 self._scan_result = None   # 마감 전에 받아 둔 선정은 버린다
             return False
         since = self.minutes_since_open()
-        if since is not None and since < self.config.open_delay_min:
+        if (since is not None and since < self.config.open_delay_min
+                and not self._early_window()):
             if self.halt_reason != "개장 직후 대기":
                 self.halt_reason = "개장 직후 대기"
                 self._log(f"{self.session()} 시작 {self.config.open_delay_min:.0f}분 "
@@ -1481,7 +1544,9 @@ class Scalper:
                 self._log(f"당일 매매 횟수 한도({self.config.max_trades_per_day}회) "
                           f"도달 — 신규 매수를 중단한다")
             return False
-        self.halt_reason = ""      # 모든 제한이 풀렸다
+        # 모든 제한이 풀렸다. 개장 대기 중의 조기 판단 구간은 상태로 알린다
+        self.halt_reason = ("개장 초반 — 갭 큰 종목만 판단"
+                            if self._early_window() else "")
         return True
 
     # ── 계좌 보유 편입 / 수동 청산 (UI 요청) ────────────────

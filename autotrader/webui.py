@@ -351,7 +351,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
 .fixed{color:var(--dim);font-size:12px;align-self:flex-end;padding-bottom:8px}
 </style></head><body>
 <h1>AutoTrader AI 단타 <span id="modeBadge" class="badge mock">모의투자</span></h1>
-<div class="sub">대형주·주요 ETF만 매매 · AI(Opus 5.5)가 분봉을 보고 진입·청산 시점 판단 · 1회 손실 한도에 맞춰 수량 결정 · 장 시작 15분 뒤~마감 1시간 전</div>
+<div class="sub">대형주·주요 ETF(인버스 포함)만 매매 · AI(Opus 5.5)가 분봉을 보고 진입·청산 시점 판단 · 1회 손실 한도에 맞춰 수량 결정 · 장 시작 15분 뒤(갭 큰 종목은 5분 뒤)~마감 1시간 전</div>
 
 <div class="row">
   <select id="market"><option value="kr">국내주식</option><option value="us">미국주식</option></select>
@@ -359,7 +359,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <span><label>최대 손절 %</label><br><input id="stop" value="2" size="4" title="AI가 종목마다 손절가를 정하되, 매수가에서 이 폭보다 멀리 두지 못합니다. 손절가에 닿으면 무조건 전량 매도"></span>
   <span><label>1회 손실 한도 %</label><br><input id="risk" value="0.5" size="4" title="한 번 손절했을 때 잃는 금액이 총 투입 금액의 이 %를 넘지 않게 수량을 정합니다"></span>
   <label title="켜면 AI 판단을 받을 수 없을 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 판단 필수</label>
-  <label title="TQQQ·SOXL 같은 지수형 레버리지·인버스 ETF를 후보에 넣습니다"><input type="checkbox" id="lev" checked> 레버리지 ETF 포함</label>
+  <label title="TQQQ·SOXL 같은 지수형 레버리지 ETF와, 지수가 내릴 때 오르는 인버스 ETF(SQQQ·SOXS 등)를 후보에 넣습니다. 같은 지수의 정방향과 인버스를 함께 들지는 않습니다"><input type="checkbox" id="lev" checked> 레버리지·인버스 ETF 포함</label>
   <span><label>동시 종목</label><br><input id="maxpos" value="2" size="3"></span>
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>

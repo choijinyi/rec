@@ -170,10 +170,18 @@ class SpreadFilterTest(unittest.TestCase):
 class OpenDelayTest(unittest.TestCase):
     def test_no_buy_right_after_open(self):
         api = FakeAPI({"AAA": 100.0}, ROWS)
-        trader = make(api, hour=9, minute=5)     # 정규장 시작 5분 뒤
+        trader = make(api, hour=9, minute=3)     # 정규장 시작 3분 뒤
         scan(trader)
         self.assertEqual(api.orders, [])
         self.assertEqual(trader.halt_reason, "개장 직후 대기")
+
+    def test_no_buy_in_early_window_without_gap(self):
+        # 5~15분: 갭이 큰 종목만 조기 판단한다. 갭이 확인되지 않으면 사지 않는다
+        api = FakeAPI({"AAA": 100.0}, ROWS)
+        trader = make(api, hour=9, minute=6)
+        scan(trader)
+        self.assertEqual(api.orders, [])
+        self.assertEqual(trader.halt_reason, "개장 초반 — 갭 큰 종목만 판단")
 
     def test_buy_after_delay(self):
         api = FakeAPI({"AAA": 100.0}, ROWS)
