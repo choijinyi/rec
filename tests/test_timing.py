@@ -450,6 +450,42 @@ class PersistenceAndJournalTest(unittest.TestCase):
         self.assertEqual(rows[2]["reason"], "손절")
 
 
+class AfterMarketTest(unittest.TestCase):
+    """애프터마켓에서는 새로 사지 않는다 (키움은 일찍 끝나 팔 길이 막힌다)."""
+
+    AFTER_UTC = datetime(2025, 11, 6, 22, 0, tzinfo=timezone.utc)   # ET 17:00
+
+    def _trader(self, **kw):
+        api = FakeAPI({"NVDA": 200.0}, [NVDA])
+        trader = make(api, plans=[plan()], **kw)
+        trader.utc_clock = lambda: self.AFTER_UTC
+        return trader, api
+
+    def test_no_entries_in_after_market(self):
+        trader, api = self._trader()
+        self.assertEqual(trader.session(), "애프터마켓")
+        scan(trader)
+        self.assertEqual(api.orders, [])
+        self.assertEqual(trader.halt_reason, "애프터마켓 매수 안 함")
+        self.assertEqual(
+            sum("애프터마켓에서는 새로 사지 않는다" in e for e in trader.events), 1)
+
+    def test_positions_are_still_managed(self):
+        trader, api = self._trader()
+        trader.utc_clock = lambda: US_OPEN_UTC          # 정규장에서 매수
+        scan(trader)
+        self.assertIn("NVDA", trader.positions)
+        trader.utc_clock = lambda: self.AFTER_UTC       # 애프터마켓으로 넘어감
+        api.prices["NVDA"] = 197.0
+        trader.step()
+        self.assertEqual(trader.trades[-1].reason, "손절")
+
+    def test_can_be_enabled(self):
+        trader, api = self._trader(us_after_entries=True)
+        scan(trader)
+        self.assertEqual([o[:2] for o in api.orders], [("NVDA", "buy")])
+
+
 class DefaultsTest(unittest.TestCase):
     def test_risk_defaults(self):
         cfg = ScalpConfig()

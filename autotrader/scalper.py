@@ -231,6 +231,9 @@ class ScalpConfig:
     allow_real: bool = False
     us_day_session: bool = True
     us_extended: bool = True      # 미국 프리마켓·애프터마켓 매매
+    # 애프터마켓에서는 새로 사지 않는다. 키움은 애프터마켓이 일찍 끝나고
+    # (한국 08시 무렵) 주간거래(10시)까지 거래가 비어, 산 뒤 팔 길이 막힌다
+    us_after_entries: bool = False
     kr_extended: bool = True      # 국내 장전·장후(NXT) 매매
     min_price: float | None = None  # None이면 미국 $5 / 국내 1,000원
     # 유동성 하한 — 저유동성 종목은 매도가 안 받아져 손절이 불가능해지므로
@@ -1435,6 +1438,14 @@ class Scalper:
     # ── 일일 안전장치 ─────────────────────────────────────
     def _entries_allowed(self) -> bool:
         if self._entry_pause_until and self.clock() < self._entry_pause_until:
+            return False
+        if (self.config.market == "us" and not self.config.us_after_entries
+                and self.session() == "애프터마켓"):
+            if self.halt_reason != "애프터마켓 매수 안 함":
+                self.halt_reason = "애프터마켓 매수 안 함"
+                self._log("애프터마켓에서는 새로 사지 않는다 (다음 장에 재개)")
+            with self._scan_lock:
+                self._scan_result = None
             return False
         left = self.minutes_to_close()
         if left is not None and left <= self.config.entry_cutoff_min:
