@@ -54,11 +54,23 @@ def _bars_block(bars: dict | None) -> str:
     if bars.get("gap_pct") is not None and (bars.get("bars_since_gap") or 99) <= 30:
         gap = (f"  장이 다시 열리며 갭 {_signed(bars['gap_pct'])} "
                f"(열린 뒤 {bars['bars_since_gap']}분 경과)\n")
+    window = bars.get("window_min")
+    span = f"이번 장 최근 {window}분" if window else "이번 장"
+    shape = ""
+    if len(bars.get("closes_30m") or []) >= 3:
+        shape = (f"  30분 간격 종가(오래된→최근): "
+                 f"{_series(bars.get('closes_30m'))}\n")
     return (
         f"{gap}"
-        f"  당일 고가 {_num(bars.get('day_high'))} / 저가 {_num(bars.get('day_low'))}"
-        f" / VWAP {_num(bars.get('vwap'))} (현재가는 VWAP 대비 "
-        f"{_signed(bars.get('vs_vwap_pct'))})\n"
+        f"  {span}: 고가 {_num(bars.get('day_high'))} / 저가 "
+        f"{_num(bars.get('day_low'))} / VWAP {_num(bars.get('vwap'))}\n"
+        f"  현재가 위치: VWAP 대비 {_signed(bars.get('vs_vwap_pct'))} / 그 구간 "
+        f"고가 대비 {_signed(bars.get('off_high_pct'))} / 저가 대비 "
+        f"{_signed(bars.get('from_low_pct'))} / 구간 시작 대비 "
+        f"{_signed(bars.get('from_start_pct'))}"
+        + (f" / 직전 장 종가 대비 {_signed(bars.get('from_prior_pct'))}"
+           if bars.get("from_prior_pct") is not None else "") + "\n"
+        f"{shape}"
         f"  최근 5분 {_signed(bars.get('ret_5m'))} / 15분 "
         f"{_signed(bars.get('ret_15m'))} / 60분 {_signed(bars.get('ret_60m'))}"
         f" / 1분봉 평균 변동폭 {bars.get('avg_range_pct', '?')}%\n"
@@ -87,25 +99,64 @@ def _entry_prompt(market: str, num: int, rows: Sequence[dict],
     min_stop = ctx.get("min_stop_pct", 0.4)
     min_rr = ctx.get("min_rr", 1.2)
     min_target = ctx.get("min_target_pct", 1.0)
+    trend = ctx.get("trend_entries", True)
     blocks = []
     for r in rows:
         kind = f" ({r['kind']})" if r.get("kind") else ""
+        peers = (f"\n  같은 지수({r['group']})를 따르는 종목의 당일 등락률: "
+                 f"{r['peers']}" if r.get("peers") else "")
         blocks.append(
             f"[{r.get('code', '?')}] {r.get('name', '')}{kind} | 현재가 "
-            f"{r.get('price', '?')} | 당일 등락률 {r.get('change_pct', '?')}% | "
-            f"거래량 {r.get('volume', '?')}\n{_bars_block(r.get('bars'))}")
+            f"{r.get('price', '?')} | 당일 등락률(전일 종가 대비) "
+            f"{r.get('change_pct', '?')}% | 거래량 {r.get('volume', '?')}"
+            f"{peers}\n{_bars_block(r.get('bars'))}")
     body = "\n\n".join(blocks)
+    view = str(ctx.get("view") or "").strip()
+    view_block = ""
+    if view:
+        view_block = (
+            f"운용자의 오늘 관점(참고): {view[:300]}\n"
+            "이 관점은 어느 방향의 종목을 먼저 볼지 정하는 데만 쓴다. 분봉이 그 "
+            "방향을 확인해 줄 때만 진입하고, 분봉이 반대로 가면 따르지 않는다.\n\n")
+    if trend:
+        trend_rules = (
+            "- [추세 추종] 당일 등락률이 크고(대략 +3% 이상) 이번 장이 열린 뒤 "
+            "VWAP 위에서 종가의 저점과 고점이 함께 높아지는 종목은, VWAP에서 "
+            "멀리 떨어져 있어도 진입 후보다. 장이 열린 지 얼마 안 돼 봉이 적으면 "
+            "열린 뒤 저점을 높이며 직전 고점을 넘는지로 판단한다(직전 장의 "
+            "흐름은 조건에 넣지 않는다). 같은 지수 종목의 등락률이 "
+            "이 방향을 뒷받침하면(예: 인버스가 오르는데 정방향은 크게 내림) 더 "
+            "믿을 만하다. 이때는 mode를 \"trend\"로 답하고, 손절가는 최근 "
+            "5~10분의 눌림 저점 바로 아래에, 목표가는 손절 폭의 1.5배 이상으로 "
+            "잡는다. 프로그램은 목표가에서 절반을 팔고 나머지는 고점을 따라가며 "
+            "판다(그러니 목표가는 첫 번째 이익 확정 지점으로 잡으면 된다).\n"
+            "- 추세가 강한 날은 깊은 눌림이 오지 않는다. 0.5~1% 정도의 얕은 "
+            "눌림 뒤 다시 고점을 넘거나, 잠깐 쉬었다가 거래량이 붙어 고점을 "
+            "넘는 순간이면 진입하기에 충분하다. VWAP까지 내려오기를 기다리다 "
+            "추세 전체를 놓치지 않는다.\n"
+            "- 추세 추종이라도 다음은 고르지 않는다: 직전 한두 개 봉이 유난히 "
+            "크게 뛰어 그 꼭대기에 있는 순간(다음 판단 때 얕은 눌림이나 재돌파를 "
+            "확인하고 산다), 구간 고가에서 이미 3% 넘게 밀려 식어 가는 중, 고점을 "
+            "다시 넘지 못하고 거래량이 줄어드는 중.\n"
+            "- 추세 조건에 들지 않는데 VWAP에서 멀리 달아난 종목, 흐름이 꺾여 "
+            "내려오는 종목, 변동폭이 너무 작아 목표에 닿기 어려운 종목은 고르지 "
+            "않는다.\n")
+    else:
+        trend_rules = (
+            "- VWAP에서 이미 멀리 달아난 종목, 방금 급등해 꼭지일 수 있는 종목, "
+            "흐름이 꺾여 내려오는 종목, 변동폭이 너무 작아 목표에 닿기 어려운 "
+            "종목은 고르지 않는다.\n")
     return (
         f"{'미국' if market == 'us' else '국내'} 주식 단타 진입 판단을 요청한다. "
         f"{_context_block(ctx)}.\n"
         f"후보는 모두 대형주·주요 ETF이며, 지금 비어 있는 자리는 {num}개다.\n\n"
+        f"{view_block}"
         f"{body}\n\n"
         "판단 기준:\n"
-        "- 장중 상승 흐름 속의 눌림(VWAP·직전 지지 부근)이나 거래량이 붙는 "
-        "돌파처럼, 손절 위치가 분명하고 가까운 자리만 '진입'으로 고른다.\n"
-        "- VWAP에서 이미 멀리 달아난 종목, 방금 급등해 꼭지일 수 있는 종목, "
-        "흐름이 꺾여 내려오는 종목, 변동폭이 너무 작아 목표에 닿기 어려운 "
-        "종목은 고르지 않는다.\n"
+        "- [눌림·돌파] 장중 상승 흐름 속의 눌림(VWAP·직전 지지 부근)이나 "
+        "거래량이 붙는 돌파처럼, 손절 위치가 분명하고 가까운 자리를 '진입'으로 "
+        "고른다. 이때는 mode를 \"pullback\"으로 답한다.\n"
+        f"{trend_rules}"
         f"- 손절가는 현재가보다 {min_stop}%~{max_stop}% 아래에서, 최근 저점 등 "
         "가격 구조가 무너지는 자리로 잡는다.\n"
         f"- 목표가는 현재가보다 최소 {min_target}% 위여야 한다(수수료와 호가 "
@@ -120,11 +171,14 @@ def _entry_prompt(market: str, num: int, rows: Sequence[dict],
         "지키며 저점·고점을 높이면 진입 후보이고, 갭을 메우며 밀리거나 첫 봉 "
         "고점을 넘지 못하면 고르지 않는다. 개장 초반은 흔들림이 크므로 손절가는 "
         "열린 뒤 저점 아래로 넉넉히 잡는다.\n"
-        "- 마땅한 자리가 없으면 아무것도 고르지 않는다. 억지로 채우지 않는다.\n\n"
+        "- 위 두 유형 가운데 어느 쪽에도 들지 않으면 고르지 않는다. 억지로 "
+        "채우지 않되, 조건이 맞는 자리를 지나치게 까다롭게 걸러 놓치지도 않는다."
+        "\n\n"
         "출력 형식(JSON 객체 하나만, 다른 글 금지):\n"
         '{"market_view": "지금 장 흐름 한 문장", "decisions": [\n'
-        '  {"code": "종목코드", "action": "enter", "max_price": 숫자, '
-        '"stop": 숫자, "target": 숫자, "reason": "근거 한두 문장"},\n'
+        '  {"code": "종목코드", "action": "enter", "mode": "pullback", '
+        '"max_price": 숫자, "stop": 숫자, "target": 숫자, '
+        '"reason": "근거 한두 문장"},\n'
         '  {"code": "종목코드", "action": "wait", "reason": "기다리는 이유"}\n'
         "]}\n"
         f'action은 enter / wait / skip 중 하나. enter는 최대 {num}개, 좋은 '
@@ -261,15 +315,19 @@ def parse_entry_plans(text: str, valid_codes: Sequence[str],
         if action in _ACTIONS_ENTER:
             if any(p["code"] == code for p in plans) or len(plans) >= num:
                 continue
+            mode = ("trend" if str(item.get("mode") or "").strip().lower()
+                    in ("trend", "추세", "추세 추종") else "pullback")
             plan = {"code": code, "max_price": _to_float(item.get("max_price")),
                     "stop": _to_float(item.get("stop")),
-                    "target": _to_float(item.get("target")), "reason": reason}
+                    "target": _to_float(item.get("target")), "reason": reason,
+                    "mode": mode}
             plans.append(plan)
             levels = " / ".join(
                 f"{label} {_num(plan[key])}" for label, key in
                 (("상한", "max_price"), ("손절", "stop"), ("목표", "target"))
                 if plan[key])
-            lines.append(f"진입 {code}" + (f" ({levels})" if levels else "")
+            lines.append(f"진입{'(추세)' if mode == 'trend' else ''} {code}"
+                         + (f" ({levels})" if levels else "")
                          + (f" — {reason}" if reason else ""))
         else:
             label = "대기" if action == "wait" else "제외"

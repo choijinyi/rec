@@ -348,3 +348,28 @@ class TimingWiringTest(unittest.TestCase):
         custom = self._state("[strategy]\nfee_pct = 0.25\n")
         custom.start(market="us", target_pct="2", max_positions="2", cash="1000")
         self.assertEqual(custom.trader.config.fee_pct, 0.25)
+
+    def test_view_and_trend_toggle_reach_the_ai(self):
+        state = self._state()
+        seen = {}
+
+        class FakeAnalyst:
+            label = "AI"
+
+            def plan_entries(self, market, rows, num, context=None):
+                seen.update(context)
+                return [], ""
+
+        state.cli_analyst_factory = lambda **kw: FakeAnalyst()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000",
+                    trend=False, view="  반도체 약세 예상, SOXS 우선  ")
+        self.assertFalse(state.trader.config.trend_entries)
+        state.trader.selector([{"code": "NVDA", "price": "100"}], 1)
+        self.assertEqual(seen["view"], "반도체 약세 예상, SOXS 우선")
+        self.assertFalse(seen["trend_entries"])
+        self.assertEqual(state.params["view"], "반도체 약세 예상, SOXS 우선")
+
+    def test_trend_is_on_by_default(self):
+        state = self._state()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        self.assertTrue(state.trader.config.trend_entries)

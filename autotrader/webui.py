@@ -98,7 +98,8 @@ class AppState:
     # ── 실행 제어 ──────────────────────────────────────────
     def start(self, market: str, target_pct, max_positions, cash,
               confirm: str = "", stop_pct=2.0, require_ai: bool = True,
-              risk_pct=0.5, leveraged: bool = True) -> dict:
+              risk_pct=0.5, leveraged: bool = True,
+              trend: bool = True, view: str = "") -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -127,6 +128,7 @@ class AppState:
                     stop_pct=_parse_float(stop_pct, "손절 %"),
                     risk_pct=_parse_float(risk_pct, "1회 손실 한도 %"),
                     universe=universe,
+                    trend_entries=bool(trend),
                     require_ai=bool(require_ai),
                     max_positions=_parse_int(max_positions, "동시 종목 수"),
                     total_cash=_parse_float(cash, "총 투입 금액"),
@@ -146,6 +148,8 @@ class AppState:
                            "min_rr": scalp_cfg.min_rr,
                            "min_target_pct": scalp_cfg.min_target_pct,
                            "tighten_gap_pct": scalp_cfg.tighten_gap_pct,
+                           "trend_entries": scalp_cfg.trend_entries,
+                           "view": str(view or "").strip()[:300],
                            "stale_min": scalp_cfg.stale_min}
                     running = holder.get("trader")
                     if running is not None:
@@ -191,6 +195,8 @@ class AppState:
                            "stop_pct": scalp_cfg.stop_pct,
                            "risk_pct": scalp_cfg.risk_pct,
                            "fee_pct": scalp_cfg.fee_pct,
+                           "trend": scalp_cfg.trend_entries,
+                           "view": str(view or "").strip()[:300],
                            "universe": (len(universe) if universe is not None
                                         else None),
                            "require_ai": scalp_cfg.require_ai,
@@ -360,12 +366,14 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <span><label>1회 손실 한도 %</label><br><input id="risk" value="0.5" size="4" title="한 번 손절했을 때 잃는 금액이 총 투입 금액의 이 %를 넘지 않게 수량을 정합니다"></span>
   <label title="켜면 AI 판단을 받을 수 없을 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 판단 필수</label>
   <label title="TQQQ·SOXL 같은 지수형 레버리지 ETF와, 지수가 내릴 때 오르는 인버스 ETF(SQQQ·SOXS 등)를 후보에 넣습니다. 같은 지수의 정방향과 인버스를 함께 들지는 않습니다"><input type="checkbox" id="lev" checked> 레버리지·인버스 ETF 포함</label>
+  <label title="당일 크게 오르며 VWAP 위에서 저점을 높이는 종목은 눌림을 기다리지 않고 따라 살 수 있게 합니다. 이렇게 산 종목은 목표가에서 절반만 팔고 나머지는 고점에서 1.5% 밀릴 때 팝니다. 추세가 이어지지 않는 날에는 손절이 늘 수 있습니다"><input type="checkbox" id="trend" checked> 추세 추종 진입</label>
   <span><label>동시 종목</label><br><input id="maxpos" value="2" size="3"></span>
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>
   <button class="primary" onclick="start()">시작</button>
   <button class="danger" onclick="stopT()">중지</button>
 </div>
+<div class="row"><span style="flex:1"><label>오늘의 관점 (선택)</label><br><input id="view" style="width:100%" maxlength="300" placeholder="예: 반도체 약세 예상, SOXS 쪽을 먼저 본다" title="AI가 어느 방향의 종목을 먼저 볼지 정할 때 참고합니다. 분봉이 그 방향을 확인해 줄 때만 진입합니다"></span></div>
 <div class="warn" id="msg"></div>
 
 <div class="grid">
@@ -410,6 +418,7 @@ async function start(){
   const r=await api("/api/start",{market:$("market").value,
     target_pct:$("target").value.trim(),stop_pct:$("stop").value.trim(),
     risk_pct:$("risk").value.trim(),leveraged:$("lev").checked,
+    trend:$("trend").checked,view:$("view").value.trim(),
     require_ai:$("needAI").checked,max_positions:$("maxpos").value.trim(),
     cash:$("cash").value.trim(),confirm:$("confirm").value.trim()});
   $("msg").textContent=r.error||"AI 단타 시작 - 장중에 대형주·주요 ETF에서 진입 시점을 판단해 매매합니다";
@@ -544,6 +553,8 @@ class Handler(BaseHTTPRequestHandler):
                     require_ai=bool(body.get("require_ai", True)),
                     risk_pct=body.get("risk_pct", 0.5),
                     leveraged=bool(body.get("leveraged", True)),
+                    trend=bool(body.get("trend", True)),
+                    view=str(body.get("view", "")),
                     max_positions=body.get("max_positions", 2),
                     cash=body.get("cash"),
                     confirm=body.get("confirm", ""),
