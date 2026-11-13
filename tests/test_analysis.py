@@ -52,7 +52,8 @@ class ParseEntryPlansTest(unittest.TestCase):
         plans, note = parse_entry_plans(ENTRY_JSON, self.VALID, 2)
         self.assertEqual(plans, [{"code": "NVDA", "max_price": 201.8,
                                   "stop": 200.3, "target": 203.6,
-                                  "reason": "VWAP 눌림 뒤 재상승"}])
+                                  "reason": "VWAP 눌림 뒤 재상승",
+                                  "mode": "pullback"}])
         self.assertIn("장 흐름", note)
         self.assertIn("진입 NVDA", note)
         self.assertIn("대기 SPY", note)

@@ -40,10 +40,13 @@ def open_gap(rows: Sequence[dict]) -> dict | None:
     return None
 
 
-def summarize_bars(bars: Sequence[dict]) -> dict | None:
+def summarize_bars(bars: Sequence[dict],
+                   session_min: float | None = None) -> dict | None:
     """1분봉(오래된 것→최근)을 요약한다.
 
     bars 원소: {"t": "YYYYMMDDHHMMSS", "o", "h", "l", "c", "v"}.
+    session_min: 이번 장이 열린 뒤 지난 시간(분). 주면 그만큼의 봉만 "이번 장"으로
+    본다 (프리마켓과 정규장처럼 봉이 끊기지 않고 이어지는 장을 가르기 위해서다).
     쓸 만한 봉이 5개 미만이면 None.
     """
     rows = [b for b in bars if b.get("c")]
@@ -51,8 +54,14 @@ def summarize_bars(bars: Sequence[dict]) -> dict | None:
         return None
     last = rows[-1]
     close = float(last["c"])
-    day = str(last.get("t", ""))[:8]
-    today = [b for b in rows if str(b.get("t", ""))[:8] == day] or rows
+    # 이번 장의 봉만 쓴다: 장이 쉬었다 열린 지점(30분 이상 공백) 뒤부터.
+    # 공백이 없으면 받은 봉 전체가 한 장이다
+    gap = open_gap(rows) or {}
+    since = gap.get("bars_since")
+    today = rows[-since:] if since and since >= 5 else rows
+    if session_min is not None and session_min >= 1:
+        today = today[-max(5, int(session_min) + 1):]
+    before = rows[:len(rows) - len(today)]
 
     volume = sum(float(b.get("v") or 0) for b in today)
     if volume > 0:
@@ -71,14 +80,26 @@ def summarize_bars(bars: Sequence[dict]) -> dict | None:
     if five[-1] != close:
         five.append(close)
     digits = 2 if close < 1000 else 0
-    gap = open_gap(rows) or {}
+    high = max(float(b["h"]) for b in today)
+    low = min(float(b["l"]) for b in today)
+    # 장 전체의 모양: 30분 간격 종가 (최근 90분만 보면 큰 흐름을 놓친다)
+    half_hour = [float(b["c"]) for b in today[::-1][::30]][::-1]
     return {
         "gap_pct": gap.get("gap_pct"),
         "bars_since_gap": gap.get("bars_since"),
         "last": close,
         "time": str(last.get("t", ""))[8:12],
-        "day_high": max(float(b["h"]) for b in today),
-        "day_low": min(float(b["l"]) for b in today),
+        "day_high": high,
+        "day_low": low,
+        "window_min": len(today),          # 위 고가·저가·VWAP을 계산한 구간(분)
+        # 이번 장이 열리기 직전 가격 (직전 장의 마지막 종가)
+        "prior_close": float(before[-1]["c"]) if before else None,
+        "from_prior_pct": _pct(close, float(before[-1]["c"])) if before else None,
+        "from_start_pct": _pct(close, float(today[0]["o"] if today[0].get("o")
+                                            else today[0]["c"])),
+        "off_high_pct": _pct(close, high),
+        "from_low_pct": _pct(close, low),
+        "closes_30m": [round(c, digits) for c in half_hour[-14:]],
         "vwap": round(vwap, 4),
         "vs_vwap_pct": _pct(close, vwap),
         "ret_5m": _pct(close, ago(5)),
