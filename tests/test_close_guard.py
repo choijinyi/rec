@@ -66,7 +66,7 @@ def make(hour, minute=0, **kw):
     cfg = dict(market="kr", max_positions=1, total_cash=1_000_000,
                scan_interval=99999.0,
                target_pct=1.5, stop_pct=3.0, trail_pct=0, open_delay_min=0,
-               risk_pct=0)
+               risk_pct=0, ladder_steps=1)
     cfg.update(kw)
     api = FakeAPI({"AAA": 10_000}, ROWS)
     trader = Scalper(api=api, config=ScalpConfig(**cfg),

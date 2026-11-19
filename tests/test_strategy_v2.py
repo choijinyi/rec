@@ -49,7 +49,7 @@ def make(api, hour=10, minute=0, selector="AAA", **kw):
     clock = {"now": datetime(2026, 11, 9, hour, minute)}      # 월요일, 국내
     cfg = dict(market="kr", max_positions=1, total_cash=100_000,
                scan_interval=99999.0, min_dollar_volume=0, min_price=1,
-               risk_pct=0)
+               risk_pct=0, ladder_steps=1)
     cfg.update(kw)
     if isinstance(selector, str):
         code = selector

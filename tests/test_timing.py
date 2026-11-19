@@ -57,7 +57,7 @@ def make(api, plans=None, reviewer=None, journal_path=None, state_path=None,
     clock = {"now": datetime(2025, 10, 7, 0, 0)}
     cfg = dict(market="us", max_positions=2, total_cash=10_000,
                scan_interval=99999.0, open_delay_min=0, max_spread_pct=0,
-               universe=build_universe("us"))
+               universe=build_universe("us"), ladder_steps=1)
     cfg.update(kw)
 
     def selector(rows, n):

@@ -267,6 +267,13 @@ class ScalpConfig:
     exit_slip_pct: float = 0.5      # 청산 매도 지정가를 현재가에서 이 %보다 낮추지 않는다
     chase_step_pct: float = 0.3     # 추격 매도 회차마다 현재가 대비 낮추는 폭(%)
     chase_max_pct: float = 2.0      # 추격 매도 최대 할인 폭(%)
+    # 분할 매매(계단식): 계획 수량을 ladder_steps로 나눠 첫 몫만 지금 사고,
+    # 나머지는 가격이 손절 폭의 1/3·2/3만큼 내려올 때 한 몫씩 더 산다. 손절가는
+    # 그대로 두고, 전부 체결된 뒤 손절돼도 1회 손실 한도를 넘지 않게 수량을
+    # 잡는다. 팔 때도 목표의 절반 지점에서 1/3, 목표가에서 1/3을 팔고 나머지는
+    # 고점을 따라가며 판다. 1이면 나누지 않는다(한 번에 사고 한 번에 판다).
+    ladder_steps: int = 3
+    add_retry_sec: float = 60.0     # 추가 매수가 안 받아졌을 때 다시 내기까지
 
 
 @dataclass
@@ -337,21 +344,52 @@ class Position:
     scale_price: float = 0.0
     scale_sent_at: dt.datetime | None = None
     scale_unconfirmed: int = 0
+    scale_label: str = "절반 익절"
+    tp_stage: int = 0            # 분할 익절 단계 (0 없음 / 1 절반 지점 / 2 목표가)
+    # 분할 매수: 아직 사지 않은 몫 [[발동 가격, 수량], …] — 높은 가격부터
+    adds: list = field(default_factory=list)
+    ladder_n: int = 1            # 계획한 분할 횟수
+    add_pending: bool = False
+    add_order: str = ""
+    add_qty: int = 0
+    add_price: float = 0.0
+    add_sent_at: dt.datetime | None = None
+    add_unconfirmed: int = 0
+    add_plan: list = field(default_factory=list)   # 지금 주문 중인 몫 (미체결 시 복구)
+    add_retry_at: dt.datetime | None = None
+    # 추가 매수 주문이 체결 없이 사라진 것으로 보였던 수량 — 잔고 반영이 늦었던
+    # 것이면 나중에 장부에 넣는다 (아무도 감시하지 않는 보유가 생기지 않게)
+    add_missed: int = 0
+    add_missed_price: float = 0.0
 
     def state(self) -> str:
         if self.entry_pending:
             return "매수 체결 확인 중"
         if self.exit_pending:
             return f"{self.exit_reason} 매도 체결 대기({self.exit_attempts}차)"
+        if self.add_pending:
+            return "추가 매수 체결 확인 중"
         if self.scale_pending:
-            return "절반 익절 체결 대기"
+            return f"{self.scale_label} 체결 대기"
         if self.scaled and not self.watch:
-            return "절반 익절 후 추적 중"
+            return ("분할 익절 후 추적 중" if self.tp_stage
+                    else "절반 익절 후 추적 중")
         if self.watch:
             return "본전 감시 중"
         if self.trailing:
             return "추적 익절 중"
+        if self.tp_stage == 1:
+            return "1차 익절 후 보유"
+        if self.adds:
+            done = self.ladder_n - len(self.adds)
+            return f"보유 (분할 매수 {done}/{self.ladder_n})"
         return "편입 보유" if self.adopted else "보유"
+
+    @property
+    def busy(self) -> bool:
+        """주문 체결을 확인하는 중 — 끝날 때까지 다른 주문을 내지 않는다."""
+        return (self.entry_pending or self.exit_pending or self.scale_pending
+                or self.add_pending)
 
     def pct(self, price: float | None = None) -> float:
         p = price if price is not None else self.last_price
@@ -520,6 +558,40 @@ class Scalper:
             quantity = min(quantity, risk_qty)
         return quantity
 
+    def _ladder_plan(self, code: str, price: float, stop: float) -> list[list]:
+        """계단식 분할 매수 계획 [[가격, 수량], …]. 첫 칸이 지금 살 몫이다.
+
+        k번째 몫은 가격이 손절 폭의 k/n만큼 내려왔을 때 산다. 전부 체결된 뒤
+        손절가에 닿아도 손실이 1회 손실 한도 안에 들도록 총 수량을 잡는다.
+        수량이 분할 횟수보다 적으면 그만큼만 나눈다(1주면 나누지 않는다).
+        """
+        cfg = self.config
+        steps = max(1, min(int(cfg.ladder_steps), 5))
+        dist = price - stop
+        if steps < 2 or dist <= 0:
+            quantity = self._size(code, price, stop)
+            return [[price, quantity]] if quantity >= 1 else []
+        total = int(min(self._per_slot_budget(), self.cash) // price)
+        if total < 1:
+            self._log(f"{code} 매수 건너뜀: 1주 금액({price:,.2f})이 슬롯 예산보다 크다")
+            return []
+        allowed = (cfg.total_cash * cfg.risk_pct / 100 if cfg.risk_pct > 0
+                   else None)
+        while total >= 1:
+            n = min(steps, total)
+            base, extra = divmod(total, n)
+            # 나누어떨어지지 않는 몫은 먼저 사는 쪽에 준다
+            plan = [[round(price - dist * i / n, 4), base + (1 if i < extra else 0)]
+                    for i in range(n)]
+            risk = sum(q * (p - stop) for p, q in plan)
+            if allowed is None or risk <= allowed + 1e-9:
+                return plan
+            total -= 1
+        self._cooldown[code] = self.clock() + dt.timedelta(minutes=30)
+        self._log(f"{code} 매수 건너뜀: 1주만 사도 손절 시 손실"
+                  f"({dist:,.2f})이 1회 손실 한도({allowed:,.2f})를 넘는다")
+        return []
+
     def _journal(self, kind: str, **data) -> None:
         """AI 판단과 매매 결과를 한 줄씩 남긴다 (나중에 판단 품질을 복기하는 용도)."""
         if not self.journal_path:
@@ -677,9 +749,10 @@ class Scalper:
             self._log(f"매수 건너뜀({code}): {levels}")
             return False
         stop, target = levels
-        quantity = self._size(code, price, stop)
-        if quantity < 1:
+        ladder = self._ladder_plan(code, price, stop)
+        if not ladder:
             return False
+        quantity = ladder[0][1]
         ord_no = self._order(code, "buy", quantity, limit_price=limit)
         self._note_entry(code, price)
         now = self.clock()
@@ -688,7 +761,9 @@ class Scalper:
                        stop_price=stop, target_price=target,
                        init_risk=price - stop,
                        mode=plan.mode if plan is not None else "pullback",
-                       volatility=plan.volatility if plan is not None else 0.0)
+                       volatility=plan.volatility if plan is not None else 0.0,
+                       adds=[list(step) for step in ladder[1:]],
+                       ladder_n=len(ladder))
         if self._verify:
             pos.entry_pending = True
             pos.entry_order = ord_no
@@ -699,9 +774,15 @@ class Scalper:
                   f"{'(추세 추종)' if pos.mode == 'trend' else ''}: "
                   f"{code} {quantity}주 "
                   f"@{price:,.2f} (손절 {stop:,.2f} / 목표 {target:,.2f}, "
-                  f"손절 시 손실 약 {(price - stop) * quantity:,.2f})")
+                  + (f"손절 시 손실 약 {(price - stop) * quantity:,.2f})"
+                     if not pos.adds else
+                     f"분할 1/{len(ladder)} — "
+                     + ", ".join(f"{p:,.2f}에서 {q}주" for p, q in pos.adds)
+                     + " 추가, 전부 산 뒤 손절 시 손실 약 "
+                     f"{sum(q * (p - stop) for p, q in ladder):,.2f})"))
         self._journal("buy", code=code, quantity=quantity, price=price,
                       stop=stop, target=target, mode=pos.mode,
+                      ladder=ladder,
                       reason=plan.reason if plan else "")
         self._save_state()
         return True
@@ -725,6 +806,7 @@ class Scalper:
 
     def _close(self, pos: Position, price: float, reason: str) -> None:
         """청산 주문. 미국(지정가)은 체결이 확인될 때까지 포지션을 유지한다."""
+        pos.adds = []                 # 파는 종목은 더 사지 않는다
         if not self._verify:
             self._order(pos.code, "sell", pos.quantity)
             self._finalize(pos, price, reason)
@@ -784,55 +866,243 @@ class Scalper:
         buy = 0.0 if pos.adopted else qty * pos.entry_price   # 편입분은 매도분만
         return ((buy + sell) * cfg.fee_pct + sell * cfg.sell_tax_pct) / 100
 
+    def _trail_width(self, pos: Position) -> float:
+        """나머지 수량의 추적 폭(%): 1분봉 변동폭에 맞춰 넓힌다."""
+        cfg = self.config
+        return round(min(max(cfg.trend_trail_pct,
+                             pos.volatility * cfg.trend_trail_mult),
+                         max(cfg.trend_trail_max_pct,
+                             cfg.trend_trail_pct)), 2) or 1.0
+
+    def _send_partial(self, pos: Position, qty: int, price: float,
+                      label: str) -> None:
+        """일부 수량 매도 주문. 나머지는 계속 보유한다."""
+        pos.scale_label = label
+        if not self._verify:
+            self._order(pos.code, "sell", qty)
+            self._book_partial(pos, qty, price)
+            return
+        limit = self._exit_limit(pos.code, price)
+        pos.scale_order = self._order(pos.code, "sell", qty, limit_price=limit)
+        pos.scale_pending = True
+        pos.scale_qty = qty
+        pos.scale_price = limit
+        pos.scale_sent_at = self.clock()
+        pos.scale_unconfirmed = 0
+        self._log(f"{label} 주문: {pos.code} {qty}주 @{limit:,.2f} "
+                  f"({pos.pct(limit):+.2f}%) — 체결 확인 중")
+
     def _scale_out(self, pos: Position, price: float) -> None:
         """추세 추종 종목이 목표가에 닿았다: 절반을 팔고 나머지는 고점을 따라간다."""
-        cfg = self.config
         half = pos.quantity // 2
+        pos.adds = []
         pos.trailing = True
         pos.scaled = True
-        pos.trail_pct = round(min(max(cfg.trend_trail_pct,
-                                      pos.volatility * cfg.trend_trail_mult),
-                                  max(cfg.trend_trail_max_pct,
-                                      cfg.trend_trail_pct)), 2)
+        pos.trail_pct = self._trail_width(pos)
         if half < 1:                      # 1주뿐이면 나누지 않고 전부 추적한다
             self._log(f"목표 도달(추세): {pos.code} {pos.pct(price):+.2f}% — "
                       f"고점 대비 -{pos.trail_pct}%에서 매도")
             self._save_state()
             return
-        if not self._verify:
-            self._order(pos.code, "sell", half)
-            self._book_partial(pos, half, price)
+        self._send_partial(pos, half, price, "절반 익절")
+
+    def _ladder_sell(self, pos: Position, price: float, stage: int) -> None:
+        """분할 익절. 1단계(목표의 절반 지점)에서 1/3, 2단계(목표가)에서 1/3을
+        팔고 나머지는 고점을 따라가며 판다."""
+        held = pos.quantity
+        if stage == 1:
+            qty = held // 3 if held >= 3 else (1 if held == 2 else 0)
+        elif pos.tp_stage >= 1:
+            qty = held // 2               # 이미 1/3을 팔았으니 남은 것의 절반
+        else:
+            qty = held * 2 // 3           # 절반 지점을 건너뛰고 목표가에 닿았다
+        pos.adds = []                     # 익절을 시작하면 더 사지 않는다
+        pos.tp_stage = stage
+        if stage == 2:
+            pos.trailing = True
+            pos.scaled = True
+            pos.trail_pct = self._trail_width(pos)
+        if qty < 1:
+            if stage == 2:                # 1주뿐이면 나누지 않고 전부 추적한다
+                self._log(f"목표 도달: {pos.code} {pos.pct(price):+.2f}% — 남은 "
+                          f"{held}주는 고점 대비 -{pos.trail_pct}%에서 매도")
+            self._save_state()
             return
-        limit = self._exit_limit(pos.code, price)
-        pos.scale_order = self._order(pos.code, "sell", half, limit_price=limit)
-        pos.scale_pending = True
-        pos.scale_qty = half
-        pos.scale_price = limit
-        pos.scale_sent_at = self.clock()
-        pos.scale_unconfirmed = 0
-        self._log(f"목표 도달(추세): {pos.code} 절반 {half}주 매도 주문 "
-                  f"@{limit:,.2f} ({pos.pct(limit):+.2f}%) — 체결 확인 중")
+        self._send_partial(pos, qty, price, f"{stage}차 분할 익절")
 
     def _book_partial(self, pos: Position, qty: int, price: float) -> None:
-        """절반 익절 체결분을 장부에 반영한다. 팔리지 않은 몫은 계속 보유한다."""
+        """일부 익절 체결분을 장부에 반영한다. 팔리지 않은 몫은 계속 보유한다."""
         pos.scale_pending = False
+        label = pos.scale_label
+        if pos.trailing:
+            rest = f"고점 대비 -{pos.trail_pct}%에서 매도"
+            miss = f"{pos.quantity}주 전부 고점을 따라가며 판다"
+        else:
+            rest = f"목표가 {self.target_price(pos):,.2f}에서 한 번 더 판다"
+            miss = "쫓아 팔지 않고 목표가에서 다시 판다"
         if qty > 0:
             price = self._order_fill(pos.scale_order, price) or price
             pos.partial_pnl += (price - pos.entry_price) * qty
             if not pos.adopted:
                 self.cash += qty * price
             pos.quantity -= qty
-            self._log(f"절반 익절: {pos.code} {qty}주 @{price:,.2f} "
-                      f"({pos.pct(price):+.2f}%) — 남은 {pos.quantity}주는 고점 "
-                      f"대비 -{pos.trail_pct}%에서 매도")
+            self._log(f"{label}: {pos.code} {qty}주 @{price:,.2f} "
+                      f"({pos.pct(price):+.2f}%) — 남은 {pos.quantity}주는 "
+                      f"{rest}")
             self._journal("scale_out", code=pos.code, quantity=qty, price=price,
-                          remaining=pos.quantity)
+                          remaining=pos.quantity, stage=pos.tp_stage)
         else:
-            self._log(f"절반 익절 미체결: {pos.code} — {pos.quantity}주 전부 "
-                      f"고점을 따라가며 판다")
+            self._log(f"{label} 미체결: {pos.code} — {miss}")
         pos.scale_order = ""
         pos.scale_qty = 0
         self._save_state()
+
+    # ── 분할 매수 (계단식 추가 매수) ───────────────────────
+    def _adds_allowed(self) -> bool:
+        """추가 매수를 해도 되는가. 사용자가 매수를 멈췄거나, 장 마감이 가깝거나,
+        당일 손실 한도에 닿았으면 계획이 남아 있어도 더 사지 않는다."""
+        cfg = self.config
+        if self.entries_paused:
+            return False
+        if (cfg.market == "us" and not cfg.us_after_entries
+                and self.session() == "애프터마켓"):
+            return False
+        left = self.minutes_to_close()
+        if left is not None and left <= cfg.entry_cutoff_min:
+            return False
+        today = self._day_key()
+        pnl_today = sum(t.pnl for t in self.trades if t.day == today)
+        return pnl_today > -cfg.total_cash * cfg.daily_loss_pct / 100
+
+    def _add_on(self, pos: Position, price: float) -> None:
+        """가격이 추가 매수 자리까지 내려왔다: 그 자리의 몫을 산다.
+
+        한꺼번에 여러 칸을 지나 내려왔으면 지나온 칸의 몫을 합쳐 산다(계획보다
+        싼 값에 사는 것이라 손실 한도는 그대로 지켜진다).
+        """
+        cfg = self.config
+        now = self.clock()
+        if pos.add_retry_at and now < pos.add_retry_at:
+            return
+        due = [step for step in pos.adds if price <= step[0]]
+        if not due:
+            return
+        limit = None
+        if cfg.max_spread_pct > 0 and hasattr(self.api, "best_bid_ask"):
+            try:
+                bid, ask = self.api.best_bid_ask(pos.code)
+            except Exception as e:        # 호가를 확인하지 못하면 사지 않는다
+                logger.info("%s 추가 매수 보류(호가 조회 실패): %s", pos.code, e)
+                return
+            if (ask - bid) / ((ask + bid) / 2) * 100 > cfg.max_spread_pct:
+                return
+            if ask > due[0][0] or ask <= self.stop_price(pos):
+                return                    # 계획한 자리보다 비싸거나 이미 손절선
+            price = ask
+            if self._verify:
+                limit = ask
+        qty = min(sum(q for _p, q in due), int(self.cash // price))
+        if qty < 1:
+            pos.adds = []
+            self._log(f"추가 매수 취소: {pos.code} — 남은 현금이 부족하다")
+            self._save_state()
+            return
+        ord_no = self._order(pos.code, "buy", qty, limit_price=limit)
+        pos.adds = pos.adds[len(due):]
+        pos.add_plan = [list(step) for step in due]
+        pos.add_qty = qty
+        pos.add_price = price
+        pos.add_order = ord_no
+        pos.add_sent_at = now
+        pos.add_unconfirmed = 0
+        self.cash -= qty * price
+        if not self._verify:
+            self._book_add(pos, qty)
+            return
+        pos.add_pending = True
+        self._log(f"추가 매수 주문: {pos.code} {qty}주 @{price:,.2f} — 체결 확인 중")
+
+    def _book_add(self, pos: Position, filled: int, requeue: bool = False) -> None:
+        """추가 매수 체결분을 장부에 넣고 평균 매입가를 다시 계산한다."""
+        pos.add_pending = False
+        price = pos.add_price
+        self.cash += (pos.add_qty - filled) * price       # 안 산 몫은 되돌린다
+        step = pos.ladder_n - len(pos.adds)
+        if filled > 0:
+            fill = self._order_fill(pos.add_order, price) or price
+            self.cash += (price - fill) * filled
+            total = pos.quantity + filled
+            pos.entry_price = (pos.entry_price * pos.quantity
+                               + fill * filled) / total
+            pos.quantity = total
+            pos.orig_qty = max(pos.orig_qty, 0) + filled
+            if pos.stop_price:
+                pos.init_risk = max(pos.entry_price - pos.stop_price, 0.0)
+            pos.peak_price = pos.last_price or fill   # 고점은 새 평균가 기준으로 다시 잰다
+            self._log(f"추가 매수({step}/{pos.ladder_n}): {pos.code} {filled}주 "
+                      f"@{fill:,.2f} — 보유 {pos.quantity}주, 평균 매입가 "
+                      f"{pos.entry_price:,.2f} (손절 {self.stop_price(pos):,.2f}, "
+                      f"손절 시 손실 약 "
+                      f"{(pos.entry_price - self.stop_price(pos)) * pos.quantity:,.2f})")
+            self._journal("add", code=pos.code, quantity=filled, price=fill,
+                          held=pos.quantity, avg=round(pos.entry_price, 4))
+        elif requeue:
+            # 한 주도 안 받아졌다 — 계획을 되살려 두고 잠시 뒤에 다시 본다
+            pos.adds = pos.add_plan + pos.adds
+            pos.add_retry_at = self.clock() + dt.timedelta(
+                seconds=self.config.add_retry_sec)
+            self._log(f"추가 매수 미체결: {pos.code} — 주문을 거두고 다시 본다")
+        else:
+            self._log(f"추가 매수 미체결: {pos.code} — 이 몫은 사지 않는다")
+        pos.add_plan = []
+        pos.add_order = ""
+        pos.add_qty = 0
+        self._save_state()
+
+    def _check_add(self, pos: Position, orders: list[dict],
+                   now: dt.datetime) -> None:
+        """추가 매수 주문의 체결 확인."""
+        order = self._find_order(orders, pos.code, pos.add_order)
+        if order is not None:
+            # 내려오는 중에 낸 주문이라 오래 기다리지 않는다 (그동안은 손절
+            # 감시가 멈춘다)
+            waited = (now - pos.add_sent_at).total_seconds()
+            if waited < self.config.exit_timeout_sec:
+                return
+            try:
+                self.api.cancel_order(order["ord_no"], pos.code)
+            except Exception as e:   # 그사이 체결됐을 수 있다 — 다음 주기에 재확인
+                logger.warning("%s 추가 매수 취소 실패: %s", pos.code, e)
+                return
+            filled = pos.add_qty - self._remaining(order, pos.add_qty)
+            self._book_add(pos, filled, requeue=filled == 0)
+            return
+        # 미체결 목록에서 사라졌다 — 체결 내역, 없으면 실계좌 보유로 확인한다
+        filled = pos.add_qty
+        report = None
+        fetch = getattr(self.api, "order_fill", None)
+        if fetch is not None and pos.add_order:
+            try:
+                report = fetch(pos.add_order)
+            except Exception as e:
+                logger.info("%s 추가 매수 체결 조회 실패: %s", pos.code, e)
+        if report and report[0] > 0:
+            filled = min(pos.add_qty, int(report[0]))
+        elif pos.baseline_qty is not None:
+            actual = self._actual_qty(pos.code)
+            if actual is None:
+                return
+            held = max(0, actual - pos.baseline_qty)
+            filled = max(0, min(pos.add_qty, held - pos.quantity))
+            if filled < pos.add_qty:
+                pos.add_unconfirmed += 1
+                if pos.add_unconfirmed < 2:       # 잔고 반영 지연에 속지 않게
+                    return
+                # 그래도 안 보이면 안 산 것으로 적되, 나중에 잔고에 나타나면
+                # 장부에 넣는다 (reconcile)
+                pos.add_missed += pos.add_qty - filled
+                pos.add_missed_price = pos.add_price
+        self._book_add(pos, filled)
 
     def _check_scale(self, pos: Position, orders: list[dict],
                      now: dt.datetime) -> None:
@@ -935,8 +1205,7 @@ class Scalper:
         return int(balances.get(code, {}).get("qty") or 0)
 
     def _check_pending(self) -> None:
-        pending = [p for p in self.positions.values()
-                   if p.entry_pending or p.exit_pending or p.scale_pending]
+        pending = [p for p in self.positions.values() if p.busy]
         if not pending:
             return
         try:
@@ -952,6 +1221,8 @@ class Scalper:
                     self._check_entry(pos, orders, now)
                 elif pos.scale_pending:
                     self._check_scale(pos, orders, now)
+                elif pos.add_pending:
+                    self._check_add(pos, orders, now)
                 else:
                     self._check_exit(pos, orders, now)
             except Exception as e:
@@ -1107,8 +1378,7 @@ class Scalper:
             self._check_pending()
         for code in list(self.positions):
             pos = self.positions.get(code)
-            if (pos is None or pos.entry_pending or pos.exit_pending
-                    or pos.scale_pending):
+            if pos is None or pos.busy:
                 continue
             try:
                 price = self.api.current_price(code)
@@ -1173,7 +1443,9 @@ class Scalper:
                     if price <= pos.peak_price * (1 - trail / 100):
                         self._close(pos, price, "익절")
                 elif price >= target:
-                    if (pos.mode == "trend" and cfg.trend_entries
+                    if cfg.ladder_steps > 1:
+                        self._ladder_sell(pos, price, 2)
+                    elif (pos.mode == "trend" and cfg.trend_entries
                             and cfg.trend_trail_pct > 0):
                         self._scale_out(pos, price)
                     elif cfg.trail_pct > 0:
@@ -1182,8 +1454,14 @@ class Scalper:
                                   f"시작 (고점 대비 -{cfg.trail_pct}%에서 매도)")
                     else:
                         self._close(pos, price, "익절")
+                elif (cfg.ladder_steps > 1 and pos.tp_stage == 0
+                      and price >= (pos.entry_price + target) / 2 > pos.entry_price):
+                    self._ladder_sell(pos, price, 1)
                 elif held_min >= cfg.stale_min:
                     self._close(pos, price, "시간초과")
+                elif (pos.adds and price <= pos.adds[0][0]
+                      and self._adds_allowed()):
+                    self._add_on(pos, price)
             except Exception as e:
                 self.last_error = f"{code} 청산 주문 오류: {e}"
                 logger.warning("%s 청산 실패(다음 주기에 재시도): %s", code, e)
@@ -1564,8 +1842,7 @@ class Scalper:
         now = self.clock()
         rows = []
         for pos in self.positions.values():
-            if (pos.entry_pending or pos.exit_pending or pos.scale_pending
-                    or pos.watch or not pos.last_price):
+            if pos.busy or pos.watch or not pos.last_price:
                 continue
             since = pos.last_review or pos.entry_time
             if (now - since).total_seconds() < self.config.review_interval:
@@ -1626,8 +1903,7 @@ class Scalper:
             self.review_note = note
         for review in reviews:
             pos = self.positions.get(review.get("code", ""))
-            if (pos is None or pos.entry_pending or pos.exit_pending
-                    or pos.scale_pending or pos.watch or not pos.last_price):
+            if pos is None or pos.busy or pos.watch or not pos.last_price:
                 continue
             action = review.get("action")
             reason = str(review.get("reason") or "")[:80]
@@ -1738,7 +2014,7 @@ class Scalper:
     def _adopt(self, code: str, mode: str) -> None:
         pos = self.positions.get(code)
         if pos is not None:
-            if pos.entry_pending or pos.exit_pending or pos.scale_pending:
+            if pos.busy:
                 return
             if mode == "sell":
                 price = pos.last_price or self.api.current_price(code)
@@ -1752,6 +2028,7 @@ class Scalper:
                     return
                 pos.watch = True
                 pos.trailing = False
+                pos.adds = []             # 감시 종목은 더 사지 않는다
                 self._log(f"본전 감시로 전환: {code} {pos.quantity}주 — 손절 없이 "
                           f"{self.breakeven_price(pos):,.2f} 이상에서 매도")
                 self._save_state()
@@ -1830,7 +2107,9 @@ class Scalper:
                      "volatility": p.volatility,
                      "trailing": p.trailing, "trail_pct": p.trail_pct,
                      "peak_price": p.peak_price,
-                     "partial_pnl": p.partial_pnl, "orig_qty": p.orig_qty}
+                     "partial_pnl": p.partial_pnl, "orig_qty": p.orig_qty,
+                     "tp_stage": p.tp_stage, "adds": p.adds,
+                     "ladder_n": p.ladder_n}
                     for p in self.positions.values()]}
         try:
             tmp = f"{self.state_path}.tmp"
@@ -1881,7 +2160,14 @@ class Scalper:
                            trail_pct=float(item.get("trail_pct") or 0),
                            peak_price=float(item.get("peak_price") or 0),
                            partial_pnl=float(item.get("partial_pnl") or 0),
+                           tp_stage=int(item.get("tp_stage") or 0),
+                           ladder_n=int(item.get("ladder_n") or 1),
                            baseline_qty=max(0, actual - qty))
+            try:
+                pos.adds = [[float(p), int(q)] for p, q in item.get("adds") or []
+                            if int(q) > 0]
+            except (TypeError, ValueError):
+                pos.adds = []
             pos.orig_qty = max(qty, int(item.get("orig_qty") or qty))
             self.positions[code] = pos
             if not pos.adopted:
@@ -1892,6 +2178,7 @@ class Scalper:
             if (not pos.watch and now_price > 0 and pos.entry_price > 0
                     and now_price <= self.stop_price(pos)):
                 pos.watch = True
+                pos.adds = []
                 pos.last_price = now_price
                 self._log(f"{code}: 이미 손절선 아래({pos.pct(now_price):+.2f}%)"
                           f" — 손절하지 않고 본전 감시로 둔다 "
@@ -1904,8 +2191,7 @@ class Scalper:
     def _flatten_for_close(self, left: float) -> None:
         """장 마감 1시간 전 시점에 남은 보유를 전량 정리한다 (손익 무관)."""
         targets = [p for p in self.positions.values()
-                   if not (p.entry_pending or p.exit_pending
-                           or p.scale_pending or p.watch)]
+                   if not (p.busy or p.watch)]
         if not targets:
             return
         session = self.session()
@@ -1979,10 +2265,22 @@ class Scalper:
                     pos.orig_qty = actual
                 self._save_state()
                 continue
-            if (pos.entry_pending or pos.exit_pending or pos.scale_pending
-                    or pos.adopted):
+            if pos.busy or pos.adopted:
                 continue
             actual = balances.get(code, {}).get("qty", pos.quantity)
+            if (pos.add_missed and pos.baseline_qty is not None
+                    and actual - pos.baseline_qty > pos.quantity):
+                # 안 산 줄 알았던 추가 매수가 잔고에 늦게 나타났다 — 이 프로그램이
+                # 낸 주문 수량까지만 장부에 넣어 손절·익절 감시 아래 둔다
+                pos.add_qty = min(pos.add_missed,
+                                  actual - pos.baseline_qty - pos.quantity)
+                pos.add_price = pos.add_missed_price
+                pos.add_missed = 0
+                self.cash -= pos.add_qty * pos.add_price
+                self._log(f"잔고 동기화: {code} 추가 매수 {pos.add_qty}주가 뒤늦게 "
+                          f"확인됐다 — 장부에 넣는다")
+                self._book_add(pos, pos.add_qty)
+                continue
             if actual >= pos.quantity:
                 continue   # 기존 보유분(초과)은 이 프로그램이 건드리지 않는다
             ref = pos.last_price or pos.entry_price
