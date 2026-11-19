@@ -100,7 +100,8 @@ class AppState:
     def start(self, market: str, target_pct, max_positions, cash,
               confirm: str = "", stop_pct=2.0, require_ai: bool = True,
               risk_pct=0.5, leveraged: bool = True,
-              trend: bool = True, view: str = "") -> dict:
+              trend: bool = True, view: str = "",
+              ladder: bool = True) -> dict:
         with self.lock:
             if self.trader is not None and self.thread and self.thread.is_alive():
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
@@ -130,6 +131,7 @@ class AppState:
                     risk_pct=_parse_float(risk_pct, "1회 손실 한도 %"),
                     universe=universe,
                     trend_entries=bool(trend),
+                    ladder_steps=3 if ladder else 1,
                     require_ai=bool(require_ai),
                     max_positions=_parse_int(max_positions, "동시 종목 수"),
                     total_cash=_parse_float(cash, "총 투입 금액"),
@@ -150,6 +152,7 @@ class AppState:
                            "min_target_pct": scalp_cfg.min_target_pct,
                            "tighten_gap_pct": scalp_cfg.tighten_gap_pct,
                            "trend_entries": scalp_cfg.trend_entries,
+                           "ladder": scalp_cfg.ladder_steps > 1,
                            "view": str(view or "").strip()[:300],
                            "stale_min": scalp_cfg.stale_min}
                     running = holder.get("trader")
@@ -198,6 +201,7 @@ class AppState:
                            "risk_pct": scalp_cfg.risk_pct,
                            "fee_pct": scalp_cfg.fee_pct,
                            "trend": scalp_cfg.trend_entries,
+                           "ladder": scalp_cfg.ladder_steps > 1,
                            "view": str(view or "").strip()[:300],
                            "universe": (len(universe) if universe is not None
                                         else None),
@@ -300,6 +304,7 @@ class AppState:
                  "pct": round(p.pct(), 2),
                  "held_min": round((now - p.entry_time).total_seconds() / 60),
                  "state": p.state(), "watch": p.watch,
+                 "adds": [list(step) for step in p.adds],
                  "stop": None if p.watch else round(trader.stop_price(p), 4),
                  "target": None if p.watch else round(trader.target_price(p), 4),
                  "breakeven": round(trader.breakeven_price(p), 4)}
@@ -380,7 +385,8 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <span><label>1회 손실 한도 %</label><br><input id="risk" value="0.5" size="4" title="한 번 손절했을 때 잃는 금액이 총 투입 금액의 이 %를 넘지 않게 수량을 정합니다"></span>
   <label title="켜면 AI 판단을 받을 수 없을 때 등락률 상위로 대신 사지 않고 매수를 쉽니다"><input type="checkbox" id="needAI" checked> AI 판단 필수</label>
   <label title="TQQQ·SOXL 같은 지수형 레버리지 ETF와, 지수가 내릴 때 오르는 인버스 ETF(SQQQ·SOXS 등)를 후보에 넣습니다. 같은 지수의 정방향과 인버스를 함께 들지는 않습니다"><input type="checkbox" id="lev" checked> 레버리지·인버스 ETF 포함</label>
-  <label title="당일 크게 오르며 VWAP 위에서 저점을 높이는 종목은 눌림을 기다리지 않고 따라 살 수 있게 합니다. 이렇게 산 종목은 목표가에서 절반만 팔고 나머지는 고점에서 1.5% 밀릴 때 팝니다. 추세가 이어지지 않는 날에는 손절이 늘 수 있습니다"><input type="checkbox" id="trend" checked> 추세 추종 진입</label>
+  <label title="당일 크게 오르며 VWAP 위에서 저점을 높이는 종목은 눌림을 기다리지 않고 따라 살 수 있게 합니다. 분할 매매를 끈 경우 이렇게 산 종목은 목표가에서 절반만 팔고 나머지는 고점을 따라가며 팝니다. 추세가 이어지지 않는 날에는 손절이 늘 수 있습니다"><input type="checkbox" id="trend" checked> 추세 추종 진입</label>
+  <label title="한 번에 사고팔지 않고 세 번에 나눕니다. 매수: 지금 1/3을 사고, 가격이 손절 폭의 1/3·2/3만큼 내려올 때마다 1/3씩 더 삽니다(손절가는 그대로, 전부 산 뒤 손절돼도 1회 손실 한도 안). 매도: 목표의 절반 지점에서 1/3, 목표가에서 1/3, 나머지는 고점을 따라가며 팝니다. 내려오지 않고 바로 오르는 종목은 1/3만 들고 가게 됩니다. 끄면 예전처럼 한 번에 사고팝니다"><input type="checkbox" id="ladder" checked> 분할 매매(3분할)</label>
   <span><label>동시 종목</label><br><input id="maxpos" value="2" size="3"></span>
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>
@@ -433,7 +439,8 @@ async function start(){
   const r=await api("/api/start",{market:$("market").value,
     target_pct:$("target").value.trim(),stop_pct:$("stop").value.trim(),
     risk_pct:$("risk").value.trim(),leveraged:$("lev").checked,
-    trend:$("trend").checked,view:$("view").value.trim(),
+    trend:$("trend").checked,ladder:$("ladder").checked,
+    view:$("view").value.trim(),
     require_ai:$("needAI").checked,max_positions:$("maxpos").value.trim(),
     cash:$("cash").value.trim(),confirm:$("confirm").value.trim()});
   $("msg").textContent=r.error||"AI 단타 시작 - 장중에 대형주·주요 ETF에서 진입 시점을 판단해 매매합니다";
@@ -499,7 +506,10 @@ async function refresh(){
         (p.last?p.last.toLocaleString(undefined,{maximumFractionDigits:2}):"-")+
         "</td><td class='"+(p.pct>=0?"pos":"neg")+"'>"+p.pct.toFixed(2)+"%</td><td>"+
         fmt(p.stop)+"</td><td>"+fmt(p.target)+"</td><td>"+
-        p.held_min+"분</td><td>"+(p.state||"")+(p.watch?" · 본전가 "+
+        p.held_min+"분</td><td>"+(p.state||"")+
+        (p.adds&&p.adds.length?" · 다음 매수 "+Number(p.adds[0][0]).toLocaleString(
+          undefined,{maximumFractionDigits:2})+"("+p.adds[0][1]+"주)":"")+
+        (p.watch?" · 본전가 "+
         Number(p.breakeven).toLocaleString(undefined,{maximumFractionDigits:2}):"")+
         "</td></tr>").join("")
       :"<tr><td colspan='9'>없음</td></tr>";
@@ -577,6 +587,7 @@ class Handler(BaseHTTPRequestHandler):
                     risk_pct=body.get("risk_pct", 0.5),
                     leveraged=bool(body.get("leveraged", True)),
                     trend=bool(body.get("trend", True)),
+                    ladder=bool(body.get("ladder", True)),
                     view=str(body.get("view", "")),
                     max_positions=body.get("max_positions", 2),
                     cash=body.get("cash"),

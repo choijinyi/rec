@@ -373,3 +373,21 @@ class TimingWiringTest(unittest.TestCase):
         state = self._state()
         state.start(market="us", target_pct="2", max_positions="2", cash="1000")
         self.assertTrue(state.trader.config.trend_entries)
+
+    def test_split_trading_is_on_by_default(self):
+        state = self._state()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000")
+        self.assertEqual(state.trader.config.ladder_steps, 3)
+        self.assertTrue(state.status()["params"]["ladder"])
+
+    def test_split_trading_can_be_turned_off(self):
+        state = self._state()
+        state.start(market="us", target_pct="2", max_positions="2", cash="1000",
+                    ladder=False)
+        self.assertEqual(state.trader.config.ladder_steps, 1)
+        self.assertFalse(state.status()["params"]["ladder"])
+
+    def test_page_has_the_split_trading_toggle(self):
+        from autotrader.webui import PAGE
+        self.assertIn('id="ladder" checked', PAGE)
+        self.assertIn("ladder:$(\"ladder\").checked", PAGE)
