@@ -70,6 +70,7 @@ class AppState:
         # 테스트에서 가짜 클라이언트/분석기를 주입할 수 있게 팩토리로 분리
         self.client_factory = KiwoomRestClient
         self.ai_label = ""        # 최근 판단에 쓴 모델·호출 방식
+        self.buy_paused = False   # 사용자가 매수만 멈춘 상태 (시작 전에도 설정 가능)
         self.analyst_factory = ClaudeAnalyst          # API 키 방식
         self.cli_analyst_factory = ClaudeCodeAnalyst  # Claude Code 구독 로그인
 
@@ -179,6 +180,7 @@ class AppState:
                                  state_path=state_path,
                                  journal_path=journal_path)
                 holder["trader"] = trader
+                trader.pause_entries(self.buy_paused)   # 멈춘 채로 시작할 수 있다
             except (ValueError, PermissionError) as e:
                 return {"error": str(e)}
 
@@ -213,6 +215,17 @@ class AppState:
                 return {"error": "실행 중이 아니다."}
             self.trader.stop()
             return {"ok": True}
+
+    def pause_buys(self, paused: bool) -> dict:
+        """매수만 멈추거나 다시 연다 (보유 종목 관리는 계속).
+
+        시작 전에 눌러 두면 매수를 멈춘 채로 시작한다 — 새로 사지 않고 보유
+        종목(본전 감시 등)만 관리하고 싶을 때 쓴다.
+        """
+        self.buy_paused = bool(paused)
+        if self.trader and self.thread and self.thread.is_alive():
+            self.trader.pause_entries(self.buy_paused)
+        return {"ok": True, "buy_paused": self.buy_paused}
 
     def adopt(self, code: str, mode: str) -> dict:
         """계좌 보유 종목 처리 요청.
@@ -261,7 +274,7 @@ class AppState:
             "prices": [], "events": [], "positions": [], "trades": [],
             "equity": None, "cash": None, "realized_pnl": None,
             "wins": 0, "losses": 0, "fees": 0.0, "session": "",
-            "halt_reason": "",
+            "halt_reason": "", "buy_paused": self.buy_paused,
             "selection_note": "", "review_note": "", "ai": self.ai_label,
             "chart_code": "", "holdings": [],
         }
@@ -339,6 +352,7 @@ border-radius:8px;padding:8px 12px;font-size:14px}
 button{cursor:pointer} button:hover{border-color:var(--acc)}
 button.primary{background:var(--acc);color:#1a1a1a;font-weight:700;border:none}
 button.danger{background:#7f1d1d;border:none}
+button.paused{background:#1e3a8a;border:none;font-weight:700}
 #chartWrap{background:var(--card);border:1px solid var(--line);border-radius:10px;
 padding:12px;margin-bottom:14px} canvas{width:100%;height:200px;display:block}
 .cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -371,7 +385,8 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>
   <button class="primary" onclick="start()">시작</button>
-  <button class="danger" onclick="stopT()">중지</button>
+  <button id="pauseBtn" onclick="pauseBuys()" title="새로 사는 것만 멈춥니다. 보유 종목의 손절·익절·본전 감시는 계속됩니다">매수 중단</button>
+  <button class="danger" onclick="stopT()" title="프로그램의 매매 루프 전체를 멈춥니다. 보유 종목 감시도 멈춥니다">중지</button>
 </div>
 <div class="row"><span style="flex:1"><label>오늘의 관점 (선택)</label><br><input id="view" style="width:100%" maxlength="300" placeholder="예: 반도체 약세 예상, SOXS 쪽을 먼저 본다" title="AI가 어느 방향의 종목을 먼저 볼지 정할 때 참고합니다. 분봉이 그 방향을 확인해 줄 때만 진입합니다"></span></div>
 <div class="warn" id="msg"></div>
@@ -437,6 +452,11 @@ async function watchLosers(){
   const r=await api("/api/adopt",{code:"*LOSERS",mode:"watch"});
   $("msg").textContent=r.error||("본전 감시 요청 접수: "+r.codes.join(", "));
 }
+let buyPaused=false;
+async function pauseBuys(){
+  const r=await api("/api/pause",{paused:!buyPaused});
+  $("msg").textContent=r.error||(r.buy_paused?"매수를 멈췄습니다 - 새로 사지 않고 보유 종목 관리만 계속합니다":"매수를 다시 시작합니다");
+}
 async function stopT(){const r=await api("/api/stop",{});$("msg").textContent=r.error||"중지 요청 완료";}
 function drawChart(prices,code){
   const c=$("chart"),x=c.getContext("2d");x.clearRect(0,0,c.width,c.height);
@@ -461,6 +481,9 @@ async function refresh(){
     if(s.running&&s.minutes_to_close!=null)run+=" · 마감까지 "+s.minutes_to_close+"분";
     if(s.halt_reason)run+=" · "+s.halt_reason;
     $("stRun").textContent=run;
+    buyPaused=!!s.buy_paused;
+    $("pauseBtn").textContent=buyPaused?"매수 재개":"매수 중단";
+    $("pauseBtn").className=buyPaused?"paused":"";
     $("stEquity").textContent=s.equity!=null?Math.round(s.equity).toLocaleString():"-";
     const pnl=s.realized_pnl;
     $("stPnl").textContent=pnl!=null?Math.round(pnl).toLocaleString():"-";
@@ -559,6 +582,8 @@ class Handler(BaseHTTPRequestHandler):
                     cash=body.get("cash"),
                     confirm=body.get("confirm", ""),
                 ))
+            elif self.path == "/api/pause":
+                self._send(self.state.pause_buys(bool(body.get("paused", True))))
             elif self.path == "/api/stop":
                 self._send(self.state.stop())
             elif self.path == "/api/adopt":

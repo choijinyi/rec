@@ -445,6 +445,7 @@ class Scalper:
         self._ai_state = ""               # AI 선정 상태 변화 로그용
         self._none_streak = 0             # AI가 이어서 "살 자리 없음"이라 답한 횟수
         self._rank_change: dict[str, float] = {}   # 순위에서 본 종목별 당일 등락률
+        self.entries_paused = False       # 사용자가 매수만 멈춘 상태
 
     # ── 상태 조회 (UI 공용) ────────────────────────────────
     @property
@@ -594,6 +595,23 @@ class Scalper:
 
     def stop(self) -> None:
         self._running = False
+
+    def pause_entries(self, paused: bool = True) -> None:
+        """사용자가 매수만 멈추거나 다시 연다. 보유 종목의 손절·익절·청산 점검은
+        멈춘 동안에도 그대로 동작한다."""
+        paused = bool(paused)
+        if paused == self.entries_paused:
+            return
+        self.entries_paused = paused
+        if paused:
+            with self._scan_lock:
+                self._scan_result = None     # 받아 둔 진입 판단은 버린다
+            self._log("매수 중단(사용자) — 새로 사지 않는다. 보유 종목 관리는 "
+                      "계속한다")
+        else:
+            self._none_streak = 0
+            self._rescan_asap = True         # 재개하면 바로 다시 찾는다
+            self._log("매수 재개(사용자)")
 
     def _log(self, message: str) -> None:
         stamp = self.clock().strftime("%H:%M:%S")
@@ -1645,6 +1663,11 @@ class Scalper:
 
     # ── 일일 안전장치 ─────────────────────────────────────
     def _entries_allowed(self) -> bool:
+        if self.entries_paused:
+            self.halt_reason = "매수 중단(사용자)"
+            with self._scan_lock:
+                self._scan_result = None
+            return False
         if self._entry_pause_until and self.clock() < self._entry_pause_until:
             return False
         if (self.config.market == "us" and not self.config.us_after_entries
