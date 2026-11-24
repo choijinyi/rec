@@ -10,7 +10,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from autotrader.kiwoom_rest import KiwoomRestClient, KiwoomRestError
-from autotrader.webui import PAGE, AppState, Handler
+from autotrader.webui import PAGE, AppState, Handler, market_of_code
 
 
 class FakeClient:
@@ -81,7 +81,7 @@ class PreviewTest(SplitBase):
     def test_preview_lists_the_plan_without_ordering(self):
         r = self.state.split_preview(**self.BODY)
         self.assertTrue(r["ok"])
-        self.assertIn("SOXL 분할 매매 계획 [회차별 매도]", r["text"])
+        self.assertIn("SOXL (미국주식) 분할 매매 계획 [회차별 매도]", r["text"])
         self.assertIn("100.00×2주, 99.00×2주", r["text"])
         self.assertIn("101.00, 99.99", r["text"])
         self.assertIn("손절 없음", r["text"])
@@ -98,9 +98,61 @@ class PreviewTest(SplitBase):
             r = self.state.split_preview(**{**self.BODY, **change})
             self.assertIn(text, r["error"])
 
-    def test_preview_warns_when_the_quote_fails(self):
+    def test_preview_refuses_a_code_without_a_quote(self):
         r = self.state.split_preview(**{**self.BODY, "code": "NOPE"})
-        self.assertIn("현재가를 확인하지 못했다", r["text"])
+        self.assertIn("현재가를 확인하지 못해 시작하지 않는다", r["error"])
+
+    def test_preview_warns_about_a_price_far_from_the_market(self):
+        r = self.state.split_preview(**{**self.BODY, "price": "70"})
+        self.assertIn("20% 넘게", r["text"])
+        self.assertNotIn("20% 넘게", self.state.split_preview(**self.BODY)["text"])
+
+
+class MarketFromCodeTest(SplitBase):
+    """화면 위 시장 선택이 '국내주식'인 채로 SOXL을 걸어도 미국주식으로 주문한다."""
+
+    def test_code_decides_the_market(self):
+        for code, market in (("SOXL", "us"), ("soxs", "us"), ("BRK.B", "us"),
+                             ("005930", "kr"), ("0001A0", "kr")):
+            self.assertEqual(market_of_code(code, "x"), market, code)
+        self.assertEqual(market_of_code("", "kr"), "kr")
+        self.assertEqual(market_of_code("Q500001", "kr"), "kr")
+
+    def test_us_ticker_goes_to_the_us_engine_whatever_the_selector_says(self):
+        body = {**self.BODY, "market": "kr", "price": "39.7", "sell_start": "42"}
+        text = self.state.split_preview(**body)["text"]
+        self.assertIn("SOXL (미국주식)", text)
+        self.assertIn("39.70×5주, 39.30×5주, 38.91×5주", text)   # 센트까지 그대로
+        self.assertIn("42.00, 42.42, 42.84", text)
+        self.assertEqual(self.state.split_start(**body), {"ok": True})
+        self.assertEqual(list(self.state.splitters), ["us"])
+        job = self.state.splitters["us"].jobs["SOXL"]
+        self.assertEqual([lv.buy for lv in job.levels],
+                         [39.7, 39.3, 38.91, 38.51, 38.11])
+
+    def test_korean_code_goes_to_the_kr_engine(self):
+        FakeClient.price = 71000.0
+        body = {**self.BODY, "market": "us", "code": "005930",
+                "price": "71000", "budget": "1000000"}
+        self.assertIn("005930 (국내주식)", self.state.split_preview(**body)["text"])
+        self.assertEqual(self.state.split_start(**body), {"ok": True})
+        self.assertEqual(list(self.state.splitters), ["kr"])
+
+    def test_job_saved_under_the_wrong_market_is_dropped_on_restart(self):
+        from autotrader.splitter import SplitTrader
+
+        path = str(Path(self.tmp, "autotrader_state_split_kr.json"))
+        old = SplitTrader(api=FakeClient("A", "B"), market="kr", state_path=path)
+        old.add_job("SOXL", 39.7, 1000.0, mode="ladder", sell_start=42.0)
+        self.assertEqual([lv.buy for lv in old.jobs["SOXL"].levels],
+                         [40, 39, 39, 39, 38])               # 원 단위로 뭉개졌던 계획
+        self.state.load_saved_splits()
+        self.assertEqual(self.state.splitters["kr"].jobs, {})
+        self.assertIn("지웠다", self.state.status()["split"]["events"][-1])
+
+    def test_unknown_code_shape_is_refused(self):
+        r = self.state.split_preview(**{**self.BODY, "market": "", "code": "12"})
+        self.assertIn("시장을 알 수 없다", r["error"])
 
     def test_preview_warns_when_budget_exceeds_buying_power(self):
         self.state.buying_power("us")
