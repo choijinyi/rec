@@ -1,5 +1,5 @@
 """지정 종목 분할 매매: 지정가에서 간격만큼 내려갈 때마다 나눠 사고, 회차별
-(+간격) 또는 매도 시작가부터 나눠 판다. 정한 금액을 넘겨 사지 않는다."""
+(+간격) 또는 매도 지정가부터 나눠 판다. 정한 금액을 넘겨 사지 않는다."""
 
 import json
 import os
@@ -129,7 +129,7 @@ class PlanTest(unittest.TestCase):
     def test_sell_start_must_be_above_the_buy_price(self):
         with self.assertRaisesRegex(ValueError, "높아야"):
             build_plan(100.0, 1000.0, mode="ladder", sell_start=100)
-        with self.assertRaisesRegex(ValueError, "매도 시작가"):
+        with self.assertRaisesRegex(ValueError, "매도 지정가"):
             build_plan(100.0, 1000.0, mode="ladder")
 
     def test_sell_only_plan_has_no_buy_levels(self):
