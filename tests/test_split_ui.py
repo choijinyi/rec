@@ -152,12 +152,15 @@ class StartTest(SplitBase):
         self.assertEqual(self.state.split_action("us", "soxl", "pause"),
                          {"ok": True})
 
-    def test_buy_pause_reaches_the_split_engine(self):
+    def test_ai_buy_pause_does_not_block_split_orders(self):
+        """'매수 중단'은 AI 단타의 것이다 — 사용자가 직접 건 분할 매매는 산다."""
         self.state.pause_buys(True)
         self.state.split_start(**self.BODY)
-        self.assertTrue(self.state.splitters["us"].buy_paused)
+        engine = self.state.splitters["us"]
+        self.assertFalse(engine.buy_paused)
         self.state.pause_buys(False)
-        self.assertFalse(self.state.splitters["us"].buy_paused)
+        self.state.pause_buys(True)
+        self.assertFalse(engine.buy_paused)
 
     def test_ai_trader_keeps_away_from_split_codes(self):
         self.state.split_start(**self.BODY)
