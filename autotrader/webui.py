@@ -142,7 +142,6 @@ class AppState:
                 us_day_session=cfg.get("us_day_session", True),
                 state_path=str(base.with_name(
                     f"autotrader_state_split_{market}.json")))
-            engine.buy_paused = self.buy_paused
             engine.restore_state()
             threading.Thread(target=engine.run, daemon=True).start()
             self.splitters[market] = engine
@@ -270,8 +269,9 @@ class AppState:
                 f"손절 -{p['stop_pct']:g}%: 마지막 회차 {levels[-1].buy:,.2f}에서 "
                 f"그만큼 더 내리면 전량 매도하고 끝낸다" if p["stop_pct"]
                 else "손절 없음: 마지막 회차 아래로 내려가도 팔지 않고 보유한다")
-        warnings.append("주문은 가격이 그 자리에 왔을 때 호가를 보고 낸다 — 미리 "
-                        "걸어 두는 주문이 아니다")
+        warnings.append("주문은 현재가가 그 가격에 닿은 뒤에 낸다(미리 걸어 두지 "
+                        "않는다). 바로 체결되지 않으면 그 가격에 지정가로 걸어 "
+                        "두고 1분마다 다시 낸다")
         return {"ok": True, "need_confirm": real,
                 "text": "\n".join(lines + ["", "확인할 점:"]
                                   + [f"- {w}" for w in warnings])}
@@ -472,11 +472,10 @@ class AppState:
         """매수만 멈추거나 다시 연다 (보유 종목 관리는 계속).
 
         시작 전에 눌러 두면 매수를 멈춘 채로 시작한다 — 새로 사지 않고 보유
-        종목(본전 감시 등)만 관리하고 싶을 때 쓴다.
+        종목(본전 감시 등)만 관리하고 싶을 때 쓴다. 지정 종목 분할 매매는
+        사용자가 직접 건 주문이라 이 버튼의 영향을 받지 않는다(작업별 일시정지).
         """
         self.buy_paused = bool(paused)
-        for engine in self.splitters.values():      # 분할 매매의 매수도 멈춘다
-            engine.buy_paused = self.buy_paused
         if self.trader and self.thread and self.thread.is_alive():
             self.trader.pause_entries(self.buy_paused)
         return {"ok": True, "buy_paused": self.buy_paused}
@@ -651,7 +650,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <span><label>총 투입 금액</label><br><input id="cash" value="1000000" size="10"></span>
   <span id="realConfirm"><label>실전 확인</label><br><input id="confirm" placeholder="YES 입력" size="6"></span>
   <button class="primary" onclick="start()">시작</button>
-  <button id="pauseBtn" onclick="pauseBuys()" title="새로 사는 것만 멈춥니다. 보유 종목의 손절·익절·본전 감시는 계속됩니다">매수 중단</button>
+  <button id="pauseBtn" onclick="pauseBuys()" title="AI 단타가 새로 사는 것만 멈춥니다. 보유 종목의 손절·익절·본전 감시는 계속됩니다. 지정 종목 분할 매매는 영향을 받지 않습니다(작업별 일시정지로 멈춥니다)">매수 중단</button>
   <button class="danger" onclick="stopT()" title="프로그램의 매매 루프 전체를 멈춥니다. 보유 종목 감시도 멈춥니다">중지</button>
 </div>
 <div class="row"><span style="flex:1"><label>오늘의 관점 (선택)</label><br><input id="view" style="width:100%" maxlength="300" placeholder="예: 반도체 약세 예상, SOXS 쪽을 먼저 본다" title="AI가 어느 방향의 종목을 먼저 볼지 정할 때 참고합니다. 분봉이 그 방향을 확인해 줄 때만 진입합니다"></span></div>

@@ -12,9 +12,9 @@
            수량을 남은 회차 수로 나눠 판다. 이미 가진 주식에 분할 매도만 걸 수도
            있다(보유분 매도 수량).
 
-AI 단타(scalper)와는 별개로 돌며, 같은 종목을 함께 다루지 않는다. 주문은 가격이
-그 자리에 왔을 때 호가를 확인하고 낸다 — 미리 걸어 두는 주문이 아니므로, 3초
-사이에 스치고 지나간 가격은 놓칠 수 있다.
+AI 단타(scalper)와는 별개로 돌며, 같은 종목을 함께 다루지 않는다. 주문은 현재가가
+그 가격에 닿은 뒤에 낸다(미리 걸어 두지 않는다). 미국주식은 호가가 맞으면 바로
+체결되게 내고, 아니면 그 가격에 지정가로 걸어 둔 채 1분마다 다시 낸다.
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ class SplitTrader:
                  utc_clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
                  sleep: Callable[[float], None] = time.sleep,
                  state_path: str | None = None, poll_interval: float = 3.0,
-                 fill_timeout_sec: float = 20.0, max_spread_pct: float = 0.0):
+                 fill_timeout_sec: float = 20.0, rest_timeout_sec: float = 60.0):
         if not is_simulation and not allow_real:
             raise PermissionError(
                 "실전투자 접속이 감지되었다. 모의투자로 검증하거나 allow_real을 "
@@ -177,11 +177,13 @@ class SplitTrader:
         self.state_path = state_path
         self.poll_interval = poll_interval
         self.fill_timeout_sec = fill_timeout_sec
-        self.max_spread_pct = max_spread_pct
+        # 회차 가격에 걸어 둔 지정가 주문을 거두고 다시 내기까지의 시간
+        self.rest_timeout_sec = rest_timeout_sec
+        self._said: dict[str, str] = {}     # 같은 안내를 되풀이해 적지 않는다
         self.jobs: dict[str, SplitJob] = {}
         self.events: list[str] = []
         self.last_error = ""
-        self.buy_paused = False       # 사용자가 매수만 멈췄다 (매도는 계속)
+        self.buy_paused = False       # True면 새로 사지 않는다 (매도는 계속)
         self._verify = (market == "us" and hasattr(api, "us_open_orders")
                         and hasattr(api, "cancel_order"))
         self._balances = hasattr(api, "us_balances") and market == "us"
@@ -200,6 +202,12 @@ class SplitTrader:
         self.events.append(f"{self.clock().strftime('%H:%M:%S')} {message}")
         del self.events[:-200]
         logger.info(message)
+
+    def _log_once(self, job: SplitJob, message: str) -> None:
+        """같은 주문을 다시 낼 때마다 같은 줄이 쌓이지 않게 한 번만 적는다."""
+        if self._said.get(job.code) != message:
+            self._said[job.code] = message
+            self._log(message)
 
     def codes(self) -> set[str]:
         """이 엔진이 다루는 종목 (AI 단타가 건드리지 않게 막는 데 쓴다)."""
@@ -360,8 +368,12 @@ class SplitTrader:
         job.pending = {"side": side, "qty": qty, "price": price,
                        "ord_no": ord_no, "sent_at": now.isoformat(),
                        "idxs": idxs, "strict": strict, "unconfirmed": 0}
-        self._log(f"분할 {'매수' if side == 'buy' else '매도'} 주문: {job.code} "
-                  f"{qty}주 @{price:,.2f} — 체결 확인 중")
+        self._log_once(job, f"분할 {'매수' if side == 'buy' else '매도'} 주문: "
+                            f"{job.code} {qty}주 @{price:,.2f} 지정가 — 체결 "
+                            f"확인 중 (안 받아지면 1분마다 다시 낸다)"
+                       if strict else
+                       f"분할 매도 주문(정리): {job.code} {qty}주 "
+                       f"@{price:,.2f} — 체결 확인 중")
         self._save_state()
 
     def _fill_price(self, ord_no: str, expected: float) -> float:
@@ -385,10 +397,12 @@ class SplitTrader:
         """체결분을 장부에 넣는다."""
         job.pending = None
         if filled <= 0:
-            self._log(f"분할 {'매수' if side == 'buy' else '매도'} 미체결: "
-                      f"{job.code} — 가격이 다시 오면 낸다")
+            job.note = (f"{'매수' if side == 'buy' else '매도'} 주문 "
+                        f"@{price:,.2f}이 아직 체결되지 않았다 — 가격이 그 자리에 "
+                        f"있으면 다시 낸다")
             self._save_state()
             return
+        self._said.pop(job.code, None)
         fill = self._fill_price(ord_no, price)
         if side == "buy":
             left = filled
@@ -546,7 +560,9 @@ class SplitTrader:
         order = self._find_order(orders, job)
         if order is not None:
             sent = dt.datetime.fromisoformat(p["sent_at"])
-            if (now - sent).total_seconds() < self.fill_timeout_sec:
+            timeout = (self.rest_timeout_sec if p.get("strict")
+                       else self.fill_timeout_sec)
+            if (now - sent).total_seconds() < timeout:
                 return
             try:
                 self.api.cancel_order(order["ord_no"], job.code)
@@ -651,6 +667,7 @@ class SplitTrader:
             job.note = f"시세 조회 실패: {str(e)[:60]}"
             return
         job.last_price = price
+        job.note = ""
         held = job.held
         if job.closing:
             if held == 0:
@@ -668,8 +685,7 @@ class SplitTrader:
                 return
         if held > 0 and self._try_sell(job, price):
             return
-        if not self.buy_paused:
-            self._try_buy(job, price)
+        self._try_buy(job, price)
 
     def _drive_closing(self, job: SplitJob, price: float) -> None:
         quote = self._quote(job.code, price)
@@ -679,60 +695,101 @@ class SplitTrader:
                    None, strict=False)
 
     def _try_sell(self, job: SplitJob, price: float) -> bool:
+        """현재가가 매도가에 닿은 몫을 판다. 주문을 냈으면 True.
+
+        미국(지정가)은 매수호가가 매도가 이상이면 그 호가에, 아니면 매도가에
+        지정가로 걸어 둔다. 시장가로 나가는 경로는 매수호가가 매도가 이상일
+        때만 판다. 어느 쪽이든 정한 매도가보다 싸게 팔지 않는다.
+        """
         if job.mode == "each":
-            if not any(lv.held > 0 and price >= lv.sell for lv in job.levels):
-                return False
-            quote = self._quote(job.code, price)
-            if quote is None:
-                return True
-            bid = quote[0]
             idxs = [i for i, lv in enumerate(job.levels)
-                    if lv.held > 0 and bid >= lv.sell]
+                    if lv.held > 0 and price >= lv.sell]
             if not idxs:
                 return False
+            quote = self._quote(job.code, price)
+            top = max(job.levels[i].sell for i in idxs)
+            if self._verify:
+                bid = quote[0] if quote else 0.0
+                limit = bid if bid >= top else top
+            else:
+                if quote is None:
+                    job.note = "호가를 받지 못해 매도를 미뤘다"
+                    return True
+                bid = quote[0]
+                idxs = [i for i in idxs if bid >= job.levels[i].sell]
+                if not idxs:
+                    job.note = (f"매수호가 {bid:,.2f}가 매도가보다 낮아 "
+                                f"기다린다")
+                    return False
+                limit = bid
             self._send(job, "sell", sum(job.levels[i].held for i in idxs),
-                       bid, idxs, strict=True)
+                       limit, idxs, strict=True)
             return True
         n, j = len(job.sell_prices), job.sell_done
         if j >= n or price < job.sell_prices[j]:
             return False
         quote = self._quote(job.code, price)
-        if quote is None:
-            return True
-        bid = quote[0]
-        if bid < job.sell_prices[j]:
-            return False
+        if self._verify:
+            bid = quote[0] if quote else 0.0
+            reached = price
+        else:
+            if quote is None:
+                job.note = "호가를 받지 못해 매도를 미뤘다"
+                return True
+            bid = reached = quote[0]
+            if bid < job.sell_prices[j]:
+                job.note = f"매수호가 {bid:,.2f}가 매도가보다 낮아 기다린다"
+                return False
         if job.carry <= 0:
             upto = j
-            while upto + 1 < n and bid >= job.sell_prices[upto + 1]:
+            while upto + 1 < n and reached >= job.sell_prices[upto + 1]:
                 upto += 1
             due = upto - j + 1
             job.carry = min(job.held, -(-job.held * due // (n - j)))
             job.carry_upto = upto
-        self._send(job, "sell", min(job.carry, job.held), bid, None,
+        limit = bid
+        if self._verify:
+            top = job.sell_prices[min(job.carry_upto, n - 1)]
+            limit = bid if bid >= top else top
+        self._send(job, "sell", min(job.carry, job.held), limit, None,
                    strict=True)
         return True
 
     def _try_buy(self, job: SplitJob, price: float) -> None:
+        """현재가가 매수가에 닿은 회차를 산다.
+
+        미국(지정가)은 매도호가가 회차 가격 이하면 그 호가에 사고, 아니면 회차
+        가격에 지정가로 걸어 둔다(걸어 둔 주문은 rest_timeout_sec 뒤 거두고,
+        가격이 그대로면 다시 건다). 시장가로 나가는 경로는 매도호가가 회차 가격
+        이하일 때만 산다. 어느 쪽이든 회차 가격보다 비싸게 사지 않는다.
+        """
         def wanted(limit: float) -> list[int]:
             return [i for i, lv in enumerate(job.levels)
                     if not lv.done and lv.bought < lv.qty and limit <= lv.buy]
 
-        if not wanted(price):
-            return
-        quote = self._quote(job.code, price)
-        if quote is None:
-            return
-        bid, ask = quote
-        if (self.max_spread_pct > 0 and bid > 0
-                and (ask - bid) / ((ask + bid) / 2) * 100 > self.max_spread_pct):
-            job.note = "호가 간격이 넓어 매수를 미뤘다"
-            return
-        idxs = wanted(ask)          # 매도호가가 그 회차 가격 이하일 때만 산다
+        idxs = wanted(price)
         if not idxs:
             return
+        if self.buy_paused:
+            job.note = "매수 중단 상태라 새로 사지 않는다"
+            return
+        quote = self._quote(job.code, price)
+        if self._verify:
+            lowest = min(job.levels[i].buy for i in idxs)
+            ask = quote[1] if quote else 0.0
+            limit = ask if 0 < ask <= lowest else lowest
+        else:
+            if quote is None:
+                job.note = "호가를 받지 못해 매수를 미뤘다"
+                return
+            ask = quote[1]
+            idxs = wanted(ask)
+            if not idxs:
+                job.note = f"매도호가 {ask:,.2f}가 매수가보다 높아 기다린다"
+                return
+            limit = ask
         qty = sum(job.levels[i].qty - job.levels[i].bought for i in idxs)
-        self._send(job, "buy", qty, ask, idxs, strict=True)
+        self._send(job, "buy", qty, limit, idxs, strict=True)
 
     # ── 루프 ──────────────────────────────────────────────
     def step(self) -> None:
@@ -742,6 +799,11 @@ class SplitTrader:
                 return
             waiting = [j for j in self.jobs.values() if j.pending]
             if waiting and self._verify:
+                for job in waiting:         # 기다리는 동안에도 현재가는 보여 준다
+                    try:
+                        job.last_price = self.api.current_price(job.code)
+                    except Exception:
+                        pass
                 self._check_pending(waiting)
             for job in list(self.jobs.values()):
                 if not job.active or job.pending:

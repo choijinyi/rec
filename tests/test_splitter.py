@@ -244,6 +244,7 @@ class EachModeTest(unittest.TestCase):
         trader.buy_paused = True
         move(trader, api, 99.0)
         self.assertEqual(len(api.orders), 1)
+        self.assertIn("매수 중단", job.note)                 # 이유를 화면에 보인다
         move(trader, api, 101.0)
         self.assertEqual(api.orders[-1][0], "sell")
 
@@ -428,28 +429,80 @@ class VerifiedOrderTest(unittest.TestCase):
         move(trader, api, 100.0)
         self.assertEqual((job.held, job.pending), (2, None))
 
-    def test_never_pays_more_than_the_step_price(self):
-        api = UsAPI(100.0)
-        api.best_bid_ask = lambda code: (99.99, 100.03)      # 매도호가가 더 높다
+    def test_rests_at_the_step_price_when_the_ask_is_higher(self):
+        """현재가는 닿았는데 매도호가가 더 높다 — 사지 못하고 멈춰 있지 않고
+        회차 가격에 지정가를 걸어 둔다 (그보다 비싸게는 사지 않는다)."""
+        api = UsAPI(51.18)
+        api.auto_fill = False
+        api.best_bid_ask = lambda code: (51.15, 51.24)
+        trader = engine(api)
+        job = trader.add_job("SOXS", 51.2, 4700.0, gap_pct=0.2, mode="ladder",
+                             sell_start=52.0)
+        trader.step()
+        self.assertEqual(api.orders, [("buy", 18, 51.2)])
+        self.assertIn("51.20", trader.snapshot()[0]["pending"])
+        api.fill()
+        move(trader, api, 51.18)
+        self.assertEqual((job.held, job.levels[0].held), (18, 18))
+        self.assertAlmostEqual(job.cost, 18 * 51.2)
+
+    def test_takes_the_ask_when_it_is_at_or_below_the_step_price(self):
+        api = UsAPI(51.18)
+        api.best_bid_ask = lambda code: (51.17, 51.19)
+        trader = engine(api)
+        trader.add_job("SOXS", 51.2, 4700.0, gap_pct=0.2)
+        trader.step()
+        self.assertEqual(api.orders, [("buy", 18, 51.19)])
+
+    def test_buys_even_when_the_quote_is_unavailable(self):
+        def no_quote(code):
+            raise RuntimeError("호가 없음")
+        api = UsAPI(51.18)
+        api.best_bid_ask = no_quote
+        trader = engine(api)
+        trader.add_job("SOXS", 51.2, 4700.0, gap_pct=0.2)
+        trader.step()
+        self.assertEqual(api.orders, [("buy", 18, 51.2)])
+
+    def test_passed_steps_rest_at_the_lowest_of_them(self):
+        api = UsAPI(98.5)
+        api.best_bid_ask = lambda code: (98.4, 99.5)
         trader = engine(api)
         trader.add_job("SOXL", 100.0, 1000.0)
         trader.step()
-        self.assertEqual(api.orders, [])
+        self.assertEqual(api.orders, [("buy", 4, 99.0)])     # 1·2회차를 99에
 
-    def test_never_sells_below_the_step_sell_price(self):
+    def test_sell_rests_at_the_sell_price_when_the_bid_is_lower(self):
         trader, api, job = self.start()
         api.fill()
         move(trader, api, 100.0)
-        move(trader, api, 101.0)                             # 매수호가 100.99
-        self.assertEqual(len(api.orders), 1)
-        move(trader, api, 101.01)
+        move(trader, api, 100.99)
+        self.assertEqual(len(api.orders), 1)                 # 아직 매도가 전
+        move(trader, api, 101.0)                             # 매수호가는 100.99
         self.assertEqual(api.orders[-1], ("sell", 2, 101.0))
+        self.assertEqual(job.held, 2)                        # 체결 전
+        api.fill()
+        move(trader, api, 101.0)
+        self.assertEqual(job.held, 0)
+        self.assertAlmostEqual(job.realized, 2.0)
 
-    def test_unfilled_order_is_cancelled_and_retried_when_price_returns(self):
+    def test_resting_order_is_pulled_after_a_minute_and_placed_again(self):
         trader, api, job = self.start()
-        move(trader, api, 100.5, seconds=21)
+        move(trader, api, 100.0, seconds=30)
+        self.assertEqual(api.cancelled, [])                  # 1분은 걸어 둔다
+        move(trader, api, 100.0, seconds=31)
         self.assertEqual(len(api.cancelled), 1)
-        self.assertEqual((job.held, job.pending), (0, None))
+        self.assertEqual(len(api.orders), 2)                 # 그대로면 곧바로 다시 건다
+        self.assertEqual(api.orders[-1], ("buy", 2, 100.0))
+        self.assertEqual(job.held, 0)
+        self.assertNotEqual(job.pending["ord_no"], api.cancelled[0])
+        placed = [e for e in trader.events if "분할 매수 주문" in e]
+        self.assertEqual(len(placed), 1)                     # 같은 줄을 쌓지 않는다
+
+    def test_order_is_not_placed_again_once_price_moves_away(self):
+        trader, api, job = self.start()
+        move(trader, api, 100.5, seconds=61)
+        self.assertEqual(len(api.cancelled), 1)
         move(trader, api, 100.5)
         self.assertEqual(len(api.orders), 1)                 # 가격이 위에 있다
         move(trader, api, 100.0)
@@ -458,7 +511,7 @@ class VerifiedOrderTest(unittest.TestCase):
     def test_partial_fill_keeps_what_was_bought(self):
         trader, api, job = self.start()
         api.fill(1)
-        move(trader, api, 100.0, seconds=21)
+        move(trader, api, 100.0, seconds=61)
         self.assertEqual(job.held, 1)
         self.assertEqual(job.levels[0].bought, 1)
         move(trader, api, 100.0)
