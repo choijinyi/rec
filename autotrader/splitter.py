@@ -23,6 +23,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -97,6 +98,17 @@ class SplitJob:
     @property
     def active(self) -> bool:
         return self.status == RUNNING
+
+
+def market_of_code(code: str, fallback: str = "") -> str:
+    """종목코드로 시장을 알아낸다: 영문(SOXL, BRK.B)은 미국, 숫자로 시작하는
+    6자리(005930, 0001A0)는 국내. 어느 쪽도 아니면 fallback."""
+    code = str(code or "").strip().upper()
+    if re.fullmatch(r"[A-Z][A-Z.\-]{0,6}", code):
+        return "us"
+    if re.fullmatch(r"[0-9][0-9A-Z]{5}", code):
+        return "kr"
+    return fallback
 
 
 def _round_price(price: float, market: str) -> float:
@@ -864,6 +876,12 @@ class SplitTrader:
                 job = SplitJob(**{**item, "levels": levels})
             except TypeError as e:
                 logger.warning("분할 매매 작업 복원 실패: %s", e)
+                continue
+            if (market_of_code(job.code, self.market) != self.market
+                    and job.held == 0 and not job.pending):
+                # 예전 버전에서 다른 시장으로 잘못 등록돼 한 주도 사지 못한 작업
+                self._log(f"분할 매매 작업을 지웠다: {job.code} — 종목코드와 시장이 "
+                          f"맞지 않아 주문이 나갈 수 없던 작업이다. 다시 등록한다")
                 continue
             pending, job.pending = job.pending, None
             if pending and pending.get("side") == "buy":

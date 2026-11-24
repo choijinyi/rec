@@ -21,7 +21,7 @@ from .kiwoom_rest import (
 )
 from .scalper import ScalpConfig, Scalper
 from .splitter import MODES as SPLIT_MODES
-from .splitter import SplitTrader, build_plan
+from .splitter import SplitTrader, build_plan, market_of_code
 from .universe import build_universe
 
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -168,10 +168,11 @@ class AppState:
                     else _parse_float(value, name))
 
         code = str(code or "").strip().upper()
-        if market not in ("us", "kr"):
-            raise ValueError("시장을 골라야 한다")
         if not code:
             raise ValueError("종목코드를 넣어야 한다")
+        if market not in ("us", "kr"):
+            raise ValueError("종목코드로 시장을 알 수 없다 — 미국주식은 영문 "
+                             "티커, 국내주식은 6자리 코드를 넣는다")
         # 매도 지정가를 넣으면 그 가격부터 나눠 팔고, 비우면 회차별로 판다
         sell = number(sell_start, "매도 지정가")
         if sell > 0 or mode == "ladder":
@@ -202,6 +203,7 @@ class AppState:
                       sell_start="", hold_qty="", stop_pct="",
                       repeat: bool = False, **_ignored) -> dict:
         """시작 전에 계획과 주의할 점을 글로 돌려준다 (주문은 내지 않는다)."""
+        market = market_of_code(code, market)     # 시장은 종목코드가 정한다
         try:
             p = self._split_params(market, code, price, budget, steps, gap_pct,
                                    mode, sell_start, hold_qty, stop_pct)
@@ -217,7 +219,8 @@ class AppState:
         cfg = load_config(self.config_path)
         real = cfg["mode"] == "real"
         unit = "$" if market == "us" else ""
-        lines = [f"{p['code']} 분할 매매 계획 [{SPLIT_MODES[mode]}"
+        lines = [f"{p['code']} ({'미국주식' if market == 'us' else '국내주식'}) "
+                 f"분할 매매 계획 [{SPLIT_MODES[mode]}"
                  f"{' · 반복' if repeat and levels else ''}] — "
                  f"{'실전투자' if real else '모의투자'}"]
         if levels:
@@ -240,10 +243,16 @@ class AppState:
         try:
             now_price = float(self._client(market, cfg).current_price(p["code"]))
         except Exception as e:
-            warnings.append(f"현재가를 확인하지 못했다 ({str(e)[:50]}) — 종목코드를 "
-                            f"다시 확인한다")
+            # 시세를 못 받는 종목은 등록해도 주문이 나가지 않는다 — 여기서 막는다
+            return {"error": f"{p['code']} 현재가를 확인하지 못해 시작하지 않는다 "
+                             f"({str(e)[:60]}). 종목코드를 확인하거나 잠시 뒤 다시 "
+                             f"시도한다."}
         if now_price:
             lines.append(f"현재가: {now_price:,.2f}")
+            if levels and abs(p["base_price"] / now_price - 1) > 0.2:
+                warnings.append(
+                    f"매수 지정가 {p['base_price']:,.2f}가 현재가와 20% 넘게 "
+                    f"다르다 — 가격을 잘못 넣지 않았는지 확인한다")
             hit = [lv for lv in levels if now_price <= lv.buy]
             if hit:
                 warnings.append(
@@ -281,6 +290,7 @@ class AppState:
                     sell_start="", hold_qty="", stop_pct="",
                     repeat: bool = False, confirm: str = "",
                     **_ignored) -> dict:
+        market = market_of_code(code, market)     # 시장은 종목코드가 정한다
         try:
             p = self._split_params(market, code, price, budget, steps, gap_pct,
                                    mode, sell_start, hold_qty, stop_pct)
@@ -679,7 +689,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <tbody id="holdings"><tr><td colspan="6">시작 후 1분 안에 표시됩니다 (미국주식)</td></tr></tbody></table>
 </div>
 
-<div class="panel"><h2>지정 종목 분할 매매 <span class="fixed">(내가 정한 종목·가격·금액으로 나눠 사고팝니다 · AI 단타와 따로 동작 · 시장은 맨 위 선택을 따릅니다)</span></h2>
+<div class="panel"><h2>지정 종목 분할 매매 <span class="fixed">(내가 정한 종목·가격·금액으로 나눠 사고팝니다 · AI 단타와 따로 동작 · 영문 종목코드는 미국주식, 숫자 6자리는 국내주식으로 주문합니다)</span></h2>
   <div class="row">
     <span><label>종목코드</label><br><input id="spCode" size="7" placeholder="SOXL"></span>
     <span><label>매수 지정가</label><br><input id="spPrice" size="7" title="1회차를 사는 가격입니다. 이후 간격만큼 내려갈 때마다 다음 회차를 삽니다. 현재가가 이미 이 가격 아래면 해당 회차들을 곧바로 삽니다"></span>
@@ -773,7 +783,7 @@ function spJobHtml(j){
   const b=(a,t,c)=>"<button "+(c?"class='"+c+"' ":"")+"data-m='"+j.market+"' data-c='"+j.code+"' data-a='"+a+
     "' onclick='splitAct(this.dataset.m,this.dataset.c,this.dataset.a)'>"+t+"</button> ";
   const tone=v=>v>=0?"pos":"neg";
-  let h="<div style='margin:12px 0 4px'><b>"+esc(j.code)+"</b> · "+j.mode_label+(j.repeat?" · 반복":"")+
+  let h="<div style='margin:12px 0 4px'><b>"+esc(j.code)+"</b> · "+(j.market==="us"?"미국":"국내")+" · "+j.mode_label+(j.repeat?" · 반복":"")+
     " · <b>"+j.status+(j.closing?" (정리 중)":"")+"</b> · 보유 "+j.held+"주"+(j.held?" @"+fmt(j.avg):"")+
     " · 현재 "+fmt(j.last||null)+(j.budget>0?" · 사용 "+fmt(j.used)+" / "+fmt(j.budget):" · 보유분 매도")+
     " · 실현 <span class='"+tone(j.realized)+"'>"+fmt(j.realized)+"</span>"+
