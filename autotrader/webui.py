@@ -54,6 +54,11 @@ def _parse_float(value, name: str) -> float:
         raise ValueError(f"{name} 값이 숫자가 아니다: {value!r}")
 
 
+def _confirmed(value) -> bool:
+    """실전 확인란: YES를 대소문자·앞뒤 공백과 상관없이 받는다."""
+    return str(value or "").strip().upper() == "YES"
+
+
 def _parse_int(value, name: str) -> int:
     try:
         return int(str(value).strip())
@@ -280,7 +285,7 @@ class AppState:
             p = self._split_params(market, code, price, budget, steps, gap_pct,
                                    mode, sell_start, hold_qty, stop_pct)
             cfg = load_config(self.config_path)
-            if cfg["mode"] == "real" and confirm != "YES":
+            if cfg["mode"] == "real" and not _confirmed(confirm):
                 return {"need_confirm": True,
                         "error": "실전투자 모드다. 분할 매매의 실전 확인란에 "
                                  "YES를 입력해야 시작된다."}
@@ -306,7 +311,7 @@ class AppState:
                 real = load_config(self.config_path)["mode"] == "real"
             except KiwoomRestError as e:
                 return {"error": str(e)}
-            if real and confirm != "YES":
+            if real and not _confirmed(confirm):
                 return {"need_confirm": True,
                         "error": "실전투자 모드다. 분할 매매의 실전 확인란에 "
                                  "YES를 입력해야 재개된다."}
@@ -349,7 +354,7 @@ class AppState:
                 return {"error": "이미 실행 중이다. 먼저 중지해야 한다."}
             cfg = load_config(self.config_path)
             mock = cfg["mode"] != "real"
-            if not mock and confirm != "YES":
+            if not mock and not _confirmed(confirm):
                 return {"need_confirm": True,
                         "error": "실전투자 모드다. 확인란에 YES를 입력해야 시작된다."}
             try:
@@ -751,6 +756,8 @@ async function splitStart(){
   const body=spBody();
   const p=await api("/api/split/preview",body);
   if(p.error){$("spMsg").textContent=p.error;return;}
+  if(p.need_confirm&&body.confirm.toUpperCase()!=="YES"){
+    $("spMsg").textContent="실전투자 모드입니다. 실전 확인란에 YES를 입력한 뒤 다시 눌러 주세요 (대소문자 무관)";return;}
   if(!confirm(p.text+"\\n\\n이대로 시작할까요?"))return;
   const r=await api("/api/split/start",body);
   $("spMsg").textContent=r.error||(body.code.toUpperCase()+" 분할 매매를 시작했습니다 - 장중에 가격이 오면 주문합니다");

@@ -217,6 +217,25 @@ class RealModeTest(SplitBase):
             self.state.split_action("us", "SOXL", "resume", confirm="YES"),
             {"ok": True})
 
+    def test_yes_is_accepted_in_any_case(self):
+        for word in ("y", "no", "예", ""):
+            self.assertTrue(
+                self.state.split_start(confirm=word, **self.BODY)["need_confirm"])
+        self.assertEqual(self.state.split_start(confirm=" yes ", **self.BODY),
+                         {"ok": True})
+        self.state.split_action("us", "SOXL", "pause")
+        self.assertEqual(
+            self.state.split_action("us", "SOXL", "resume", confirm="Yes"),
+            {"ok": True})
+
+    def test_ai_trader_start_accepts_lowercase_yes_too(self):
+        self.assertTrue(self.state.start(
+            market="us", target_pct="2", max_positions="2", cash="1000",
+            confirm="ye")["need_confirm"])
+        self.assertEqual(self.state.start(
+            market="us", target_pct="2", max_positions="2", cash="1000",
+            confirm="yes"), {"ok": True})
+
     def test_preview_says_real(self):
         self.assertIn("실전투자", self.state.split_preview(**self.BODY)["text"])
 
