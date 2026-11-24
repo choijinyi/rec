@@ -93,7 +93,8 @@ class PreviewTest(SplitBase):
         for change, text in (({"price": "abc"}, "숫자가 아니다"),
                              ({"budget": "100"}, "1주도 살 수 없다"),
                              ({"code": ""}, "종목코드"),
-                             ({"mode": "ladder"}, "매도 시작가")):
+                             ({"mode": "ladder"}, "매도 지정가"),
+                             ({"hold_qty": "3"}, "매도 지정가")):
             r = self.state.split_preview(**{**self.BODY, **change})
             self.assertIn(text, r["error"])
 
@@ -108,6 +109,15 @@ class PreviewTest(SplitBase):
         r = self.state.split_preview(**{**self.BODY, "budget": "5000"})
         self.assertIn("매수 가능 금액: $1,234.56", r["text"])
         self.assertIn("매수 가능 금액보다 많다", r["text"])
+
+    def test_sell_price_alone_selects_the_sell_ladder(self):
+        body = {k: v for k, v in self.BODY.items() if k != "mode"}
+        r = self.state.split_preview(sell_start="105", **body)
+        self.assertIn("[매도 지정가 분할]", r["text"])
+        self.assertIn("105.00, 106.05", r["text"])
+        self.assertIn("[회차별 매도]", self.state.split_preview(**body)["text"])
+        self.state.split_start(sell_start="105", **body)
+        self.assertEqual(self.state.splitters["us"].jobs["SOXL"].mode, "ladder")
 
     def test_sell_ladder_preview(self):
         r = self.state.split_preview(**{**self.BODY, "mode": "ladder",
@@ -306,7 +316,11 @@ class RouteTest(SplitBase):
         self.assertEqual(self.get("/api/status")["buying_power"], None)
 
     def test_page_has_the_panel_and_the_buying_power_card(self):
+        self.assertNotIn("spMode", PAGE)             # 매도 지정가 칸은 늘 보인다
+        self.assertNotIn("spLadder", PAGE)
         for needle in ('id="spCode"', 'id="spJobs"', 'id="stBP"',
+                       '<label>매도 지정가</label>', 'id="spSell"',
+                       'id="spHold"', 'id="spHint"',
                        "/api/split/preview", "매수 가능 금액",
                        "지정 종목 분할 매매"):
             self.assertIn(needle, PAGE)

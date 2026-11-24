@@ -8,7 +8,7 @@
 
 - each   : 회차별 매도. 각 회차를 자기 매수가보다 간격만큼 오른 가격에 판다.
            반복을 켜면 팔린 회차를 같은 가격에서 다시 산다.
-- ladder : 매도 시작가 지정. 매도 시작가부터 간격만큼 올라갈 때마다 보유
+- ladder : 매도 지정가 분할. 매도 지정가부터 간격만큼 올라갈 때마다 보유
            수량을 남은 회차 수로 나눠 판다. 이미 가진 주식에 분할 매도만 걸 수도
            있다(보유분 매도 수량).
 
@@ -32,7 +32,7 @@ from .scalper import kr_session, us_session
 
 logger = logging.getLogger(__name__)
 
-MODES = {"each": "회차별 매도", "ladder": "매도 시작가 지정"}
+MODES = {"each": "회차별 매도", "ladder": "매도 지정가 분할"}
 MAX_JOBS = 5
 RUNNING, PAUSED, DONE, STOPPED, CUT = "진행", "멈춤", "완료", "종료", "손절"
 
@@ -117,7 +117,7 @@ def build_plan(base_price: float, budget: float, steps: int = 5,
     if budget < 0 or hold_qty < 0:
         raise ValueError("금액과 수량은 0 이상이어야 한다")
     if hold_qty and mode != "ladder":
-        raise ValueError("보유분 매도는 '매도 시작가 지정' 방식에서만 쓸 수 있다")
+        raise ValueError("보유분 매도 수량을 쓰려면 매도 지정가를 넣어야 한다")
     if budget == 0 and hold_qty == 0:
         raise ValueError("총 금액을 넣어야 한다 (보유분만 팔려면 보유분 매도 "
                          "수량을 넣는다)")
@@ -142,9 +142,9 @@ def build_plan(base_price: float, budget: float, steps: int = 5,
     sell_prices: list[float] = []
     if mode == "ladder":
         if sell_start <= 0:
-            raise ValueError("매도 시작가를 넣어야 한다")
+            raise ValueError("매도 지정가를 넣어야 한다")
         if levels and sell_start <= base_price:
-            raise ValueError("매도 시작가는 매수 지정가보다 높아야 한다 "
+            raise ValueError("매도 지정가는 매수 지정가보다 높아야 한다 "
                              "(낮으면 사자마자 손해 보고 판다)")
         sell_prices = [_round_price(sell_start * (1 + gap_pct * j / 100), market)
                        for j in range(steps)]

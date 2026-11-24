@@ -168,18 +168,20 @@ class AppState:
             raise ValueError("시장을 골라야 한다")
         if not code:
             raise ValueError("종목코드를 넣어야 한다")
-        if mode not in SPLIT_MODES:
-            raise ValueError("매도 방식을 골라야 한다")
+        # 매도 지정가를 넣으면 그 가격부터 나눠 팔고, 비우면 회차별로 판다
+        sell = number(sell_start, "매도 지정가")
+        if sell > 0 or mode == "ladder":
+            mode = "ladder"
+        elif mode not in SPLIT_MODES:
+            mode = "each"
         return {"code": code,
                 "base_price": number(price, "매수 지정가"),
                 "budget": number(budget, "총 금액"),
                 "steps": int(number(steps, "횟수", 5)),
                 "gap_pct": number(gap_pct, "간격 %", 1.0),
                 "mode": mode,
-                "sell_start": number(sell_start, "매도 시작가")
-                              if mode == "ladder" else 0.0,
-                "hold_qty": int(number(hold_qty, "보유분 매도 수량"))
-                            if mode == "ladder" else 0,
+                "sell_start": sell,
+                "hold_qty": int(number(hold_qty, "보유분 매도 수량")),
                 "stop_pct": number(stop_pct, "손절 %")}
 
     def _split_conflict(self, market: str, code: str) -> str:
@@ -192,13 +194,14 @@ class AppState:
         return ""
 
     def split_preview(self, market: str = "us", code: str = "", price="",
-                      budget="", steps=5, gap_pct=1.0, mode: str = "each",
+                      budget="", steps=5, gap_pct=1.0, mode: str = "",
                       sell_start="", hold_qty="", stop_pct="",
                       repeat: bool = False, **_ignored) -> dict:
         """시작 전에 계획과 주의할 점을 글로 돌려준다 (주문은 내지 않는다)."""
         try:
             p = self._split_params(market, code, price, budget, steps, gap_pct,
                                    mode, sell_start, hold_qty, stop_pct)
+            mode = p["mode"]
             levels, sells = build_plan(p["base_price"], p["budget"], p["steps"],
                                        p["gap_pct"], mode, p["sell_start"],
                                        market, p["hold_qty"])
@@ -244,7 +247,7 @@ class AppState:
                     f"{sum(lv.qty for lv in hit)}주(약 {unit}"
                     f"{now_price * sum(lv.qty for lv in hit):,.2f})를 곧바로 산다")
             if mode == "ladder" and p["hold_qty"] and now_price >= sells[0]:
-                warnings.append("현재가가 매도 시작가 이상이다 — 시작하면 보유분을 "
+                warnings.append("현재가가 매도 지정가 이상이다 — 시작하면 보유분을 "
                                 "곧바로 팔기 시작한다")
         fee = cfg.get("fee_pct")
         fee = (0.07 if market == "us" else 0.015) if fee is None else fee
@@ -269,7 +272,7 @@ class AppState:
                                   + [f"- {w}" for w in warnings])}
 
     def split_start(self, market: str = "us", code: str = "", price="",
-                    budget="", steps=5, gap_pct=1.0, mode: str = "each",
+                    budget="", steps=5, gap_pct=1.0, mode: str = "",
                     sell_start="", hold_qty="", stop_pct="",
                     repeat: bool = False, confirm: str = "",
                     **_ignored) -> dict:
@@ -676,17 +679,17 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <div class="row">
     <span><label>종목코드</label><br><input id="spCode" size="7" placeholder="SOXL"></span>
     <span><label>매수 지정가</label><br><input id="spPrice" size="7" title="1회차를 사는 가격입니다. 이후 간격만큼 내려갈 때마다 다음 회차를 삽니다. 현재가가 이미 이 가격 아래면 해당 회차들을 곧바로 삽니다"></span>
+    <span><label>매도 지정가</label><br><input id="spSell" size="10" placeholder="비우면 회차별" title="넣으면 이 가격부터 간격만큼 올라갈 때마다 남은 수량을 남은 회차로 나눠 팝니다. 비워 두면 각 회차를 자기 매수가보다 간격만큼 오른 가격에 팝니다"></span>
     <span><label>총 금액</label><br><input id="spBudget" size="8" title="이 금액을 횟수로 나눈 만큼씩 삽니다. 계획 가격보다 비싸게 사지 않으므로 쓴 돈이 이 금액을 넘지 않습니다"></span>
     <span><label>횟수</label><br><input id="spSteps" value="5" size="2"></span>
     <span><label>간격 %</label><br><input id="spGap" value="1" size="3"></span>
-    <span><label>매도 방식</label><br><select id="spMode"><option value="each">회차별 매도 (매수가 + 간격)</option><option value="ladder">매도 시작가 지정</option></select></span>
-    <span class="spLadder"><label>매도 시작가</label><br><input id="spSell" size="7" title="이 가격부터 간격만큼 올라갈 때마다 남은 수량을 남은 회차로 나눠 팝니다"></span>
-    <span class="spLadder"><label>보유분 매도 수량</label><br><input id="spHold" size="4" placeholder="0" title="이미 계좌에 있는 주식 가운데 이 수량을 분할 매도에 넣습니다(미국주식). 총 금액을 0으로 두면 사지 않고 팔기만 합니다"></span>
+    <span><label>보유분 매도 수량</label><br><input id="spHold" size="4" placeholder="0" title="이미 계좌에 있는 주식 가운데 이 수량을 분할 매도에 넣습니다(미국주식, 매도 지정가 필요). 총 금액을 0으로 두면 사지 않고 팔기만 합니다"></span>
     <span><label>손절 %</label><br><input id="spStop" value="0" size="3" title="0이면 손절 없음. 값을 넣으면 마지막 회차 가격에서 그만큼 더 내렸을 때 전량 매도하고 끝냅니다"></span>
-    <label title="회차별 매도: 팔린 회차를 같은 가격에서 다시 삽니다. 매도 시작가 지정: 전부 팔리면 처음부터 다시 시작합니다"><input type="checkbox" id="spRepeat"> 반복</label>
+    <label title="매도 지정가를 비운 경우: 팔린 회차를 같은 가격에서 다시 삽니다. 매도 지정가를 넣은 경우: 전부 팔리면 처음부터 다시 시작합니다"><input type="checkbox" id="spRepeat"> 반복</label>
     <span id="spRealConfirm" style="display:none"><label>실전 확인</label><br><input id="spConfirm" placeholder="YES 입력" size="6"></span>
     <button id="spStartBtn" onclick="splitStart()">계획 확인 후 시작</button>
   </div>
+  <div class="fixed" id="spHint"></div>
   <div class="warn" id="spMsg"></div>
   <div id="spJobs">등록된 분할 매매가 없습니다.</div>
   <ul id="spLog"></ul>
@@ -733,13 +736,15 @@ async function watchLosers(){
   $("msg").textContent=r.error||("본전 감시 요청 접수: "+r.codes.join(", "));
 }
 const esc=t=>String(t==null?"":t).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
-function spToggle(){const on=$("spMode").value==="ladder";
-  document.querySelectorAll(".spLadder").forEach(e=>e.style.display=on?"inline-block":"none");}
-$("spMode").onchange=spToggle;spToggle();
+function spHint(){const sell=$("spSell").value.trim(),gap=$("spGap").value.trim()||"1",n=$("spSteps").value.trim()||"5";
+  $("spHint").textContent=sell
+    ?"매도: 매도 지정가 "+sell+"부터 "+gap+"%씩 올라갈 때마다 "+n+"회에 나눠 팝니다."
+    :"매도: 매도 지정가를 비워 두어, 각 회차를 자기 매수가보다 "+gap+"% 오른 가격에 팝니다. 매도 지정가를 넣으면 그 가격부터 "+gap+"%씩 올라가며 "+n+"회에 나눠 팝니다.";}
+["spSell","spGap","spSteps"].forEach(id=>$(id).oninput=spHint);spHint();
 function spBody(){return {market:$("market").value,code:$("spCode").value.trim(),
   price:$("spPrice").value.trim(),budget:$("spBudget").value.trim(),
   steps:$("spSteps").value.trim(),gap_pct:$("spGap").value.trim(),
-  mode:$("spMode").value,sell_start:$("spSell").value.trim(),
+  mode:$("spSell").value.trim()?"ladder":"each",sell_start:$("spSell").value.trim(),
   hold_qty:$("spHold").value.trim(),stop_pct:$("spStop").value.trim(),
   repeat:$("spRepeat").checked,confirm:$("spConfirm").value.trim()};}
 async function splitStart(){
