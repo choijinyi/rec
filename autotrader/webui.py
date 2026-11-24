@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,8 @@ from .kiwoom_rest import (
     KiwoomRestClient, KiwoomRestError, _read_parser, load_config,
 )
 from .scalper import ScalpConfig, Scalper
+from .splitter import MODES as SPLIT_MODES
+from .splitter import SplitTrader, build_plan
 from .universe import build_universe
 
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -73,6 +76,242 @@ class AppState:
         self.buy_paused = False   # 사용자가 매수만 멈춘 상태 (시작 전에도 설정 가능)
         self.analyst_factory = ClaudeAnalyst          # API 키 방식
         self.cli_analyst_factory = ClaudeCodeAnalyst  # Claude Code 구독 로그인
+        # 지정 종목 분할 매매 엔진(시장별)과 공용 API 클라이언트·매수 가능 금액
+        self.splitters: dict[str, SplitTrader] = {}
+        self._split_lock = threading.Lock()
+        self._clients: dict[tuple, object] = {}
+        self._bp: dict[str, dict] = {}
+
+    def _client(self, market: str, cfg: dict | None = None):
+        """시장별 API 클라이언트. AI 단타와 분할 매매가 하나를 같이 쓴다."""
+        cfg = cfg or load_config(self.config_path)
+        mock = cfg["mode"] != "real"
+        key = (market, mock, cfg["appkey"], self.client_factory)
+        client = self._clients.get(key)
+        if client is None:
+            client = self.client_factory(cfg["appkey"], cfg["secretkey"],
+                                         mock=mock, market=market)
+            self._clients[key] = client
+        return client
+
+    # ── 매수 가능 금액 ─────────────────────────────────────
+    def buying_power(self, market: str) -> dict:
+        """지금 주문할 수 있는 금액. 30초마다 뒤에서 새로 읽는다."""
+        entry = self._bp.setdefault(
+            market, {"data": None, "error": "", "at": None, "busy": False})
+        stale = entry["at"] is None or time.monotonic() - entry["at"] > 30
+        if stale and not entry["busy"]:
+            entry["busy"] = True
+
+            def work():
+                try:
+                    data = dict(self._client(market).buying_power())
+                    data["time"] = datetime.now().strftime("%H:%M:%S")
+                    entry["data"], entry["error"] = data, ""
+                except Exception as e:
+                    entry["error"] = str(e)[:120]
+                finally:
+                    entry["at"] = time.monotonic()
+                    entry["busy"] = False
+
+            threading.Thread(target=work, daemon=True).start()
+        return {"data": entry["data"], "error": entry["error"]}
+
+    # ── 지정 종목 분할 매매 ────────────────────────────────
+    def _splitter(self, market: str, create: bool = True) -> SplitTrader | None:
+        with self._split_lock:
+            engine = self.splitters.get(market)
+            if engine is not None or not create:
+                return engine
+            cfg = load_config(self.config_path)
+            mock = cfg["mode"] != "real"
+            fee_pct = cfg.get("fee_pct")
+            if fee_pct is None:
+                fee_pct = 0.07 if market == "us" else 0.015
+            base = Path(self.config_path).resolve()
+            engine = SplitTrader(
+                api=self._client(market, cfg), market=market,
+                is_simulation=mock, allow_real=not mock,
+                fee_pct=max(0.0, fee_pct),
+                sell_tax_pct=max(0.0, cfg.get("sell_tax_pct") or 0.0),
+                us_day_session=cfg.get("us_day_session", True),
+                state_path=str(base.with_name(
+                    f"autotrader_state_split_{market}.json")))
+            engine.buy_paused = self.buy_paused
+            engine.restore_state()
+            threading.Thread(target=engine.run, daemon=True).start()
+            self.splitters[market] = engine
+            return engine
+
+    def load_saved_splits(self) -> None:
+        """이전 실행의 분할 매매 작업을 화면에 다시 보여 준다 (멈춤 상태)."""
+        base = Path(self.config_path).resolve()
+        for market in ("us", "kr"):
+            if base.with_name(f"autotrader_state_split_{market}.json").exists():
+                try:
+                    self._splitter(market)
+                except Exception as e:
+                    self.last_error = f"분할 매매 작업 복원 실패: {e}"
+
+    def split_codes(self, market: str) -> set[str]:
+        engine = self.splitters.get(market)
+        return engine.codes() if engine else set()
+
+    def _split_params(self, market, code, price, budget, steps, gap_pct, mode,
+                      sell_start, hold_qty, stop_pct) -> dict:
+        def number(value, name, default=0.0):
+            return (default if str(value or "").strip() == ""
+                    else _parse_float(value, name))
+
+        code = str(code or "").strip().upper()
+        if market not in ("us", "kr"):
+            raise ValueError("시장을 골라야 한다")
+        if not code:
+            raise ValueError("종목코드를 넣어야 한다")
+        if mode not in SPLIT_MODES:
+            raise ValueError("매도 방식을 골라야 한다")
+        return {"code": code,
+                "base_price": number(price, "매수 지정가"),
+                "budget": number(budget, "총 금액"),
+                "steps": int(number(steps, "횟수", 5)),
+                "gap_pct": number(gap_pct, "간격 %", 1.0),
+                "mode": mode,
+                "sell_start": number(sell_start, "매도 시작가")
+                              if mode == "ladder" else 0.0,
+                "hold_qty": int(number(hold_qty, "보유분 매도 수량"))
+                            if mode == "ladder" else 0,
+                "stop_pct": number(stop_pct, "손절 %")}
+
+    def _split_conflict(self, market: str, code: str) -> str:
+        trader = self.trader
+        if (trader and self.thread and self.thread.is_alive()
+                and self.params.get("market") == market
+                and code in trader.positions):
+            return (f"{code}는 AI 단타가 보유·관리 중이다 — 같은 종목을 두 기능이 "
+                    f"함께 다루지 않는다")
+        return ""
+
+    def split_preview(self, market: str = "us", code: str = "", price="",
+                      budget="", steps=5, gap_pct=1.0, mode: str = "each",
+                      sell_start="", hold_qty="", stop_pct="",
+                      repeat: bool = False, **_ignored) -> dict:
+        """시작 전에 계획과 주의할 점을 글로 돌려준다 (주문은 내지 않는다)."""
+        try:
+            p = self._split_params(market, code, price, budget, steps, gap_pct,
+                                   mode, sell_start, hold_qty, stop_pct)
+            levels, sells = build_plan(p["base_price"], p["budget"], p["steps"],
+                                       p["gap_pct"], mode, p["sell_start"],
+                                       market, p["hold_qty"])
+        except ValueError as e:
+            return {"error": str(e)}
+        conflict = self._split_conflict(market, p["code"])
+        if conflict:
+            return {"error": conflict}
+        cfg = load_config(self.config_path)
+        real = cfg["mode"] == "real"
+        unit = "$" if market == "us" else ""
+        lines = [f"{p['code']} 분할 매매 계획 [{SPLIT_MODES[mode]}"
+                 f"{' · 반복' if repeat and levels else ''}] — "
+                 f"{'실전투자' if real else '모의투자'}"]
+        if levels:
+            total = sum(lv.buy * lv.qty for lv in levels)
+            lines.append("매수: " + ", ".join(
+                f"{lv.buy:,.2f}×{lv.qty}주" for lv in levels))
+            lines.append(f"  전부 사면 {sum(lv.qty for lv in levels)}주, "
+                         f"{unit}{total:,.2f} (정한 금액 {unit}{p['budget']:,.2f})")
+        if p["hold_qty"]:
+            lines.append(f"보유분 {p['hold_qty']}주를 함께 나눠 판다")
+        if mode == "each":
+            lines.append("매도: " + ", ".join(f"{lv.sell:,.2f}" for lv in levels)
+                         + " (회차별로 자기 매수가 +"
+                         f"{p['gap_pct']:g}%)")
+        else:
+            lines.append("매도: " + ", ".join(f"{s:,.2f}" for s in sells)
+                         + " (닿을 때마다 남은 수량을 남은 회차로 나눠 판다)")
+        warnings = []
+        now_price = None
+        try:
+            now_price = float(self._client(market, cfg).current_price(p["code"]))
+        except Exception as e:
+            warnings.append(f"현재가를 확인하지 못했다 ({str(e)[:50]}) — 종목코드를 "
+                            f"다시 확인한다")
+        if now_price:
+            lines.append(f"현재가: {now_price:,.2f}")
+            hit = [lv for lv in levels if now_price <= lv.buy]
+            if hit:
+                warnings.append(
+                    f"현재가가 지정가 이하다 — 시작하면 1~{len(hit)}회차 "
+                    f"{sum(lv.qty for lv in hit)}주(약 {unit}"
+                    f"{now_price * sum(lv.qty for lv in hit):,.2f})를 곧바로 산다")
+            if mode == "ladder" and p["hold_qty"] and now_price >= sells[0]:
+                warnings.append("현재가가 매도 시작가 이상이다 — 시작하면 보유분을 "
+                                "곧바로 팔기 시작한다")
+        fee = cfg.get("fee_pct")
+        fee = (0.07 if market == "us" else 0.015) if fee is None else fee
+        if mode == "each" and p["gap_pct"] <= 2 * fee + (cfg.get("sell_tax_pct")
+                                                         or 0):
+            warnings.append("간격이 왕복 수수료·세금보다 크지 않아 팔아도 남지 않는다")
+        power = (self._bp.get(market) or {}).get("data")
+        if power:
+            lines.append(f"매수 가능 금액: {unit}{power['orderable']:,.2f}")
+            if p["budget"] > power["orderable"]:
+                warnings.append("총 금액이 매수 가능 금액보다 많다 — 뒤 회차 주문이 "
+                                "거부될 수 있다")
+        if levels:
+            warnings.append(
+                f"손절 -{p['stop_pct']:g}%: 마지막 회차 {levels[-1].buy:,.2f}에서 "
+                f"그만큼 더 내리면 전량 매도하고 끝낸다" if p["stop_pct"]
+                else "손절 없음: 마지막 회차 아래로 내려가도 팔지 않고 보유한다")
+        warnings.append("주문은 가격이 그 자리에 왔을 때 호가를 보고 낸다 — 미리 "
+                        "걸어 두는 주문이 아니다")
+        return {"ok": True, "need_confirm": real,
+                "text": "\n".join(lines + ["", "확인할 점:"]
+                                  + [f"- {w}" for w in warnings])}
+
+    def split_start(self, market: str = "us", code: str = "", price="",
+                    budget="", steps=5, gap_pct=1.0, mode: str = "each",
+                    sell_start="", hold_qty="", stop_pct="",
+                    repeat: bool = False, confirm: str = "",
+                    **_ignored) -> dict:
+        try:
+            p = self._split_params(market, code, price, budget, steps, gap_pct,
+                                   mode, sell_start, hold_qty, stop_pct)
+            cfg = load_config(self.config_path)
+            if cfg["mode"] == "real" and confirm != "YES":
+                return {"need_confirm": True,
+                        "error": "실전투자 모드다. 분할 매매의 실전 확인란에 "
+                                 "YES를 입력해야 시작된다."}
+            conflict = self._split_conflict(market, p["code"])
+            if conflict:
+                return {"error": conflict}
+            engine = self._splitter(market)
+            engine.add_job(repeat=bool(repeat), **p)
+        except (ValueError, PermissionError, KiwoomRestError) as e:
+            return {"error": str(e)}
+        return {"ok": True}
+
+    def split_action(self, market: str = "us", code: str = "",
+                     action: str = "", confirm: str = "", **_ignored) -> dict:
+        if action not in ("pause", "resume", "stop", "liquidate", "remove"):
+            return {"error": f"알 수 없는 요청: {action}"}
+        engine = self.splitters.get(market)
+        code = str(code or "").strip().upper()
+        if engine is None or code not in engine.jobs:
+            return {"error": "그런 분할 매매 작업이 없다."}
+        if action == "resume":
+            try:
+                real = load_config(self.config_path)["mode"] == "real"
+            except KiwoomRestError as e:
+                return {"error": str(e)}
+            if real and confirm != "YES":
+                return {"need_confirm": True,
+                        "error": "실전투자 모드다. 분할 매매의 실전 확인란에 "
+                                 "YES를 입력해야 재개된다."}
+            conflict = self._split_conflict(market, code)
+            if conflict:
+                return {"error": conflict}
+        engine.request(code, action)
+        return {"ok": True}
 
     def _make_analyst(self):
         """분석 백엔드 선택: api_key가 있으면 API, 없으면 Claude Code 로그인.
@@ -138,8 +377,7 @@ class AppState:
                     allow_real=not mock,
                     us_day_session=cfg.get("us_day_session", True),
                 )
-                client = self.client_factory(cfg["appkey"], cfg["secretkey"],
-                                             mock=mock, market=market)
+                client = self._client(market, cfg)
                 api = RecordingAPI(client)
 
                 holder: dict = {}
@@ -184,6 +422,8 @@ class AppState:
                                  journal_path=journal_path)
                 holder["trader"] = trader
                 trader.pause_entries(self.buy_paused)   # 멈춘 채로 시작할 수 있다
+                # 분할 매매 중인 종목은 AI 단타가 사지도 편입하지도 않는다
+                trader.blocked_codes = lambda m=market: self.split_codes(m)
             except (ValueError, PermissionError) as e:
                 return {"error": str(e)}
 
@@ -227,6 +467,8 @@ class AppState:
         종목(본전 감시 등)만 관리하고 싶을 때 쓴다.
         """
         self.buy_paused = bool(paused)
+        for engine in self.splitters.values():      # 분할 매매의 매수도 멈춘다
+            engine.buy_paused = self.buy_paused
         if self.trader and self.thread and self.thread.is_alive():
             self.trader.pause_entries(self.buy_paused)
         return {"ok": True, "buy_paused": self.buy_paused}
@@ -245,6 +487,9 @@ class AppState:
         code = (code or "").strip().upper()
         if not code:
             return {"error": "종목코드가 비어 있다."}
+        if code in self.split_codes(self.params.get("market", "")):
+            return {"error": f"{code}는 지정 종목 분할 매매 중이다 — 분할 매매 "
+                             f"쪽에서 중지하거나 정리해야 한다."}
         if code == "*LOSERS":
             if mode != "watch":
                 return {"error": "전체 요청은 본전 감시만 가능하다."}
@@ -262,7 +507,7 @@ class AppState:
         return {"ok": True}
 
     # ── 상태 조회 ──────────────────────────────────────────
-    def status(self) -> dict:
+    def status(self, market: str | None = None) -> dict:
         mode = "mock"
         try:
             mode = load_config(self.config_path)["mode"]
@@ -281,7 +526,14 @@ class AppState:
             "halt_reason": "", "buy_paused": self.buy_paused,
             "selection_note": "", "review_note": "", "ai": self.ai_label,
             "chart_code": "", "holdings": [],
+            "split": {"jobs": [], "events": []}, "buying_power": None,
         }
+        for engine in list(self.splitters.values()):
+            out["split"]["jobs"] += engine.snapshot()
+            out["split"]["events"] += engine.events[-12:]
+        out["split"]["events"] = sorted(out["split"]["events"])[-12:]
+        if market in ("us", "kr"):       # 화면이 고른 시장의 매수 가능 금액
+            out["buying_power"] = self.buying_power(market)
         trader = self.trader
         if trader:
             out["equity"] = trader.equity()
@@ -404,6 +656,7 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <div class="card"><div class="k">오늘 매매</div><div class="v" id="stTrades">-</div></div>
   <div class="card"><div class="k">승 / 패</div><div class="v" id="stWinLoss">-</div></div>
   <div class="card"><div class="k">현금</div><div class="v" id="stCash">-</div></div>
+  <div class="card" id="bpCard" title="계좌에서 지금 새로 주문할 수 있는 금액입니다. 위에서 고른 시장 기준이며 30초마다 다시 읽습니다"><div class="k">매수 가능 금액 <span id="bpTime"></span></div><div class="v" id="stBP">-</div><div class="k" id="bpNote"></div></div>
 </div>
 
 <div class="panel"><h2>보유 포지션</h2>
@@ -417,6 +670,26 @@ th{color:var(--dim);font-weight:400} td:first-child,th:first-child{text-align:le
   <table><thead><tr><th>종목</th><th>보유</th><th>매입단가</th><th>현재가</th>
   <th>손익률</th><th>처리</th></tr></thead>
   <tbody id="holdings"><tr><td colspan="6">시작 후 1분 안에 표시됩니다 (미국주식)</td></tr></tbody></table>
+</div>
+
+<div class="panel"><h2>지정 종목 분할 매매 <span class="fixed">(내가 정한 종목·가격·금액으로 나눠 사고팝니다 · AI 단타와 따로 동작 · 시장은 맨 위 선택을 따릅니다)</span></h2>
+  <div class="row">
+    <span><label>종목코드</label><br><input id="spCode" size="7" placeholder="SOXL"></span>
+    <span><label>매수 지정가</label><br><input id="spPrice" size="7" title="1회차를 사는 가격입니다. 이후 간격만큼 내려갈 때마다 다음 회차를 삽니다. 현재가가 이미 이 가격 아래면 해당 회차들을 곧바로 삽니다"></span>
+    <span><label>총 금액</label><br><input id="spBudget" size="8" title="이 금액을 횟수로 나눈 만큼씩 삽니다. 계획 가격보다 비싸게 사지 않으므로 쓴 돈이 이 금액을 넘지 않습니다"></span>
+    <span><label>횟수</label><br><input id="spSteps" value="5" size="2"></span>
+    <span><label>간격 %</label><br><input id="spGap" value="1" size="3"></span>
+    <span><label>매도 방식</label><br><select id="spMode"><option value="each">회차별 매도 (매수가 + 간격)</option><option value="ladder">매도 시작가 지정</option></select></span>
+    <span class="spLadder"><label>매도 시작가</label><br><input id="spSell" size="7" title="이 가격부터 간격만큼 올라갈 때마다 남은 수량을 남은 회차로 나눠 팝니다"></span>
+    <span class="spLadder"><label>보유분 매도 수량</label><br><input id="spHold" size="4" placeholder="0" title="이미 계좌에 있는 주식 가운데 이 수량을 분할 매도에 넣습니다(미국주식). 총 금액을 0으로 두면 사지 않고 팔기만 합니다"></span>
+    <span><label>손절 %</label><br><input id="spStop" value="0" size="3" title="0이면 손절 없음. 값을 넣으면 마지막 회차 가격에서 그만큼 더 내렸을 때 전량 매도하고 끝냅니다"></span>
+    <label title="회차별 매도: 팔린 회차를 같은 가격에서 다시 삽니다. 매도 시작가 지정: 전부 팔리면 처음부터 다시 시작합니다"><input type="checkbox" id="spRepeat"> 반복</label>
+    <span id="spRealConfirm" style="display:none"><label>실전 확인</label><br><input id="spConfirm" placeholder="YES 입력" size="6"></span>
+    <button id="spStartBtn" onclick="splitStart()">계획 확인 후 시작</button>
+  </div>
+  <div class="warn" id="spMsg"></div>
+  <div id="spJobs">등록된 분할 매매가 없습니다.</div>
+  <ul id="spLog"></ul>
 </div>
 
 <div id="chartWrap"><canvas id="chart" width="1040" height="200"></canvas></div>
@@ -459,6 +732,54 @@ async function watchLosers(){
   const r=await api("/api/adopt",{code:"*LOSERS",mode:"watch"});
   $("msg").textContent=r.error||("본전 감시 요청 접수: "+r.codes.join(", "));
 }
+const esc=t=>String(t==null?"":t).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+function spToggle(){const on=$("spMode").value==="ladder";
+  document.querySelectorAll(".spLadder").forEach(e=>e.style.display=on?"inline-block":"none");}
+$("spMode").onchange=spToggle;spToggle();
+function spBody(){return {market:$("market").value,code:$("spCode").value.trim(),
+  price:$("spPrice").value.trim(),budget:$("spBudget").value.trim(),
+  steps:$("spSteps").value.trim(),gap_pct:$("spGap").value.trim(),
+  mode:$("spMode").value,sell_start:$("spSell").value.trim(),
+  hold_qty:$("spHold").value.trim(),stop_pct:$("spStop").value.trim(),
+  repeat:$("spRepeat").checked,confirm:$("spConfirm").value.trim()};}
+async function splitStart(){
+  const body=spBody();
+  const p=await api("/api/split/preview",body);
+  if(p.error){$("spMsg").textContent=p.error;return;}
+  if(!confirm(p.text+"\\n\\n이대로 시작할까요?"))return;
+  const r=await api("/api/split/start",body);
+  $("spMsg").textContent=r.error||(body.code.toUpperCase()+" 분할 매매를 시작했습니다 - 장중에 가격이 오면 주문합니다");
+}
+async function splitAct(market,code,action){
+  const ask={stop:"의 분할 매매를 끝냅니다. 더 사고팔지 않으며, 지금 가진 수량은 계좌에 그대로 둡니다. 진행할까요?",
+    liquidate:"의 보유 수량을 지금 모두 팔고 분할 매매를 끝냅니다. 진행할까요?"}[action];
+  if(ask&&!confirm(code+ask))return;
+  const r=await api("/api/split/action",{market:market,code:code,action:action,confirm:$("spConfirm").value.trim()});
+  $("spMsg").textContent=r.error||(code+" 요청 접수 - 3초 안에 처리됩니다");
+}
+function spJobHtml(j){
+  const live=j.status==="진행"||j.status==="멈춤";
+  const b=(a,t,c)=>"<button "+(c?"class='"+c+"' ":"")+"data-m='"+j.market+"' data-c='"+j.code+"' data-a='"+a+
+    "' onclick='splitAct(this.dataset.m,this.dataset.c,this.dataset.a)'>"+t+"</button> ";
+  const tone=v=>v>=0?"pos":"neg";
+  let h="<div style='margin:12px 0 4px'><b>"+esc(j.code)+"</b> · "+j.mode_label+(j.repeat?" · 반복":"")+
+    " · <b>"+j.status+(j.closing?" (정리 중)":"")+"</b> · 보유 "+j.held+"주"+(j.held?" @"+fmt(j.avg):"")+
+    " · 현재 "+fmt(j.last||null)+(j.budget>0?" · 사용 "+fmt(j.used)+" / "+fmt(j.budget):" · 보유분 매도")+
+    " · 실현 <span class='"+tone(j.realized)+"'>"+fmt(j.realized)+"</span>"+
+    (j.held?" · 평가 <span class='"+tone(j.unrealized)+"'>"+fmt(j.unrealized)+"</span>":"")+
+    (j.stop_pct?" · 손절 -"+j.stop_pct+"%":"")+
+    (j.pending?" · "+esc(j.pending):"")+(j.note?" · <span class='neg'>"+esc(j.note)+"</span>":"")+"</div><div style='margin-bottom:6px'>"+
+    (j.status==="진행"?b("pause","일시정지"):"")+(j.status==="멈춤"?b("resume","재개"):"")+
+    (live?b("stop","중지(보유 유지)")+b("liquidate","전량 매도 후 종료","danger"):b("remove","목록에서 지우기"))+"</div>";
+  h+="<table><thead><tr><th>회차</th><th>매수가</th><th>수량</th><th>보유</th><th>매도가</th><th>상태</th></tr></thead><tbody>";
+  const n=Math.max(j.levels.length,j.sells.length);
+  for(let i=0;i<n;i++){const l=j.levels[i],sl=j.sells[i];
+    const sell=j.mode==="each"?(l?fmt(l.sell):"-"):(sl?fmt(sl.price)+(sl.done?" (매도됨)":""):"-");
+    const st=!l?"-":l.done?"완료":l.held>0?"보유":l.bought>0?"일부 체결":"대기";
+    h+="<tr><td>"+(i+1)+"</td><td>"+(l?fmt(l.buy):"-")+"</td><td>"+(l?l.qty:"-")+"</td><td>"+(l?l.held:"-")+
+      "</td><td>"+sell+"</td><td>"+st+(l&&l.rounds?" · "+l.rounds+"회 완료":"")+"</td></tr>";}
+  return h+"</tbody></table>";
+}
 let buyPaused=false;
 async function pauseBuys(){
   const r=await api("/api/pause",{paused:!buyPaused});
@@ -478,11 +799,22 @@ function drawChart(prices,code){
 }
 async function refresh(){
   try{
-    const s=await api("/api/status");
+    const s=await api("/api/status?market="+$("market").value);
     const real=s.config_mode==="real";
     $("modeBadge").textContent=real?"실전투자":"모의투자";
     $("modeBadge").className="badge "+(real?"real":"mock");
     $("realConfirm").style.display=real?"inline-block":"none";
+    $("spRealConfirm").style.display=real?"inline-block":"none";
+    const bp=s.buying_power,bd=bp&&bp.data;
+    if(bd){const usd=bd.currency==="USD";
+      $("stBP").textContent=(usd?"$":"")+Number(bd.orderable).toLocaleString(undefined,{maximumFractionDigits:2})+(usd?"":"원");
+      $("bpTime").textContent="("+bd.time+")";
+      $("bpNote").textContent=usd?("달러 예수금 $"+fmt(bd.deposit)+" · 원화 "+Math.round(bd.krw_deposit).toLocaleString()+"원"):("예수금 "+Math.round(bd.deposit).toLocaleString()+"원");
+    }else{$("stBP").textContent=bp&&bp.error?"조회 실패":"조회 중";$("bpTime").textContent="";
+      $("bpNote").textContent=bp&&bp.error?bp.error:"";}
+    const jobs=(s.split&&s.split.jobs)||[];
+    $("spJobs").innerHTML=jobs.length?jobs.map(spJobHtml).join(""):"등록된 분할 매매가 없습니다.";
+    $("spLog").innerHTML=((s.split&&s.split.events)||[]).slice().reverse().map(e=>"<li>"+esc(e)+"</li>").join("");
     let run=s.running?("실행 중 · "+(s.session||"-")):"대기";
     if(s.running&&s.session==="장외")run="대기 (장외)";
     if(s.running&&s.minutes_to_close!=null)run+=" · 마감까지 "+s.minutes_to_close+"분";
@@ -570,8 +902,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self._send(PAGE.encode("utf-8"), content_type="text/html")
-        elif self.path == "/api/status":
-            self._send(self.state.status())
+        elif self.path.split("?")[0] == "/api/status":
+            query = self.path.partition("?")[2]
+            market = next((part[7:] for part in query.split("&")
+                           if part.startswith("market=")), None)
+            self._send(self.state.status(market))
         else:
             self._send({"error": "not found"}, 404)
 
@@ -597,6 +932,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(self.state.pause_buys(bool(body.get("paused", True))))
             elif self.path == "/api/stop":
                 self._send(self.state.stop())
+            elif self.path == "/api/split/preview":
+                self._send(self.state.split_preview(**body))
+            elif self.path == "/api/split/start":
+                self._send(self.state.split_start(**body))
+            elif self.path == "/api/split/action":
+                self._send(self.state.split_action(**body))
             elif self.path == "/api/adopt":
                 self._send(self.state.adopt(body.get("code", ""),
                                             body.get("mode", "")))
@@ -609,6 +950,7 @@ class Handler(BaseHTTPRequestHandler):
 def run_ui(config_path: str = "config.ini", port: int = 8899,
            open_browser: bool = True) -> None:
     state = AppState(config_path)
+    state.load_saved_splits()
     Handler.state = state
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
@@ -623,4 +965,6 @@ def run_ui(config_path: str = "config.ini", port: int = 8899,
     finally:
         if state.trader:
             state.trader.stop()
+        for engine in state.splitters.values():
+            engine.stop()
         server.server_close()

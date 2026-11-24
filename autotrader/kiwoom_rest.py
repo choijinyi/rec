@@ -510,6 +510,38 @@ class KiwoomRestClient:
                              "name": str(row.get("frgn_stk_nm", "")).strip()}
         return out
 
+    def buying_power(self) -> dict:
+        """지금 새로 주문할 수 있는 금액.
+
+        미국: 달러 주문가능금액(ust21110) — 원화 예수금까지 합쳐 주문할 수 있는
+        계좌(통합증거금)는 그만큼이 포함된 값이 온다. 국내: 주문가능금액(kt00001).
+        반환: {"currency", "orderable", "deposit", "krw_deposit"}
+        """
+        def num(raw) -> float:
+            try:
+                return float(str(raw or 0).replace(",", "").strip() or 0)
+            except ValueError:
+                return 0.0
+
+        if self.market == "us":
+            res = self._call("/api/us/acnt", "ust21110", {})
+            usd = next((row for row in res.get("result_list") or []
+                        if str(row.get("crnc_code", "")).strip().upper() == "USD"),
+                       None)
+            if usd is None:
+                raise KiwoomRestError("달러 예수금 정보를 찾지 못했다 (ust21110)")
+            return {"currency": "USD",
+                    "orderable": num(usd.get("fc_ord_alowa")),
+                    "deposit": num(usd.get("fc_entra")),
+                    "krw_deposit": num(res.get("krw_entra"))}
+        res = self._call("/api/dostk/acnt", "kt00001", {"qry_tp": "3"})
+        if res.get("ord_alow_amt") in (None, ""):
+            raise KiwoomRestError("주문가능금액을 찾지 못했다 (kt00001)")
+        return {"currency": "KRW",
+                "orderable": num(res.get("ord_alow_amt")),
+                "deposit": num(res.get("entr")),
+                "krw_deposit": num(res.get("entr"))}
+
     def us_open_orders(self, code: str = "") -> list[dict]:
         """미체결 주문 목록(ust21050).
 

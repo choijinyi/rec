@@ -450,6 +450,8 @@ class Scalper:
         self.sleep = sleep
 
         self.cash = config.total_cash
+        # 지정 종목 분할 매매처럼 다른 기능이 다루는 종목 — 사지도 편입하지도 않는다
+        self.blocked_codes: Callable[[], set[str]] = set
         self.positions: dict[str, Position] = {}
         self.trades: list[Trade] = []
         self.events: list[str] = []
@@ -708,6 +710,9 @@ class Scalper:
         return self.config.total_cash / self.config.max_positions
 
     def _buy(self, code: str, plan: EntryPlan | None = None) -> bool:
+        if code in self.blocked_codes():
+            self._log(f"매수 건너뜀({code}): 지정 종목 분할 매매 중인 종목이다")
+            return False
         try:
             price = self.api.current_price(code)
         except Exception as e:
@@ -1494,6 +1499,7 @@ class Scalper:
         rows: list[dict] = []
         seen: set[str] = set()
         universe = self.config.universe
+        blocked = {c.upper() for c in self.blocked_codes()}
         # 종목군을 제한하면 대형주가 모이는 거래대금 순위를 넓게 훑는다
         criteria_list = (("value", "volume", "change") if universe is not None
                          else ("change", "volume"))
@@ -1511,6 +1517,8 @@ class Scalper:
                         row, "change_pct")
                 if universe is not None and code.upper() not in universe:
                     continue                      # 대형주·주요 ETF만 매매한다
+                if code.upper() in blocked:
+                    continue                      # 분할 매매 중인 종목
                 if code and code not in seen:
                     seen.add(code)
                     rows.append(row)
@@ -2013,6 +2021,9 @@ class Scalper:
 
     def _adopt(self, code: str, mode: str) -> None:
         pos = self.positions.get(code)
+        if pos is None and code in self.blocked_codes():
+            self._log(f"편입 불가({code}): 지정 종목 분할 매매 중인 종목이다")
+            return
         if pos is not None:
             if pos.busy:
                 return
